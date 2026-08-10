@@ -1,0 +1,40 @@
+name: Market Scanner
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # كل 15 دقيقة (بتوقيت UTC)
+  workflow_dispatch: {}       # يسمح بالتشغيل اليدوي من تبويب Actions لأي وقت
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scanner
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SCAN_INTERVAL: '1h'
+          SCAN_DEPTH: '40'
+        run: python scanner.py
+
+      - name: Commit alert state (if changed)
+        run: |
+          git config user.name "market-scanner-bot"
+          git config user.email "actions@github.com"
+          git add alerted_state.json
+          git diff --cached --quiet || git commit -m "تحديث حالة التنبيهات [skip ci]"
+          git push
