@@ -24,8 +24,7 @@ EXCLUDE_SYMS = {"USDCUSDT","FDUSDUSDT","TUSDUSDT","DAIUSDT","USDPUSDT",
 
 HTF_MAP = {"15m": "1h", "1h": "4h", "4h": "1d", "1d": "1w"}
 
-BASE_URL = "https://api.binance.com/api/v3"
-
+BASE_URL = "https://data-api.binance.vision/api/v3"
 
 # ---------------- دوال المؤشرات الفنية ----------------
 
