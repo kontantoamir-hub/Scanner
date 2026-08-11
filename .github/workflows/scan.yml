@@ -2,7 +2,7 @@ name: Market Scanner
 
 on:
   schedule:
-    - cron: '*/15 * * * *'   # كل 15 دقيقة (بتوقيت UTC)
+    - cron: '4,19,34,49 * * * *'   # كل 15 دقيقة تقريبًا، بإزاحة عن cron-job.org لتفادي التعارض
   workflow_dispatch: {}       # يسمح بالتشغيل اليدوي من تبويب Actions لأي وقت
 
 permissions:
