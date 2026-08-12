@@ -223,7 +223,7 @@ def compute_indicators(klines):
     }
 
 
-def score_at(i, ind):
+def score_at(i, ind, apply_extra_filters=True):
     if i < 26 or ind["bb_upper"][i] is None or ind["rsi"][i] is None or ind["vol_avg"][i] is None:
         return None
     trend_up = ind["ema9"][i] > ind["ema21"][i]
@@ -237,32 +237,32 @@ def score_at(i, ind):
     vol_score = trend_dir * 0.5 if vol_confirm else 0
     score = trend_dir + rsi_state + (1 if macd_bull else -1) + bb_state + vol_score
 
-    # --- فلاتر إضافية لتحسين جودة الإشارة ---
+    # --- فلاتر إضافية لتحسين جودة الإشارة (ADX / انحراف / مقاومة / OBV) ---
+    # تُحسب دائمًا للعرض التشخيصي، لكن تُطبَّق على الدرجة فقط لو apply_extra_filters=True
+    # (يُستخدم False في الاختبار الرجعي لمقارنة الأداء بدونها)
 
-    # ADX: سوق عرضي (بلا اتجاه واضح) -> إشارات أقل موثوقية -> تخفيف الدرجة
     adx_val = ind["adx"][i] if i < len(ind["adx"]) else None
     ranging = adx_val is not None and adx_val < ADX_THRESHOLD
-    if ranging:
-        score *= 0.5
 
-    # انحراف صعودي (Bullish Divergence) بين السعر و RSI -> إشارة انعكاس قوية -> تعزيز الدرجة
     divergence = bullish_divergence(ind["closes"][:i + 1], ind["rsi"][:i + 1])
-    if divergence:
-        score += 1
 
-    # القرب من مقاومة قوية فوق السعر مباشرة -> مخاطرة ارتداد للأسفل -> تخفيض الدرجة
     resistance = nearest_resistance(ind["highs"][:i + 1], ind["closes"][:i + 1])
     near_resistance = False
     if resistance:
         dist_pct = (resistance - price) / price * 100
         near_resistance = 0 <= dist_pct <= RESISTANCE_PROXIMITY_PCT
+
+    obv_confirm = obv_confirms_trend(ind["obv"][:i + 1], trend_up)
+
+    if apply_extra_filters:
+        if ranging:
+            score *= 0.5
+        if divergence:
+            score += 1
         if near_resistance:
             score -= 1
-
-    # OBV: هل الحجم التراكمي يدعم اتجاه السعر فعليًا (وليس فقط حجم شمعة واحدة) -> تعزيز إضافي بسيط
-    obv_confirm = obv_confirms_trend(ind["obv"][:i + 1], trend_up)
-    if obv_confirm:
-        score += trend_dir * 0.5
+        if obv_confirm:
+            score += trend_dir * 0.5
 
     return {
         "score": score, "trend_up": trend_up, "vol_confirm": vol_confirm, "rv": rv,
