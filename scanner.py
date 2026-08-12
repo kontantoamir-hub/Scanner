@@ -25,6 +25,16 @@ HTF_MAP = {"15m": "1h", "1h": "4h", "4h": "1d", "1d": "1w"}
 
 BASE_URL = "https://data-api.binance.vision/api/v3"
 
+# ---------- إعدادات فلاتر التحليل الإضافية (ADX / الانحراف / المقاومة / OBV) ----------
+ADX_PERIOD = 14
+ADX_THRESHOLD = 20              # تحت هذا المستوى يُعتبر السوق عرضيًا (بلا اتجاه واضح)
+DIVERGENCE_LOOKBACK = 20        # عدد الشموع للبحث فيها عن قيعان سعرية للمقارنة مع RSI
+DIVERGENCE_PIVOT_SPAN = 3       # عدد الشموع على كل جانب لاعتبار نقطة "قاع محلي"
+RESISTANCE_LOOKBACK = 50        # عدد الشموع للبحث فيها عن أقرب مقاومة سابقة
+RESISTANCE_PIVOT_SPAN = 3       # عدد الشموع على كل جانب لاعتبار نقطة "قمة محلية"
+RESISTANCE_PROXIMITY_PCT = 1.5  # لو السعر أقرب من هذه النسبة% لمقاومة فوقه -> تحذير
+OBV_TREND_WINDOW = 10           # عدد الشموع لقياس اتجاه OBV مقابل اتجاه السعر
+
 
 # ---------------- دوال المؤشرات الفنية ----------------
 
@@ -83,6 +93,117 @@ def rolling_avg(values, period):
     return out
 
 
+def adx(highs, lows, closes, period=ADX_PERIOD):
+    """
+    مؤشر قوة الاتجاه (ADX) — يميّز السوق المتجه بوضوح عن السوق العرضي المتذبذب.
+    قيمة أقل من ~20 تعني غالبًا سوقًا بلا اتجاه واضح، حيث تكثر الإشارات الكاذبة.
+    يرجع قائمة بنفس طول closes، بقيم None قبل اكتمال فترة الحساب.
+    """
+    n = len(closes)
+    out = [None] * n
+    if n <= period * 2:
+        return out
+
+    tr = [0.0] * n
+    plus_dm = [0.0] * n
+    minus_dm = [0.0] * n
+    for i in range(1, n):
+        up_move = highs[i] - highs[i - 1]
+        down_move = lows[i - 1] - lows[i]
+        plus_dm[i] = up_move if (up_move > down_move and up_move > 0) else 0.0
+        minus_dm[i] = down_move if (down_move > up_move and down_move > 0) else 0.0
+        tr[i] = max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+
+    tr_sum = sum(tr[1:period + 1])
+    plus_sum = sum(plus_dm[1:period + 1])
+    minus_sum = sum(minus_dm[1:period + 1])
+
+    dx = [None] * n
+    for i in range(period + 1, n):
+        tr_sum = tr_sum - (tr_sum / period) + tr[i]
+        plus_sum = plus_sum - (plus_sum / period) + plus_dm[i]
+        minus_sum = minus_sum - (minus_sum / period) + minus_dm[i]
+        pdi = 100 * plus_sum / tr_sum if tr_sum else 0
+        mdi = 100 * minus_sum / tr_sum if tr_sum else 0
+        dx[i] = 100 * abs(pdi - mdi) / (pdi + mdi) if (pdi + mdi) else 0
+
+    start = period * 2
+    valid_dx = [x for x in dx[period + 1:start + 1] if x is not None]
+    if not valid_dx:
+        return out
+    out[start] = sum(valid_dx) / len(valid_dx)
+    for i in range(start + 1, n):
+        if out[i - 1] is None or dx[i] is None:
+            continue
+        out[i] = (out[i - 1] * (period - 1) + dx[i]) / period
+    return out
+
+
+def obv(closes, vols):
+    """
+    On-Balance Volume — يجمع الحجم مع اتجاه السعر، لكشف هل الحجم يدعم الحركة فعليًا
+    أم أن الصعود/الهبوط يحدث بحجم ضعيف (أقل موثوقية).
+    """
+    out = [0.0] * len(closes)
+    for i in range(1, len(closes)):
+        if closes[i] > closes[i - 1]:
+            out[i] = out[i - 1] + vols[i]
+        elif closes[i] < closes[i - 1]:
+            out[i] = out[i - 1] - vols[i]
+        else:
+            out[i] = out[i - 1]
+    return out
+
+
+def obv_confirms_trend(obv_vals, trend_up, window=OBV_TREND_WINDOW):
+    """يتحقق هل اتجاه OBV خلال آخر window شمعة يتماشى مع اتجاه السعر (EMA9/21)."""
+    if len(obv_vals) <= window:
+        return False
+    obv_slope_up = obv_vals[-1] > obv_vals[-1 - window]
+    return obv_slope_up == trend_up
+
+
+def bullish_divergence(closes, rsi_vals, lookback=DIVERGENCE_LOOKBACK, pivot_span=DIVERGENCE_PIVOT_SPAN):
+    """
+    يكشف انحراف صعودي: السعر يصنع قاعًا أدنى من القاع السابق، بينما RSI يصنع قاعًا أعلى —
+    من أقوى إشارات احتمال الانعكاس للأعلى عند المحترفين.
+    """
+    n = len(closes)
+    if n < lookback + pivot_span * 2:
+        return False
+    start = n - lookback
+    lows_idx = []
+    for i in range(max(start, pivot_span), n - pivot_span):
+        if rsi_vals[i] is None:
+            continue
+        window = closes[i - pivot_span:i + pivot_span + 1]
+        if closes[i] == min(window):
+            lows_idx.append(i)
+    if len(lows_idx) < 2:
+        return False
+    i1, i2 = lows_idx[-2], lows_idx[-1]
+    if rsi_vals[i1] is None or rsi_vals[i2] is None:
+        return False
+    price_lower_low = closes[i2] < closes[i1]
+    rsi_higher_low = rsi_vals[i2] > rsi_vals[i1]
+    return price_lower_low and rsi_higher_low
+
+
+def nearest_resistance(highs, closes, lookback=RESISTANCE_LOOKBACK, pivot_span=RESISTANCE_PIVOT_SPAN):
+    """يرجع أقرب مستوى مقاومة (قمة سعرية سابقة) فوق السعر الحالي، أو None لو لا توجد."""
+    n = len(highs)
+    window_n = min(lookback, n)
+    start = n - window_n
+    price = closes[-1]
+    pivots = []
+    for i in range(max(start, pivot_span), n - pivot_span):
+        window = highs[i - pivot_span:i + pivot_span + 1]
+        if highs[i] == max(window):
+            pivots.append(highs[i])
+    above = [p for p in pivots if p > price]
+    return min(above) if above else None
+
+
 def compute_indicators(klines):
     closes = [float(k[4]) for k in klines]
     highs = [float(k[2]) for k in klines]
@@ -97,6 +218,8 @@ def compute_indicators(klines):
         "macd": macd_line, "signal": signal,
         "bb_upper": bb_upper, "bb_lower": bb_lower,
         "vol_avg": rolling_avg(vols, 20),
+        "adx": adx(highs, lows, closes),
+        "obv": obv(closes, vols),
     }
 
 
@@ -113,7 +236,41 @@ def score_at(i, ind):
     trend_dir = 1 if trend_up else -1
     vol_score = trend_dir * 0.5 if vol_confirm else 0
     score = trend_dir + rsi_state + (1 if macd_bull else -1) + bb_state + vol_score
-    return {"score": score, "trend_up": trend_up, "vol_confirm": vol_confirm, "rv": rv}
+
+    # --- فلاتر إضافية لتحسين جودة الإشارة ---
+
+    # ADX: سوق عرضي (بلا اتجاه واضح) -> إشارات أقل موثوقية -> تخفيف الدرجة
+    adx_val = ind["adx"][i] if i < len(ind["adx"]) else None
+    ranging = adx_val is not None and adx_val < ADX_THRESHOLD
+    if ranging:
+        score *= 0.5
+
+    # انحراف صعودي (Bullish Divergence) بين السعر و RSI -> إشارة انعكاس قوية -> تعزيز الدرجة
+    divergence = bullish_divergence(ind["closes"][:i + 1], ind["rsi"][:i + 1])
+    if divergence:
+        score += 1
+
+    # القرب من مقاومة قوية فوق السعر مباشرة -> مخاطرة ارتداد للأسفل -> تخفيض الدرجة
+    resistance = nearest_resistance(ind["highs"][:i + 1], ind["closes"][:i + 1])
+    near_resistance = False
+    if resistance:
+        dist_pct = (resistance - price) / price * 100
+        near_resistance = 0 <= dist_pct <= RESISTANCE_PROXIMITY_PCT
+        if near_resistance:
+            score -= 1
+
+    # OBV: هل الحجم التراكمي يدعم اتجاه السعر فعليًا (وليس فقط حجم شمعة واحدة) -> تعزيز إضافي بسيط
+    obv_confirm = obv_confirms_trend(ind["obv"][:i + 1], trend_up)
+    if obv_confirm:
+        score += trend_dir * 0.5
+
+    return {
+        "score": score, "trend_up": trend_up, "vol_confirm": vol_confirm, "rv": rv,
+        "adx_val": adx_val, "ranging": ranging,
+        "divergence": divergence,
+        "near_resistance": near_resistance, "resistance": resistance,
+        "obv_confirm": obv_confirm,
+    }
 
 
 def atr_percent(ind, period=14):
@@ -256,6 +413,10 @@ def analyze_symbol(t, interval):
             "persistent": persistent,
             "htf_checked": htf_checked,
             "htf_aligned": htf_aligned,
+            "ranging": r["ranging"],
+            "divergence": r["divergence"],
+            "near_resistance": r["near_resistance"],
+            "obv_confirm": r["obv_confirm"],
             "entry": entry, "sl": sl, "tps": tps,
         }
     except Exception as e:
@@ -323,6 +484,14 @@ def format_alert(r, market_caution=False):
         badges.append("مستقرة")
     if r["htf_checked"]:
         badges.append("متوافقة مع فريم أعلى" if r["htf_aligned"] else "تعاكس فريم أعلى")
+    if r.get("divergence"):
+        badges.append("انحراف صعودي مؤكد")
+    if r.get("obv_confirm"):
+        badges.append("حجم داعم (OBV)")
+    if r.get("ranging"):
+        badges.append("⚠️ سوق عرضي (ADX ضعيف)")
+    if r.get("near_resistance"):
+        badges.append("⚠️ قريب من مقاومة قوية")
     badge_txt = f" ({', '.join(badges)})" if badges else ""
 
     lines = [
@@ -648,7 +817,11 @@ def main():
 
     results = run_scan(tickers)
 
-    strong = [r for r in results if r["score"] >= 2.5 and r["vol_confirm"] and r["atr_pct"] >= 0.12 and r["persistent"]]
+    strong = [
+        r for r in results
+        if r["score"] >= 2.5 and r["vol_confirm"] and r["atr_pct"] >= 0.12 and r["persistent"]
+        and not r["ranging"] and not r["near_resistance"]
+    ]
     strong_symbols = {r["symbol"] for r in strong}
 
     prev_alerted, prev_dominance = load_state()
