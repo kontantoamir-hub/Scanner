@@ -55,6 +55,12 @@ ACCUM_WINDOW = 20               # عدد الشموع لقياس التراكم 
 ACCUM_PRICE_MAX_MOVE_PCT = 4.0  # أقصى تحرك سعري% خلال النافذة كي يُعتبر السعر "شبه ثابت"
 ACCUM_FLOW_RATIO_MIN = 0.3      # أدنى نسبة صافي تدفق شراء (OBV/حجم) كي يُعتبر تراكمًا واضحًا
 
+# ---------------- إعدادات أهداف الإشارات المبكرة (تقديرية، أقل ثقة من الإشارة الرسمية) ----------------
+# وقف خسارة أوسع من الإشارة الرسمية (1.5×ATR) لأن نقطة الدخول أقل دقة والتقلب حولها أعلى
+EARLY_SL_ATR_MULT = 2.0
+# "احتمالية" (شرط واحد فقط: squeeze أو accumulation) مقابل "مؤكدة" (شرطان فأكثر، بما فيها الانحراف الصعودي)
+EARLY_CONFIRMED_MIN_CONDITIONS = 2
+
 
 # ---------------- دوال المؤشرات الفنية ----------------
 
@@ -484,6 +490,25 @@ def analyze_symbol(t, interval):
         squeeze = volatility_squeeze(ind["bb_upper"], ind["bb_lower"], ind["closes"])
         accumulation = silent_accumulation(ind["closes"], ind["vols"], ind["obv"])
 
+        # أهداف تقديرية للإشارة المبكرة نفسها (وليس فقط تحذير بدون أرقام):
+        # وقف خسارة أوسع (ATR×2) لأن الدخول أقل تأكيدًا، وعدد أهداف حسب مستوى الثقة
+        # (شرط واحد = احتمالية وهدف واحد، شرطان فأكثر = مؤكدة وهدفان)، مع تقليم أي هدف
+        # يتجاوز أقرب مقاومة معروفة كي لا نضع هدفًا خلف حاجز سعري واضح.
+        early_entry = early_sl = None
+        early_tps = []
+        early_confidence = None
+        if squeeze or accumulation:
+            conditions_met = sum([squeeze, accumulation, r["divergence"]])
+            early_confidence = "مؤكدة" if conditions_met >= EARLY_CONFIRMED_MIN_CONDITIONS else "احتمالية"
+            early_entry = ind["closes"][last]
+            atrv = atr_value(ind)
+            early_sl = early_entry - atrv * EARLY_SL_ATR_MULT
+            early_risk = early_entry - early_sl
+            early_tp_count = 2 if conditions_met >= EARLY_CONFIRMED_MIN_CONDITIONS else 1
+            raw_tps = [early_entry + early_risk * i for i in range(1, early_tp_count + 1)]
+            resistance = r.get("resistance")
+            early_tps = [min(tp, resistance) for tp in raw_tps] if resistance else raw_tps
+
         # خطة دخول (شراء فقط — السوق الفوري لا يدعم فتح صفقة بيع مكشوفة)، محسوبة ديناميكيًا حسب التحليل:
         # وقف الخسارة من التقلب الفعلي (ATR) للعملة، وعدد الأهداف حسب قوة درجة التوافق
         entry = sl = None
@@ -524,6 +549,8 @@ def analyze_symbol(t, interval):
             "squeeze": squeeze,
             "accumulation": accumulation,
             "entry": entry, "sl": sl, "tps": tps,
+            "early_entry": early_entry, "early_sl": early_sl, "early_tps": early_tps,
+            "early_confidence": early_confidence,
         }
     except Exception as e:
         print(f"[تخطي] {symbol}: {e}")
@@ -627,25 +654,40 @@ def format_alert(r, market_caution=False):
 def format_early_alert(r):
     """
     تنبيه رادار مبكر: انضغاط تقلب و/أو تراكم صامت لعملة لم تصل بعد لإشارة شراء كاملة.
-    بدون خطة دخول/أهداف/وقف خسارة — تحذير احتمالي فقط للمراقبة اليدوية.
+    يعرض أهدافًا تقديرية (وقف خسارة أوسع من الرسمية + هدف/هدفين حسب مستوى الثقة)،
+    وتُتابَع تلقائيًا (TP/SL) ضمن نفس آلية الصفقات المفتوحة — لكنها تبقى أقل تأكيدًا
+    من الإشارة الرسمية.
     """
     badges = []
     if r.get("squeeze"):
         badges.append("انضغاط تقلب (Squeeze)")
     if r.get("accumulation"):
         badges.append("تراكم صامت (OBV)")
+    if r.get("divergence"):
+        badges.append("انحراف صعودي")
     if r.get("extended"):
         badges.append("⚠️ حركة ممتدة (احتمال فوات الفرصة)")
     badge_txt = ", ".join(badges)
 
+    confidence = r.get("early_confidence")
+    dot = "🟣" if confidence == "مؤكدة" else "🔵"
+    title = f"إشارة مبكرة — {confidence}" if confidence else "إشارة مبكرة"
+
     lines = [
-        "🔵 إشارة مبكرة — تجمّع محتمل",
+        f"{dot} {title}",
         r['symbol'].replace('USDT', '/USDT'),
         f"المؤشرات: {badge_txt}",
         f"الدرجة الحالية: {r['score']:.1f} | فريم: {INTERVAL}",
         f"السعر الحالي: {r['price']:.6g}",
-        "⚠️ تحذير احتمالي فقط، ليست خطة دخول مؤكدة — راقب العملة يدويًا",
     ]
+
+    if r.get("early_entry") is not None:
+        lines.append(f"الدخول التقديري: {r['early_entry']:.6g}")
+        for i, tp in enumerate(r.get("early_tps", []), start=1):
+            lines.append(f"هدف تقديري {i}: {tp:.6g}")
+        lines.append(f"وقف خسارة تقديري: {r['early_sl']:.6g}")
+
+    lines.append("⚠️ أهداف تقديرية أقل ثقة من الإشارة الرسمية — البوت سيتابعها تلقائيًا ويُشعرك عند تحقق هدف أو ضرب وقف الخسارة")
     return "\n".join(lines)
 
 
@@ -771,6 +813,30 @@ def open_new_positions(positions, fresh_signals):
             "trend_up": r["trend_up"],   # اتجاه EMA9/21 وقت فتح الصفقة، يُستخدم لاحقًا لكشف انعكاس الإشارة
             "interval": INTERVAL,
             "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "type": "official",
+        })
+
+
+def open_new_early_positions(positions, fresh_early_signals):
+    """
+    يفتح متابعة تلقائية (TP/SL) لإشارات مبكرة توفّرت لها أهداف تقديرية، بنفس آلية
+    الصفقات الرسمية لكن بحقل type="early" يُستخدم لاحقًا لتمييز رسائل النتيجة.
+    """
+    for r in fresh_early_signals:
+        if r.get("early_entry") is None:
+            continue
+        positions.append({
+            "symbol": r["symbol"],
+            "entry": r["early_entry"],
+            "sl": r["early_sl"],
+            "tps": r["early_tps"],
+            "hit_tps": [],
+            "score": r["score"],
+            "trend_up": r["trend_up"],
+            "interval": INTERVAL,
+            "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "type": "early",
+            "confidence": r.get("early_confidence"),
         })
 
 
@@ -816,8 +882,10 @@ def format_sl_hit(pos, price):
     sl = pos["sl"]
     pct_drop = (sl - entry) / entry * 100
     duration = format_duration(_hours_since(pos["opened_at"]))
+    is_early = pos.get("type") == "early"
+    header = "❌ (إشارة مبكرة) " if is_early else "❌ "
     return (
-        f"❌ {pos['symbol'].replace('USDT', '/USDT')}\n"
+        f"{header}{pos['symbol'].replace('USDT', '/USDT')}\n"
         f"سعر الدخول: {entry:.6g}\n"
         f"SL: {sl:.6g}\n"
         f"نسبة النزول: {pct_drop:.2f}%\n"
@@ -830,10 +898,13 @@ def format_tp_hit(pos, tp_index, price):
     tp = pos["tps"][tp_index]
     pct_gain = (tp - entry) / entry * 100
     duration = format_duration(_hours_since(pos["opened_at"]))
+    is_early = pos.get("type") == "early"
+    header = "✅ (إشارة مبكرة) " if is_early else "✅ "
+    tp_label = f"هدف تقديري {tp_index + 1}" if is_early else f"TP{tp_index + 1}"
     return (
-        f"✅ {pos['symbol'].replace('USDT', '/USDT')}\n"
+        f"{header}{pos['symbol'].replace('USDT', '/USDT')}\n"
         f"سعر الدخول: {entry:.6g}\n"
-        f"TP{tp_index + 1}: {tp:.6g}\n"
+        f"{tp_label}: {tp:.6g}\n"
         f"نسبة الصعود: +{pct_gain:.2f}%\n"
         f"المدة الزمنية لتحقيق الهدف: {duration}"
     )
@@ -995,8 +1066,9 @@ def main():
         send_telegram(format_early_alert(r))
         time.sleep(1)
 
-    # تسجيل الإشارات الجديدة كصفقات مفتوحة قيد المتابعة لاحقًا
+    # تسجيل الإشارات الجديدة كصفقات مفتوحة قيد المتابعة لاحقًا (رسمية + مبكرة)
     open_new_positions(open_positions, fresh)
+    open_new_early_positions(open_positions, fresh_early)
 
     # حفظ موحّد: ذاكرة الإشارات (رسمية + مبكرة) + BTC Dominance + الصفقات المفتوحة + أرشيف الصفقات المغلقة حديثًا
     save_all_state(strong_symbols | early_keys, btc_dominance, open_positions, closed_now)
