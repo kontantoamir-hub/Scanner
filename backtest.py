@@ -13,6 +13,10 @@
      يجعل نسبة النجاح متفائلة بشكل غير واقعي.
   3) تقرير عدد الصفقات التي بقيت مفتوحة بلا حسم حتى نهاية فترة الاختبار (unresolved)،
      حتى تُعرف حدود موثوقية الأرقام المعروضة.
+  4) توسيع العينة الافتراضية (365 يوم / 30 عملة بدل 180 يوم / 15 عملة) لتقليل أثر الضجيج
+     الإحصائي على عملة أو فترة بعينها.
+  5) اختبار عدة عتبات دخول (SCORE_THRESHOLDS) في نفس التشغيلة — بدل عتبة 2.5 الثابتة —
+     لمعرفة هل تشديد شرط الدخول يحسّن EV، مع جدول مقارنة نهائي بين كل العتبات.
 
 تشغيل يدوي فقط (لا يعمل بجدولة تلقائية):
     python backtest.py
@@ -31,13 +35,17 @@ from scanner import (
 
 # ---------- إعدادات الاختبار الرجعي ----------
 BACKTEST_INTERVAL = os.environ.get("BACKTEST_INTERVAL", "1h")
-BACKTEST_DAYS = int(os.environ.get("BACKTEST_DAYS", "180"))          # مدة الفترة المُختبَرة بالأيام
-BACKTEST_SYMBOL_COUNT = int(os.environ.get("BACKTEST_SYMBOL_COUNT", "15"))  # عدد العملات
+BACKTEST_DAYS = int(os.environ.get("BACKTEST_DAYS", "365"))          # مدة الفترة المُختبَرة بالأيام (وُسّعت من 180)
+BACKTEST_SYMBOL_COUNT = int(os.environ.get("BACKTEST_SYMBOL_COUNT", "30"))  # عدد العملات (وُسّع من 15)
 WARMUP_CANDLES = 250  # عدد الشموع الأولى المستخدمة فقط لتهيئة المؤشرات (لا تُستخدم كإشارات)
 
 # نسبة العمولة لكل جهة (%) — الافتراضي 0.1% يطابق Taker العادي على Binance Spot.
 # رسوم الصفقة الكاملة (دخول + خروج) = FEE_PCT * 2
 FEE_PCT = float(os.environ.get("FEE_PCT", "0.1"))
+
+# عتبات درجة الدخول المراد اختبارها في نفس التشغيلة (تُطبَّق فقط على نسخة "مع الفلاتر"،
+# لأنها أثبتت أداءً أفضل في الاختبارات السابقة). القيمة الأولى (2.5) هي الأساس الحالي في scanner.py.
+SCORE_THRESHOLDS = [float(x) for x in os.environ.get("SCORE_THRESHOLDS", "2.5,3.0,3.5,4.0").split(",")]
 
 
 # ---------------- جلب بيانات تاريخية طويلة (تتجاوز حد الـ1000 شمعة لكل طلب) ----------------
@@ -96,7 +104,7 @@ def htf_index_for(ltf_close_time, htf_close_times):
     return idx if idx >= 0 else None
 
 
-def backtest_symbol(symbol, interval, klines, htf_klines, apply_extra_filters):
+def backtest_symbol(symbol, interval, klines, htf_klines, apply_extra_filters, score_threshold=2.5):
     ind = compute_indicators(klines)
     htf_ind = compute_indicators(htf_klines) if len(htf_klines) > 30 else None
     htf_close_times = [k[6] for k in htf_klines] if htf_ind else []
@@ -166,7 +174,7 @@ def backtest_symbol(symbol, interval, klines, htf_klines, apply_extra_filters):
                 final_score += (trend_dir * 0.5) if htf_aligned else (-trend_dir * 0.5)
 
         strong = (
-            final_score >= 2.5 and r["vol_confirm"] and persistent
+            final_score >= score_threshold and r["vol_confirm"] and persistent
         )
         if apply_extra_filters:
             strong = strong and not r["ranging"] and not r["near_resistance"]
@@ -265,14 +273,14 @@ def main():
     symbols = pick_backtest_symbols(BACKTEST_SYMBOL_COUNT)
     print(f"عملات الاختبار ({len(symbols)}): {', '.join(s.replace('USDT','/USDT') for s in symbols)}")
     print(f"رسوم مفترضة: {FEE_PCT:.3f}% لكل جهة ({FEE_PCT*2:.3f}% لكل صفقة كاملة)")
+    print(f"عتبات الدرجة المُختبَرة (مع الفلاتر): {SCORE_THRESHOLDS}")
 
     end_ms = int(time.time() * 1000)
     start_ms = end_ms - BACKTEST_DAYS * 86400 * 1000
     htf_interval = HTF_MAP.get(BACKTEST_INTERVAL)
 
-    trades_with_filters, trades_without_filters = [], []
-    unresolved_with, unresolved_without = 0, 0
-
+    # جلب بيانات كل عملة مرة واحدة فقط، ثم إعادة استخدامها لكل الاختبارات (توفير طلبات API)
+    symbol_data = []
     for symbol in symbols:
         print(f"\nجلب بيانات {symbol} ({BACKTEST_DAYS} يومًا، فريم {BACKTEST_INTERVAL})...")
         try:
@@ -286,19 +294,51 @@ def main():
             print(f"[تخطي {symbol}] بيانات غير كافية ({len(klines)} شمعة)")
             continue
 
-        t_with, u_with = backtest_symbol(symbol, BACKTEST_INTERVAL, klines, htf_klines, True)
-        t_without, u_without = backtest_symbol(symbol, BACKTEST_INTERVAL, klines, htf_klines, False)
+        symbol_data.append((symbol, klines, htf_klines))
 
+    print("\n" + "=" * 50)
+    print(f"نتائج الاختبار الرجعي — آخر {BACKTEST_DAYS} يومًا — فريم {BACKTEST_INTERVAL}")
+    print("=" * 50)
+
+    # 1) المقارنة الأساسية عند العتبة الافتراضية (2.5): مع الفلاتر مقابل بدونها
+    base_threshold = SCORE_THRESHOLDS[0]
+    trades_with_filters, unresolved_with = [], 0
+    trades_without_filters, unresolved_without = [], 0
+    for symbol, klines, htf_klines in symbol_data:
+        t_with, u_with = backtest_symbol(symbol, BACKTEST_INTERVAL, klines, htf_klines, True, base_threshold)
+        t_without, u_without = backtest_symbol(symbol, BACKTEST_INTERVAL, klines, htf_klines, False, base_threshold)
         trades_with_filters += t_with
         trades_without_filters += t_without
         unresolved_with += u_with
         unresolved_without += u_without
 
+    summarize(trades_with_filters, f"مع الفلاتر الجديدة (ADX/انحراف/مقاومة/OBV) — عتبة {base_threshold}", unresolved_with)
+    summarize(trades_without_filters, f"بدون الفلاتر الجديدة (المنطق القديم فقط) — عتبة {base_threshold}", unresolved_without)
+
+    # 2) اختبار العتبات الإضافية (مع الفلاتر فقط، لأنها أثبتت أنها الأفضل)
+    threshold_summaries = [(base_threshold, trades_with_filters, unresolved_with)]
+    for threshold in SCORE_THRESHOLDS[1:]:
+        trades_t, unresolved_t = [], 0
+        for symbol, klines, htf_klines in symbol_data:
+            t, u = backtest_symbol(symbol, BACKTEST_INTERVAL, klines, htf_klines, True, threshold)
+            trades_t += t
+            unresolved_t += u
+        summarize(trades_t, f"مع الفلاتر — عتبة {threshold}", unresolved_t)
+        threshold_summaries.append((threshold, trades_t, unresolved_t))
+
+    # 3) جدول مقارنة نهائي يسهّل اختيار أفضل عتبة دفعة واحدة
     print("\n" + "=" * 50)
-    print(f"نتائج الاختبار الرجعي — آخر {BACKTEST_DAYS} يومًا — فريم {BACKTEST_INTERVAL}")
+    print("جدول مقارنة العتبات (مع الفلاتر فقط)")
     print("=" * 50)
-    summarize(trades_with_filters, "مع الفلاتر الجديدة (ADX / انحراف / مقاومة / OBV)", unresolved_with)
-    summarize(trades_without_filters, "بدون الفلاتر الجديدة (المنطق القديم فقط)", unresolved_without)
+    print(f"{'العتبة':>8} | {'الصفقات':>8} | {'نسبة النجاح':>12} | {'EV صافي/صفقة':>14}")
+    for threshold, trades_t, _ in threshold_summaries:
+        if not trades_t:
+            print(f"{threshold:>8} | {'0':>8} | {'-':>12} | {'-':>14}")
+            continue
+        pcts = [net_pct(t) for t in trades_t]
+        win_rate = sum(1 for p in pcts if p > 0) / len(pcts) * 100
+        ev = sum(pcts) / len(pcts)
+        print(f"{threshold:>8} | {len(trades_t):>8} | {win_rate:>11.1f}% | {ev:>+13.3f}%")
 
 
 if __name__ == "__main__":
