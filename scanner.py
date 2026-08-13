@@ -594,17 +594,58 @@ def run_scan(tickers=None):
 
 # ---------------- تيليجرام ----------------
 
-def send_telegram(text):
+def send_telegram(text, parse_mode=None):
+    """يرسل رسالة تيليجرام ويرجع message_id الخاص بها (أو None عند الفشل) كي يمكن تعديلها لاحقًا."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ TELEGRAM_TOKEN أو TELEGRAM_CHAT_ID غير موجودين — تخطي الإرسال.")
-        return
+        return None
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    if parse_mode:
+        data["parse_mode"] = parse_mode
     try:
-        resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=15)
+        resp = requests.post(url, data=data, timeout=15)
         if not resp.ok:
             print("فشل إرسال تيليجرام:", resp.text)
+            return None
+        return resp.json().get("result", {}).get("message_id")
     except Exception as e:
         print("خطأ إرسال تيليجرام:", e)
+        return None
+
+
+def edit_telegram_message(message_id, text, parse_mode="HTML"):
+    """يعدّل رسالة تيليجرام سابقة (عبر message_id) بدل إرسال رسالة جديدة."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not message_id:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id, "text": text}
+    if parse_mode:
+        data["parse_mode"] = parse_mode
+    try:
+        resp = requests.post(url, data=data, timeout=15)
+        if not resp.ok:
+            print("فشل تعديل رسالة تيليجرام:", resp.text)
+            return False
+        return True
+    except Exception as e:
+        print("خطأ تعديل رسالة تيليجرام:", e)
+        return False
+
+
+def mark_original_message(pos, status_line):
+    """
+    يرجع لرسالة الإشارة الأولى (المحفوظ message_id الخاص بها) ويشطبها بخط في الوسط
+    (strikethrough) ثم يضيف سطر الحالة النهائية (تحقق الهدف / ضرب وقف الخسارة).
+    لا يفعل شيئًا لو لم يوجد message_id أو نص أصلي محفوظين (صفقات قديمة قبل هذا التحديث مثلاً).
+    """
+    orig = pos.get("orig_text")
+    mid = pos.get("message_id")
+    if not orig or not mid:
+        return
+    escaped = orig.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    edited_text = f"<s>{escaped}</s>\n\n{status_line}"
+    edit_telegram_message(mid, edited_text, parse_mode="HTML")
 
 
 def format_alert(r, market_caution=False):
@@ -814,6 +855,8 @@ def open_new_positions(positions, fresh_signals):
             "interval": INTERVAL,
             "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "type": "official",
+            "message_id": r.get("message_id"),
+            "orig_text": r.get("orig_text"),
         })
 
 
@@ -837,6 +880,8 @@ def open_new_early_positions(positions, fresh_early_signals):
             "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "type": "early",
             "confidence": r.get("early_confidence"),
+            "message_id": r.get("message_id"),
+            "orig_text": r.get("orig_text"),
         })
 
 
@@ -944,6 +989,7 @@ def check_open_positions(positions, price_map):
 
         if price <= pos["sl"]:
             send_telegram(format_sl_hit(pos, price))
+            mark_original_message(pos, "❌ ضُرب وقف الخسارة")
             pos["closed_reason"] = "SL"
             pos["closed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
             pos["exit_price"] = price
@@ -957,6 +1003,11 @@ def check_open_positions(positions, price_map):
             for i in newly_hit:
                 send_telegram(format_tp_hit(pos, i, price))
                 time.sleep(1)
+            tp_labels = [
+                (f"هدف تقديري {i + 1}" if pos.get("type") == "early" else f"TP{i + 1}")
+                for i in sorted(pos["hit_tps"])
+            ]
+            mark_original_message(pos, "✅ تحقق: " + "، ".join(tp_labels))
             if pos["sl"] < pos["entry"]:
                 pos["sl"] = pos["entry"]  # نقل SL لنقطة التعادل بعد أول هدف محقق
 
@@ -1059,11 +1110,15 @@ def main():
 
     for r in fresh:
         caution = market_caution and not r["symbol"].startswith("BTC")
-        send_telegram(format_alert(r, caution))
+        text = format_alert(r, caution)
+        r["orig_text"] = text
+        r["message_id"] = send_telegram(text)
         time.sleep(1)  # تجنب تجاوز حد تيليجرام لعدد الرسائل بالثانية
 
     for r in fresh_early:
-        send_telegram(format_early_alert(r))
+        text = format_early_alert(r)
+        r["orig_text"] = text
+        r["message_id"] = send_telegram(text)
         time.sleep(1)
 
     # تسجيل الإشارات الجديدة كصفقات مفتوحة قيد المتابعة لاحقًا (رسمية + مبكرة)
