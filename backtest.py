@@ -5,6 +5,15 @@
 يقارن أيضًا الأداء مع الفلاتر الأربعة الجديدة (ADX / انحراف / مقاومة / OBV) مقابل بدونها،
 للتحقق هل تحسّن جودة الإشارات فعلاً أم لا.
 
+تعديلات عن النسخة الأصلية:
+  1) خصم رسوم التداول (FEE_PCT لكل جهة) من نتيجة كل صفقة، لمطابقة الواقع.
+  2) محاكاة أسباب إغلاق إضافية موجودة في البوت الحي وغائبة سابقًا عن الاختبار الرجعي:
+     انعكاس الاتجاه (EMA9/21) والسقف الزمني (TIME_STOP_HOURS). بدون هذا، كانت الصفقات
+     التي لا تصل لا لآخر TP ولا لـ SL تبقى "معلّقة" وتُستبعد بصمت من الإحصائيات، مما
+     يجعل نسبة النجاح متفائلة بشكل غير واقعي.
+  3) تقرير عدد الصفقات التي بقيت مفتوحة بلا حسم حتى نهاية فترة الاختبار (unresolved)،
+     حتى تُعرف حدود موثوقية الأرقام المعروضة.
+
 تشغيل يدوي فقط (لا يعمل بجدولة تلقائية):
     python backtest.py
 """
@@ -17,18 +26,21 @@ from scanner import (
     compute_indicators, score_at,
     fetch_ticker24h,
     EXCLUDE_SUFFIX, EXCLUDE_SYMS, LIQUIDITY_FLOOR, HTF_MAP,
-    BASE_URL, _request_with_retry,
+    BASE_URL, _request_with_retry, TIME_STOP_HOURS,
 )
 
 # ---------- إعدادات الاختبار الرجعي ----------
 BACKTEST_INTERVAL = os.environ.get("BACKTEST_INTERVAL", "1h")
-BACKTEST_DAYS = int(os.environ.get("BACKTEST_DAYS", "180"))       # مدة الفترة المُختبَرة بالأيام
+BACKTEST_DAYS = int(os.environ.get("BACKTEST_DAYS", "180"))          # مدة الفترة المُختبَرة بالأيام
 BACKTEST_SYMBOL_COUNT = int(os.environ.get("BACKTEST_SYMBOL_COUNT", "15"))  # عدد العملات
 WARMUP_CANDLES = 250  # عدد الشموع الأولى المستخدمة فقط لتهيئة المؤشرات (لا تُستخدم كإشارات)
 
+# نسبة العمولة لكل جهة (%) — الافتراضي 0.1% يطابق Taker العادي على Binance Spot.
+# رسوم الصفقة الكاملة (دخول + خروج) = FEE_PCT * 2
+FEE_PCT = float(os.environ.get("FEE_PCT", "0.1"))
+
 
 # ---------------- جلب بيانات تاريخية طويلة (تتجاوز حد الـ1000 شمعة لكل طلب) ----------------
-
 def fetch_klines_range(symbol, interval, start_ms, end_ms):
     out = []
     cursor = start_ms
@@ -66,7 +78,6 @@ def pick_backtest_symbols(count):
 
 
 # ---------------- محاكاة صفقة واحدة (دخول/خروج) ضمن بيانات تاريخية ----------------
-
 def atr_value_at(ind, i, period=14):
     trs = []
     start = max(1, i - period + 1)
@@ -93,21 +104,46 @@ def backtest_symbol(symbol, interval, klines, htf_klines, apply_extra_filters):
     n = len(ind["closes"])
     trades = []
     open_trade = None
+    unresolved = 0
 
     for i in range(WARMUP_CANDLES, n):
         high, low, price = ind["highs"][i], ind["lows"][i], ind["closes"][i]
 
-        # 1) تحديث الصفقة المفتوحة أولاً (SL له أولوية داخل نفس الشمعة كافتراض متحفّظ)
+        # 1) تحديث الصفقة المفتوحة أولاً (بنفس ترتيب أولويات الفحص في البوت الحي)
         if open_trade:
+            closed = False
+
+            # أ) وقف الخسارة (يُفترض متحفظًا أنه يُفحص أولًا داخل نفس الشمعة)
             if low <= open_trade["sl"]:
                 open_trade.update(exit_price=open_trade["sl"], exit_index=i, result="SL")
                 trades.append(open_trade)
                 open_trade = None
-            else:
-                if high >= open_trade["tps"][-1]:
-                    open_trade.update(exit_price=open_trade["tps"][-1], exit_index=i, result="ALL_TP")
+                closed = True
+
+            # ب) الوصول لآخر هدف ربح (إغلاق كامل)
+            elif high >= open_trade["tps"][-1]:
+                open_trade.update(exit_price=open_trade["tps"][-1], exit_index=i, result="ALL_TP")
+                trades.append(open_trade)
+                open_trade = None
+                closed = True
+
+            # ج) انعكاس الاتجاه (EMA9/21) — نفس فحص trend_reversed في البوت الحي
+            if not closed and open_trade:
+                current_trend_up = ind["ema9"][i] > ind["ema21"][i]
+                if current_trend_up != open_trade["trend_up"]:
+                    open_trade.update(exit_price=price, exit_index=i, result="INVALIDATED")
                     trades.append(open_trade)
                     open_trade = None
+                    closed = True
+
+            # د) السقف الزمني — نفس TIME_STOP_HOURS في البوت الحي
+            if not closed and open_trade:
+                hours_open = (klines[i][6] - klines[open_trade["entry_index"]][6]) / 3600000
+                if hours_open >= TIME_STOP_HOURS:
+                    open_trade.update(exit_price=price, exit_index=i, result="EXPIRED")
+                    trades.append(open_trade)
+                    open_trade = None
+                    closed = True
 
         if open_trade:
             continue  # صفقة واحدة مفتوحة بالتوازي لكل عملة، لتبسيط المحاكاة
@@ -134,6 +170,7 @@ def backtest_symbol(symbol, interval, klines, htf_klines, apply_extra_filters):
         )
         if apply_extra_filters:
             strong = strong and not r["ranging"] and not r["near_resistance"]
+
         # فلتر الحد الأدنى للتقلب (ATR%) يُحسب لحظيًا عند الشمعة i، وليس آخر شمعة في السلسلة كلها
         atrv = atr_value_at(ind, i)
         atr_pct_now = atrv / price * 100
@@ -161,59 +198,80 @@ def backtest_symbol(symbol, interval, klines, htf_klines, apply_extra_filters):
         open_trade = {
             "symbol": symbol, "entry_index": i, "entry": entry,
             "sl": sl, "tps": tps, "score": final_score,
+            "trend_up": r["trend_up"],
         }
 
-    return trades
+    if open_trade:
+        unresolved += 1  # صفقة بقيت مفتوحة حتى نهاية بيانات الاختبار — لم تُحسم ولا تُحتسب في الإحصائيات
+
+    return trades, unresolved
 
 
 # ---------------- تجميع الإحصائيات ----------------
+def net_pct(t):
+    """نسبة الربح/الخسارة الصافية للصفقة بعد خصم رسوم الدخول والخروج."""
+    gross = (t["exit_price"] - t["entry"]) / t["entry"] * 100
+    return gross - (FEE_PCT * 2)
 
-def summarize(all_trades, label):
+
+def summarize(all_trades, label, unresolved=0):
     if not all_trades:
         print(f"\n=== {label}: لا توجد صفقات ===")
+        if unresolved:
+            print(f"(صفقات معلّقة لم تُحسم حتى نهاية الفترة: {unresolved})")
         return
 
-    wins = [t for t in all_trades if t["result"] == "ALL_TP"]
-    losses = [t for t in all_trades if t["result"] == "SL"]
     total = len(all_trades)
-    win_rate = len(wins) / total * 100 if total else 0
+    pcts = [net_pct(t) for t in all_trades]
 
-    def pct(t):
-        return (t["exit_price"] - t["entry"]) / t["entry"] * 100
+    # التصنيف الآن بناءً على الربح/الخسارة الصافي الفعلي، وليس فقط سبب الإغلاق —
+    # لأن صفقة EXPIRED أو INVALIDATED قد تكون رابحة أو خاسرة بالصافي
+    wins = [p for p in pcts if p > 0]
+    losses = [p for p in pcts if p <= 0]
 
-    avg_win = sum(pct(t) for t in wins) / len(wins) if wins else 0
-    avg_loss = sum(pct(t) for t in losses) / len(losses) if losses else 0
-    best = max(all_trades, key=pct) if all_trades else None
-    worst = min(all_trades, key=pct) if all_trades else None
+    win_rate = len(wins) / total * 100
+    avg_win = sum(wins) / len(wins) if wins else 0
+    avg_loss = sum(losses) / len(losses) if losses else 0
+    ev = sum(pcts) / total
+
+    by_result = {}
+    for t in all_trades:
+        by_result[t["result"]] = by_result.get(t["result"], 0) + 1
+
+    best_i = max(range(total), key=lambda idx: pcts[idx])
+    worst_i = min(range(total), key=lambda idx: pcts[idx])
 
     print(f"\n=== {label} ===")
-    print(f"إجمالي الصفقات: {total} | رابحة: {len(wins)} | خاسرة: {len(losses)} | نسبة النجاح: {win_rate:.1f}%")
+    print(f"إجمالي الصفقات المغلقة: {total} | صفقات معلّقة (لم تُحسم حتى نهاية الفترة): {unresolved}")
+    print("توزيع أسباب الإغلاق: " + ", ".join(f"{k}={v}" for k, v in by_result.items()))
+    print(f"نسبة الصفقات الرابحة بعد الرسوم ({FEE_PCT*2:.2f}% ذهاب وإياب): {win_rate:.1f}%")
     print(f"متوسط الربح: +{avg_win:.2f}% | متوسط الخسارة: {avg_loss:.2f}%")
-    if best:
-        print(f"أفضل صفقة: {best['symbol'].replace('USDT','/USDT')} ({pct(best):+.2f}%)")
-    if worst:
-        print(f"أسوأ صفقة: {worst['symbol'].replace('USDT','/USDT')} ({pct(worst):+.2f}%)")
+    print(f"القيمة المتوقعة لكل صفقة (EV صافي): {ev:+.3f}%")
+    print(f"أفضل صفقة: {all_trades[best_i]['symbol'].replace('USDT','/USDT')} ({pcts[best_i]:+.2f}%)")
+    print(f"أسوأ صفقة: {all_trades[worst_i]['symbol'].replace('USDT','/USDT')} ({pcts[worst_i]:+.2f}%)")
 
     per_symbol = {}
-    for t in all_trades:
-        per_symbol.setdefault(t["symbol"], []).append(t)
+    for t, p in zip(all_trades, pcts):
+        per_symbol.setdefault(t["symbol"], []).append(p)
     print("توزيع حسب العملة:")
-    for sym, ts in sorted(per_symbol.items(), key=lambda x: -len(x[1])):
-        w = sum(1 for t in ts if t["result"] == "ALL_TP")
-        print(f"  {sym.replace('USDT','/USDT')}: {len(ts)} صفقة | نجاح {w}/{len(ts)}")
+    for sym, ps in sorted(per_symbol.items(), key=lambda x: -len(x[1])):
+        w = sum(1 for p in ps if p > 0)
+        avg = sum(ps) / len(ps)
+        print(f"  {sym.replace('USDT','/USDT')}: {len(ps)} صفقة | نجاح {w}/{len(ps)} | EV متوسط {avg:+.2f}%")
 
 
 # ---------------- التشغيل الرئيسي ----------------
-
 def main():
     symbols = pick_backtest_symbols(BACKTEST_SYMBOL_COUNT)
     print(f"عملات الاختبار ({len(symbols)}): {', '.join(s.replace('USDT','/USDT') for s in symbols)}")
+    print(f"رسوم مفترضة: {FEE_PCT:.3f}% لكل جهة ({FEE_PCT*2:.3f}% لكل صفقة كاملة)")
 
     end_ms = int(time.time() * 1000)
     start_ms = end_ms - BACKTEST_DAYS * 86400 * 1000
     htf_interval = HTF_MAP.get(BACKTEST_INTERVAL)
 
     trades_with_filters, trades_without_filters = [], []
+    unresolved_with, unresolved_without = 0, 0
 
     for symbol in symbols:
         print(f"\nجلب بيانات {symbol} ({BACKTEST_DAYS} يومًا، فريم {BACKTEST_INTERVAL})...")
@@ -228,14 +286,19 @@ def main():
             print(f"[تخطي {symbol}] بيانات غير كافية ({len(klines)} شمعة)")
             continue
 
-        trades_with_filters += backtest_symbol(symbol, BACKTEST_INTERVAL, klines, htf_klines, True)
-        trades_without_filters += backtest_symbol(symbol, BACKTEST_INTERVAL, klines, htf_klines, False)
+        t_with, u_with = backtest_symbol(symbol, BACKTEST_INTERVAL, klines, htf_klines, True)
+        t_without, u_without = backtest_symbol(symbol, BACKTEST_INTERVAL, klines, htf_klines, False)
+
+        trades_with_filters += t_with
+        trades_without_filters += t_without
+        unresolved_with += u_with
+        unresolved_without += u_without
 
     print("\n" + "=" * 50)
     print(f"نتائج الاختبار الرجعي — آخر {BACKTEST_DAYS} يومًا — فريم {BACKTEST_INTERVAL}")
     print("=" * 50)
-    summarize(trades_with_filters, "مع الفلاتر الجديدة (ADX / انحراف / مقاومة / OBV)")
-    summarize(trades_without_filters, "بدون الفلاتر الجديدة (المنطق القديم فقط)")
+    summarize(trades_with_filters, "مع الفلاتر الجديدة (ADX / انحراف / مقاومة / OBV)", unresolved_with)
+    summarize(trades_without_filters, "بدون الفلاتر الجديدة (المنطق القديم فقط)", unresolved_without)
 
 
 if __name__ == "__main__":
