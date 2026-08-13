@@ -727,6 +727,7 @@ def check_open_positions(positions, price_map):
     """
     يقارن الصفقات المفتوحة بالسعر الحالي، يرسل إشعار تيليجرام عند تحقق هدف،
     ضرب وقف خسارة، انعكاس الإشارة الأصلية (EMA)، أو انتهاء السقف الزمني.
+    بعد لمس أول هدف، يُنقل SL لنقطة الدخول (Breakeven) لتفادي تحوّل ربح مؤقت لخسارة كاملة.
     يرجع (الصفقات المتبقية مفتوحة، الصفقات التي أُغلقت الآن).
     """
     still_open, closed_now = [], []
@@ -752,6 +753,8 @@ def check_open_positions(positions, price_map):
             for i in newly_hit:
                 send_telegram(format_tp_hit(pos, i, price))
                 time.sleep(1)
+            if pos["sl"] < pos["entry"]:
+                pos["sl"] = pos["entry"]  # نقل SL لنقطة التعادل بعد أول هدف محقق
 
         if len(pos["hit_tps"]) >= len(pos["tps"]):
             pos["closed_reason"] = "ALL_TP"
