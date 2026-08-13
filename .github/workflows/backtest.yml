@@ -1,0 +1,39 @@
+name: Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      backtest_days:
+        description: 'عدد الأيام التي يغطيها الاختبار الرجعي'
+        required: false
+        default: '180'
+      symbol_count:
+        description: 'عدد العملات المراد اختبارها'
+        required: false
+        default: '15'
+      interval:
+        description: 'الفريم الزمني (15m / 1h / 4h / 1d)'
+        required: false
+        default: '1h'
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run backtest
+        env:
+          BACKTEST_DAYS: ${{ github.event.inputs.backtest_days || '180' }}
+          BACKTEST_SYMBOL_COUNT: ${{ github.event.inputs.symbol_count || '15' }}
+          BACKTEST_INTERVAL: ${{ github.event.inputs.interval || '1h' }}
+        run: python backtest.py
