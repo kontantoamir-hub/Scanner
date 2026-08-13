@@ -17,6 +17,9 @@
      الإحصائي على عملة أو فترة بعينها.
   5) اختبار عدة عتبات دخول (SCORE_THRESHOLDS) في نفس التشغيلة — بدل عتبة 2.5 الثابتة —
      لمعرفة هل تشديد شرط الدخول يحسّن EV، مع جدول مقارنة نهائي بين كل العتبات.
+  6) تتبع الأهداف الجزئية (hit_tps) ونقل SL لنقطة التعادل (Breakeven) بعد أول هدف محقق،
+     بنفس منطق check_open_positions في البوت الحي — لتفادي احتساب صفقة لمست TP1 أو TP2
+     ثم انعكست كخسارة كاملة، وهو ما كان يُخفي جزءًا من الأداء الحقيقي للاستراتيجية.
 
 تشغيل يدوي فقط (لا يعمل بجدولة تلقائية):
     python backtest.py
@@ -128,12 +131,20 @@ def backtest_symbol(symbol, interval, klines, htf_klines, apply_extra_filters, s
                 open_trade = None
                 closed = True
 
-            # ب) الوصول لآخر هدف ربح (إغلاق كامل)
-            elif high >= open_trade["tps"][-1]:
-                open_trade.update(exit_price=open_trade["tps"][-1], exit_index=i, result="ALL_TP")
-                trades.append(open_trade)
-                open_trade = None
-                closed = True
+            # ب) تحديث الأهداف الجزئية المتحققة + نقل SL لنقطة التعادل بعد أول هدف
+            if not closed and open_trade:
+                newly_hit = [k for k, tp in enumerate(open_trade["tps"])
+                             if k not in open_trade["hit_tps"] and high >= tp]
+                if newly_hit:
+                    open_trade["hit_tps"].extend(newly_hit)
+                    if open_trade["sl"] < open_trade["entry"]:
+                        open_trade["sl"] = open_trade["entry"]  # Breakeven بعد أول هدف محقق
+
+                if len(open_trade["hit_tps"]) >= len(open_trade["tps"]):
+                    open_trade.update(exit_price=open_trade["tps"][-1], exit_index=i, result="ALL_TP")
+                    trades.append(open_trade)
+                    open_trade = None
+                    closed = True
 
             # ج) انعكاس الاتجاه (EMA9/21) — نفس فحص trend_reversed في البوت الحي
             if not closed and open_trade:
@@ -206,7 +217,7 @@ def backtest_symbol(symbol, interval, klines, htf_klines, apply_extra_filters, s
         open_trade = {
             "symbol": symbol, "entry_index": i, "entry": entry,
             "sl": sl, "tps": tps, "score": final_score,
-            "trend_up": r["trend_up"],
+            "trend_up": r["trend_up"], "hit_tps": [],
         }
 
     if open_trade:
