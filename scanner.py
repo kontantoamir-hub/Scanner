@@ -634,6 +634,8 @@ def format_early_alert(r):
         badges.append("انضغاط تقلب (Squeeze)")
     if r.get("accumulation"):
         badges.append("تراكم صامت (OBV)")
+    if r.get("extended"):
+        badges.append("⚠️ حركة ممتدة (احتمال فوات الفرصة)")
     badge_txt = ", ".join(badges)
 
     lines = [
