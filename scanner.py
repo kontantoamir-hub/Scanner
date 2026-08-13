@@ -1,6 +1,14 @@
 """
 ماسح السوق — نسخة البايثون (تعمل بجدولة تلقائية عبر GitHub Actions)
 نفس منطق أداة HTML: فلترة سيولة/حركة -> تحليل عميق -> تأكيد فريم أعلى -> استقرار -> تنبيه تيليجرام
+
+يضيف أيضًا مسارًا مستقلاً لـ"إشارات مبكرة" (انضغاط تقلب / تراكم صامت) لعملات لم تصل بعد
+لإشارة شراء كاملة، كتحذير رادار بدون خطة دخول مؤكدة — لتفادي مشكلة "شراء القمة" حيث
+الإشارة الرسمية تصل بعد ما الحركة صارت واضحة للجميع.
+
+يضيف كذلك فلتر "إرهاق/امتداد زائد" (Overextension) يعاقب درجة الإشارات الرسمية نفسها لو
+السعر بعيد جدًا عن EMA50 بوحدات ATR — لمعالجة نفس مشكلة "شراء القمة" من جهة الإشارة
+الرسمية مباشرة، وليس فقط عبر تحذير مبكر منفصل.
 """
 
 import os
@@ -34,6 +42,18 @@ RESISTANCE_LOOKBACK = 50        # عدد الشموع للبحث فيها عن �
 RESISTANCE_PIVOT_SPAN = 3       # عدد الشموع على كل جانب لاعتبار نقطة "قمة محلية"
 RESISTANCE_PROXIMITY_PCT = 1.5  # لو السعر أقرب من هذه النسبة% لمقاومة فوقه -> تحذير
 OBV_TREND_WINDOW = 10           # عدد الشموع لقياس اتجاه OBV مقابل اتجاه السعر
+
+# ---------- إعدادات فلتر الإرهاق/الامتداد الزائد (Overextension) ----------
+EXTENSION_EMA_PERIOD = 50       # المتوسط المتحرك المرجعي لقياس "المسافة المقطوعة" عن خط الأساس
+EXTENSION_ATR_THRESHOLD = float(os.environ.get("EXTENSION_ATR_THRESHOLD", "3.0"))
+# المسافة بين السعر وEMA50 بوحدات ATR — فوق هذا الحد يُعتبر السعر ممتدًا بشكل مفرط (احتمال شراء متأخر)
+
+# ---------- إعدادات الإشارات المبكرة (انضغاط تقلب / تراكم صامت) ----------
+SQUEEZE_LOOKBACK = 20           # عدد الشموع لحساب متوسط عرض نطاق Bollinger
+SQUEEZE_RATIO_THRESHOLD = 0.6   # عرض النطاق الحالي <= هذه النسبة من المتوسط -> يُعتبر انضغاطًا
+ACCUM_WINDOW = 20               # عدد الشموع لقياس التراكم الصامت
+ACCUM_PRICE_MAX_MOVE_PCT = 4.0  # أقصى تحرك سعري% خلال النافذة كي يُعتبر السعر "شبه ثابت"
+ACCUM_FLOW_RATIO_MIN = 0.3      # أدنى نسبة صافي تدفق شراء (OBV/حجم) كي يُعتبر تراكمًا واضحًا
 
 
 # ---------------- دوال المؤشرات الفنية ----------------
@@ -163,6 +183,45 @@ def obv_confirms_trend(obv_vals, trend_up, window=OBV_TREND_WINDOW):
     return obv_slope_up == trend_up
 
 
+def volatility_squeeze(bb_upper, bb_lower, closes, lookback=SQUEEZE_LOOKBACK):
+    """
+    يكشف انضغاط تقلب (Squeeze): عرض نطاق Bollinger الحالي أضيق بشكل ملحوظ من متوسطه
+    خلال آخر lookback شمعة — غالبًا يسبق حركة سعرية قوية (بالاتجاهين)، فهو مؤشر
+    "ترقّب" وليس اتجاهًا بحد ذاته، ويُستخدم كإشارة مبكرة قبل تأكيد الاتجاه الكامل.
+    """
+    n = len(closes)
+    if n <= lookback or bb_upper[-1] is None or bb_lower[-1] is None:
+        return False
+    widths = []
+    for i in range(n - lookback, n):
+        if bb_upper[i] is None or bb_lower[i] is None:
+            continue
+        widths.append((bb_upper[i] - bb_lower[i]) / closes[i])
+    if len(widths) < lookback * 0.5:
+        return False
+    avg_width = sum(widths) / len(widths)
+    if avg_width == 0:
+        return False
+    return widths[-1] <= avg_width * SQUEEZE_RATIO_THRESHOLD
+
+
+def silent_accumulation(closes, vols, obv_vals, window=ACCUM_WINDOW):
+    """
+    يكشف تراكم صامت: صافي تدفق الشراء (OBV) نسبة لإجمالي الحجم المتداول خلال النافذة
+    يميل بوضوح لضغط شراء، بينما السعر نفسه بالكاد تحرك -- إشارة على تجميع مركز
+    قبل انعكاس سعري محتمل، دون انتظار تأكيد الاتجاه الكامل بالمؤشرات اللحظية.
+    """
+    n = len(closes)
+    if n <= window:
+        return False
+    price_change_pct = abs(closes[-1] - closes[-1 - window]) / closes[-1 - window] * 100
+    vol_sum = sum(vols[-window:])
+    if vol_sum == 0:
+        return False
+    flow_ratio = (obv_vals[-1] - obv_vals[-1 - window]) / vol_sum
+    return price_change_pct <= ACCUM_PRICE_MAX_MOVE_PCT and flow_ratio >= ACCUM_FLOW_RATIO_MIN
+
+
 def bullish_divergence(closes, rsi_vals, lookback=DIVERGENCE_LOOKBACK, pivot_span=DIVERGENCE_PIVOT_SPAN):
     """
     يكشف انحراف صعودي: السعر يصنع قاعًا أدنى من القاع السابق، بينما RSI يصنع قاعًا أعلى —
@@ -204,6 +263,39 @@ def nearest_resistance(highs, closes, lookback=RESISTANCE_LOOKBACK, pivot_span=R
     return min(above) if above else None
 
 
+def atr_value_at(ind, i, period=14):
+    """
+    نفس فكرة atr_value لكن عند شمعة i محددة (وليس دائمًا آخر شمعة) — يُستخدم لقياس
+    الإرهاق/الامتداد عند نقطة زمنية معيّنة، ويسمح لنفس المنطق يشتغل حيًا وبالاختبار الرجعي.
+    """
+    trs = []
+    start = max(1, i - period + 1)
+    for j in range(start, i + 1):
+        prev_close = ind["closes"][j - 1]
+        tr = max(ind["highs"][j] - ind["lows"][j],
+                  abs(ind["highs"][j] - prev_close),
+                  abs(ind["lows"][j] - prev_close))
+        trs.append(tr)
+    return sum(trs) / len(trs) if trs else 0
+
+
+def overextended(ind, i, trend_up):
+    """
+    يكشف امتدادًا سعريًا مفرطًا: المسافة بين السعر الحالي وEMA50 بوحدات ATR فوق عتبة معيّنة،
+    بمعنى أن العملة صعدت (أو هبطت) كثيرًا خلال فترة قصيرة نسبيًا — احتمال دخول متأخر
+    (شراء القمة) حتى لو باقي المؤشرات اللحظية تبدو إيجابية.
+    """
+    ema50 = ind.get("ema50")
+    if not ema50 or i >= len(ema50) or ema50[i] is None:
+        return False
+    atrv = atr_value_at(ind, i)
+    if atrv <= 0:
+        return False
+    price = ind["closes"][i]
+    distance = (price - ema50[i]) / atrv if trend_up else (ema50[i] - price) / atrv
+    return distance >= EXTENSION_ATR_THRESHOLD
+
+
 def compute_indicators(klines):
     closes = [float(k[4]) for k in klines]
     highs = [float(k[2]) for k in klines]
@@ -214,6 +306,7 @@ def compute_indicators(klines):
     return {
         "closes": closes, "highs": highs, "lows": lows, "vols": vols,
         "ema9": ema(closes, 9), "ema21": ema(closes, 21),
+        "ema50": ema(closes, EXTENSION_EMA_PERIOD),
         "rsi": rsi(closes),
         "macd": macd_line, "signal": signal,
         "bb_upper": bb_upper, "bb_lower": bb_lower,
@@ -237,7 +330,7 @@ def score_at(i, ind, apply_extra_filters=True):
     vol_score = trend_dir * 0.5 if vol_confirm else 0
     score = trend_dir + rsi_state + (1 if macd_bull else -1) + bb_state + vol_score
 
-    # --- فلاتر إضافية لتحسين جودة الإشارة (ADX / انحراف / مقاومة / OBV) ---
+    # --- فلاتر إضافية لتحسين جودة الإشارة (ADX / انحراف / مقاومة / OBV / إرهاق) ---
     # تُحسب دائمًا للعرض التشخيصي، لكن تُطبَّق على الدرجة فقط لو apply_extra_filters=True
     # (يُستخدم False في الاختبار الرجعي لمقارنة الأداء بدونها)
 
@@ -254,6 +347,8 @@ def score_at(i, ind, apply_extra_filters=True):
 
     obv_confirm = obv_confirms_trend(ind["obv"][:i + 1], trend_up)
 
+    extended = overextended(ind, i, trend_up)
+
     if apply_extra_filters:
         if ranging:
             score *= 0.5
@@ -263,6 +358,8 @@ def score_at(i, ind, apply_extra_filters=True):
             score -= 1
         if obv_confirm:
             score += trend_dir * 0.5
+        if extended:
+            score -= trend_dir * 1  # عقوبة على الامتداد المفرط -- احتمال دخول متأخر (شراء القمة)
 
     return {
         "score": score, "trend_up": trend_up, "vol_confirm": vol_confirm, "rv": rv,
@@ -270,6 +367,7 @@ def score_at(i, ind, apply_extra_filters=True):
         "divergence": divergence,
         "near_resistance": near_resistance, "resistance": resistance,
         "obv_confirm": obv_confirm,
+        "extended": extended,
     }
 
 
@@ -381,6 +479,11 @@ def analyze_symbol(t, interval):
                 except Exception:
                     pass
 
+        # إشارات مبكرة (انضغاط تقلب / تراكم صامت) — مستقلة عن الدرجة الرسمية، تُحسب دائمًا
+        # للعرض، وتُستخدم لاحقًا فقط لعملات لم تصل بعد لإشارة شراء كاملة
+        squeeze = volatility_squeeze(ind["bb_upper"], ind["bb_lower"], ind["closes"])
+        accumulation = silent_accumulation(ind["closes"], ind["vols"], ind["obv"])
+
         # خطة دخول (شراء فقط — السوق الفوري لا يدعم فتح صفقة بيع مكشوفة)، محسوبة ديناميكيًا حسب التحليل:
         # وقف الخسارة من التقلب الفعلي (ATR) للعملة، وعدد الأهداف حسب قوة درجة التوافق
         entry = sl = None
@@ -417,6 +520,9 @@ def analyze_symbol(t, interval):
             "divergence": r["divergence"],
             "near_resistance": r["near_resistance"],
             "obv_confirm": r["obv_confirm"],
+            "extended": r["extended"],
+            "squeeze": squeeze,
+            "accumulation": accumulation,
             "entry": entry, "sl": sl, "tps": tps,
         }
     except Exception as e:
@@ -492,6 +598,8 @@ def format_alert(r, market_caution=False):
         badges.append("⚠️ سوق عرضي (ADX ضعيف)")
     if r.get("near_resistance"):
         badges.append("⚠️ قريب من مقاومة قوية")
+    if r.get("extended"):
+        badges.append("⚠️ حركة ممتدة (احتمال شراء متأخر)")
     badge_txt = f" ({', '.join(badges)})" if badges else ""
 
     lines = [
@@ -513,6 +621,29 @@ def format_alert(r, market_caution=False):
     if market_caution:
         lines.append("⚠️ سيطرة BTC (Dominance) تتحرك بقوة الآن — إشارات العملات البديلة أقل موثوقية مؤقتًا")
 
+    return "\n".join(lines)
+
+
+def format_early_alert(r):
+    """
+    تنبيه رادار مبكر: انضغاط تقلب و/أو تراكم صامت لعملة لم تصل بعد لإشارة شراء كاملة.
+    بدون خطة دخول/أهداف/وقف خسارة — تحذير احتمالي فقط للمراقبة اليدوية.
+    """
+    badges = []
+    if r.get("squeeze"):
+        badges.append("انضغاط تقلب (Squeeze)")
+    if r.get("accumulation"):
+        badges.append("تراكم صامت (OBV)")
+    badge_txt = ", ".join(badges)
+
+    lines = [
+        "🔵 إشارة مبكرة — تجمّع محتمل",
+        r['symbol'].replace('USDT', '/USDT'),
+        f"المؤشرات: {badge_txt}",
+        f"الدرجة الحالية: {r['score']:.1f} | فريم: {INTERVAL}",
+        f"السعر الحالي: {r['price']:.6g}",
+        "⚠️ تحذير احتمالي فقط، ليست خطة دخول مؤكدة — راقب العملة يدويًا",
+    ]
     return "\n".join(lines)
 
 
@@ -725,9 +856,9 @@ def trend_reversed(symbol, interval, original_trend_up):
 
 def check_open_positions(positions, price_map):
     """
-    يقارن الصفقات المفتوحة بالسعر الحالي، يرسل إشعار تيليجرام عند تحقق هدف،
-    ضرب وقف خسارة، انعكاس الإشارة الأصلية (EMA)، أو انتهاء السقف الزمني.
-    بعد لمس أول هدف، يُنقل SL لنقطة الدخول (Breakeven) لتفادي تحوّل ربح مؤقت لخسارة كاملة.
+    يقارن الصفقات المفتوحة بالسعر الحالي، يرسل إشعار تيليجرام عند تحقق هدف أو ضرب وقف خسارة،
+    وينقل SL لنقطة الدخول (Breakeven) بمجرد لمس أول هدف. الإغلاق بسبب انعكاس الاتجاه (EMA)
+    أو انتهاء السقف الزمني يبقى فعّالاً لإدارة المخاطر، لكن بدون إرسال إشعار تيليجرام له.
     يرجع (الصفقات المتبقية مفتوحة، الصفقات التي أُغلقت الآن).
     """
     still_open, closed_now = [], []
@@ -763,18 +894,14 @@ def check_open_positions(positions, price_map):
             closed_now.append(pos)
             continue
 
-        # لم يتحقق TP ولا SL بعد -> افحص إبطال الإشارة (انعكاس الاتجاه) قبل السقف الزمني
+        # لم يتحقق TP ولا SL بعد -> افحص إبطال الإشارة (انعكاس الاتجاه) قبل السقف الزمني.
+        # يُغلق الصفقة بصمت (بدون إشعار تيليجرام) لإدارة المخاطر، حسب طلب المستخدم.
         reversed_signal = trend_reversed(pos["symbol"], pos.get("interval", INTERVAL), pos["trend_up"])
         if reversed_signal:
-            send_telegram(
-                f"⚠️ انعكس الاتجاه\n{pos['symbol'].replace('USDT','/USDT')}\n"
-                f"الدخول: {pos['entry']:.6g} | الحالي: {price:.6g}"
-            )
             pos["closed_reason"] = "INVALIDATED"
             pos["closed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
             pos["exit_price"] = price
             closed_now.append(pos)
-            time.sleep(1)
             continue
 
         hours_open = _hours_since(pos["opened_at"])
@@ -827,8 +954,17 @@ def main():
     ]
     strong_symbols = {r["symbol"] for r in strong}
 
+    # إشارات مبكرة (انضغاط تقلب / تراكم صامت) لعملات لم تصل بعد لإشارة شراء كاملة —
+    # تُميَّز بمفتاح منفصل (":early") في ذاكرة التنبيهات كي لا تتعارض مع إشارات الشراء الرسمية
+    early_eligible = [
+        r for r in results
+        if r["score"] < 2.5 and (r["squeeze"] or r["accumulation"])
+    ]
+    early_keys = {f"{r['symbol']}:early" for r in early_eligible}
+
     prev_alerted, prev_dominance = load_state()
     fresh = [r for r in strong if r["symbol"] not in prev_alerted]
+    fresh_early = [r for r in early_eligible if f"{r['symbol']}:early" not in prev_alerted]
 
     # تتبّع BTC Dominance: تحذير إضافي لو تحركت بقوة منذ آخر تشغيل (إشارات العملات البديلة تصير أقل موثوقية)
     btc_dominance = None
@@ -845,18 +981,23 @@ def main():
     except Exception as e:
         print("تعذّر جلب BTC Dominance:", e)
 
-    print(f"إشارات قوية حاليًا: {len(strong)} | جديدة (لم تُرسل قبل): {len(fresh)}")
+    print(f"إشارات قوية حاليًا: {len(strong)} | جديدة (لم تُرسل قبل): {len(fresh)} | "
+          f"إشارات مبكرة جديدة: {len(fresh_early)}")
 
     for r in fresh:
         caution = market_caution and not r["symbol"].startswith("BTC")
         send_telegram(format_alert(r, caution))
         time.sleep(1)  # تجنب تجاوز حد تيليجرام لعدد الرسائل بالثانية
 
+    for r in fresh_early:
+        send_telegram(format_early_alert(r))
+        time.sleep(1)
+
     # تسجيل الإشارات الجديدة كصفقات مفتوحة قيد المتابعة لاحقًا
     open_new_positions(open_positions, fresh)
 
-    # حفظ موحّد: ذاكرة الإشارات + BTC Dominance + الصفقات المفتوحة + أرشيف الصفقات المغلقة حديثًا
-    save_all_state(strong_symbols, btc_dominance, open_positions, closed_now)
+    # حفظ موحّد: ذاكرة الإشارات (رسمية + مبكرة) + BTC Dominance + الصفقات المفتوحة + أرشيف الصفقات المغلقة حديثًا
+    save_all_state(strong_symbols | early_keys, btc_dominance, open_positions, closed_now)
     print("انتهى المسح.")
 
 
