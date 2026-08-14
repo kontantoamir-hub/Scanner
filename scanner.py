@@ -712,6 +712,20 @@ def format_tp_line(pos, tp_index):
     return f"✅ تحقق {label}: {tp:.6g} (+{pct_gain:.2f}%)"
 
 
+def build_progress_text(pos):
+    """
+    النص الأساسي الذي يُبنى عليه أي تعديل نهائي للرسالة (SL / انعكاس / انتهاء وقت):
+    النص الأصلي + سطر لكل هدف تحقق قبل الإغلاق (إن وُجد)، حتى ما يضيع سجل الأهداف
+    المتحققة سابقًا عند الشطب النهائي.
+    """
+    base = pos.get("alert_text", "")
+    hit_sorted = sorted(pos.get("hit_tps", []))
+    if not hit_sorted:
+        return base
+    lines = [format_tp_line(pos, j) for j in hit_sorted]
+    return base + "\n\n" + "\n".join(lines)
+
+
 def format_alert(r, market_caution=False):
     is_buy = r["score"] >= 2.5
     dot = "🟢" if is_buy else "🔴"
@@ -1086,7 +1100,7 @@ def check_open_positions(positions, price_map):
         if price <= pos["sl"]:
             result_text = format_sl_hit(pos, price)
             send_telegram(result_text)
-            edit_telegram_strike(pos.get("alert_message_id"), pos.get("alert_text", ""), result_text)
+            edit_telegram_strike(pos.get("alert_message_id"), build_progress_text(pos), result_text)
             pos["closed_reason"] = "SL"
             pos["closed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
             pos["exit_price"] = price
@@ -1134,7 +1148,7 @@ def check_open_positions(positions, price_map):
         # كي تبقى كل صفقة مرئية النتيجة بالمحادثة، بدل ما تختفي بصمت.
         reversed_signal = trend_reversed(pos["symbol"], pos.get("interval", INTERVAL), pos["trend_up"])
         if reversed_signal:
-            edit_telegram_strike(pos.get("alert_message_id"), pos.get("alert_text", ""),
+            edit_telegram_strike(pos.get("alert_message_id"), build_progress_text(pos),
                                   format_invalidated(pos, price))
             pos["closed_reason"] = "INVALIDATED"
             pos["closed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1149,7 +1163,7 @@ def check_open_positions(positions, price_map):
                 f"الدخول: {pos['entry']:.6g} | الحالي: {price:.6g} | مدة المراقبة: {hours_open:.0f}س"
             )
             send_telegram(expired_text)
-            edit_telegram_strike(pos.get("alert_message_id"), pos.get("alert_text", ""), expired_text)
+            edit_telegram_strike(pos.get("alert_message_id"), build_progress_text(pos), expired_text)
             pos["closed_reason"] = "EXPIRED"
             pos["closed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
             pos["exit_price"] = price
