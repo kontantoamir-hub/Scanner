@@ -595,16 +595,49 @@ def run_scan(tickers=None):
 # ---------------- تيليجرام ----------------
 
 def send_telegram(text):
+    """يرسل رسالة تيليجرام جديدة، ويرجع message_id الخاص فيها (أو None عند الفشل) —
+    يُستخدم لاحقًا لتعديل نفس الرسالة (شطبها + إضافة النتيجة) عند إغلاق الصفقة."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ TELEGRAM_TOKEN أو TELEGRAM_CHAT_ID غير موجودين — تخطي الإرسال.")
-        return
+        return None
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=15)
         if not resp.ok:
             print("فشل إرسال تيليجرام:", resp.text)
+            return None
+        return resp.json().get("result", {}).get("message_id")
     except Exception as e:
         print("خطأ إرسال تيليجرام:", e)
+        return None
+
+
+def _escape_html(text):
+    """يهرب رموز HTML الخاصة قبل الإرسال بوضع parse_mode=HTML (تفاديًا لكسر التنسيق)."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def edit_telegram_strike(message_id, original_text, result_text):
+    """
+    يعدّل رسالة تيليجرام الأصلية (الإشارة) بعد إغلاق الصفقة: يشطب نصها الأصلي (Strikethrough)
+    ويضيف نتيجة الإغلاق تحته بنفس الرسالة — بالإضافة إلى رسالة النتيجة الجديدة المنفصلة،
+    وليس بديلاً عنها.
+    """
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not message_id:
+        return
+    new_text = f"<s>{_escape_html(original_text)}</s>\n\n{_escape_html(result_text)}"
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
+    try:
+        resp = requests.post(url, data={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "message_id": message_id,
+            "text": new_text,
+            "parse_mode": "HTML",
+        }, timeout=15)
+        if not resp.ok:
+            print("فشل تعديل رسالة تيليجرام:", resp.text)
+    except Exception as e:
+        print("خطأ تعديل رسالة تيليجرام:", e)
 
 
 def format_alert(r, market_caution=False):
@@ -819,6 +852,9 @@ def open_new_positions(positions, fresh_signals):
             "accumulation": r.get("accumulation"),
             "divergence": r.get("divergence"),
             "extended": r.get("extended"),
+            # message_id ونص رسالة الإشارة الأصلية -> تُستخدم لاحقًا لتعديل نفس الرسالة (شطب + نتيجة) عند الإغلاق
+            "alert_message_id": r.get("_msg_id"),
+            "alert_text": r.get("_alert_text"),
         })
 
 
@@ -848,6 +884,8 @@ def open_new_early_positions(positions, fresh_early_signals):
             "accumulation": r.get("accumulation"),
             "divergence": r.get("divergence"),
             "extended": r.get("extended"),
+            "alert_message_id": r.get("_msg_id"),
+            "alert_text": r.get("_alert_text"),
         })
 
 
@@ -921,6 +959,22 @@ def format_tp_hit(pos, tp_index, price):
     )
 
 
+def format_invalidated(pos, price):
+    """نتيجة إغلاق محايدة لصفقة انعكس اتجاهها قبل تحقيق أي هدف أو ضرب وقف خسارة."""
+    entry = pos["entry"]
+    pct = (price - entry) / entry * 100
+    duration = format_duration(_hours_since(pos["opened_at"]))
+    is_early = pos.get("type") == "early"
+    header = "⚪ (إشارة مبكرة) " if is_early else "⚪ "
+    return (
+        f"{header}{pos['symbol'].replace('USDT', '/USDT')}\n"
+        f"انعكس الاتجاه قبل تحقيق أي هدف\n"
+        f"الدخول: {entry:.6g} | الخروج: {price:.6g}\n"
+        f"النتيجة الصافية: {pct:+.2f}%\n"
+        f"المدة الزمنية: {duration}"
+    )
+
+
 def trend_reversed(symbol, interval, original_trend_up):
     """
     يفحص هل انعكس اتجاه EMA9/21 منذ فتح الصفقة (إبطال الإشارة الأصلية).
@@ -954,7 +1008,9 @@ def check_open_positions(positions, price_map):
             continue
 
         if price <= pos["sl"]:
-            send_telegram(format_sl_hit(pos, price))
+            result_text = format_sl_hit(pos, price)
+            send_telegram(result_text)
+            edit_telegram_strike(pos.get("alert_message_id"), pos.get("alert_text", ""), result_text)
             pos["closed_reason"] = "SL"
             pos["closed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
             pos["exit_price"] = price
@@ -963,15 +1019,21 @@ def check_open_positions(positions, price_map):
             continue
 
         newly_hit = [i for i, tp in enumerate(pos["tps"]) if i not in pos["hit_tps"] and price >= tp]
+        last_tp_text = None
         if newly_hit:
             pos["hit_tps"].extend(newly_hit)
             for i in newly_hit:
-                send_telegram(format_tp_hit(pos, i, price))
+                last_tp_text = format_tp_hit(pos, i, price)
+                send_telegram(last_tp_text)
                 time.sleep(1)
             if pos["sl"] < pos["entry"]:
                 pos["sl"] = pos["entry"]  # نقل SL لنقطة التعادل بعد أول هدف محقق
 
         if len(pos["hit_tps"]) >= len(pos["tps"]):
+            edit_telegram_strike(
+                pos.get("alert_message_id"), pos.get("alert_text", ""),
+                last_tp_text or format_tp_hit(pos, len(pos["tps"]) - 1, price)
+            )
             pos["closed_reason"] = "ALL_TP"
             pos["closed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
             pos["exit_price"] = price
@@ -979,9 +1041,12 @@ def check_open_positions(positions, price_map):
             continue
 
         # لم يتحقق TP ولا SL بعد -> افحص إبطال الإشارة (انعكاس الاتجاه) قبل السقف الزمني.
-        # يُغلق الصفقة بصمت (بدون إشعار تيليجرام) لإدارة المخاطر، حسب طلب المستخدم.
+        # لا تُرسل رسالة جديدة صاخبة (حسب طلب سابق)، لكن الرسالة الأصلية تُعدَّل (شطب + نتيجة محايدة)
+        # كي تبقى كل صفقة مرئية النتيجة بالمحادثة، بدل ما تختفي بصمت.
         reversed_signal = trend_reversed(pos["symbol"], pos.get("interval", INTERVAL), pos["trend_up"])
         if reversed_signal:
+            edit_telegram_strike(pos.get("alert_message_id"), pos.get("alert_text", ""),
+                                  format_invalidated(pos, price))
             pos["closed_reason"] = "INVALIDATED"
             pos["closed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
             pos["exit_price"] = price
@@ -990,10 +1055,12 @@ def check_open_positions(positions, price_map):
 
         hours_open = _hours_since(pos["opened_at"])
         if hours_open >= TIME_STOP_HOURS:
-            send_telegram(
+            expired_text = (
                 f"⏱️ انتهت صلاحية المراقبة (سقف زمني)\n{pos['symbol'].replace('USDT','/USDT')}\n"
                 f"الدخول: {pos['entry']:.6g} | الحالي: {price:.6g} | مدة المراقبة: {hours_open:.0f}س"
             )
+            send_telegram(expired_text)
+            edit_telegram_strike(pos.get("alert_message_id"), pos.get("alert_text", ""), expired_text)
             pos["closed_reason"] = "EXPIRED"
             pos["closed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
             pos["exit_price"] = price
@@ -1070,11 +1137,15 @@ def main():
 
     for r in fresh:
         caution = market_caution and not r["symbol"].startswith("BTC")
-        send_telegram(format_alert(r, caution))
+        alert_text = format_alert(r, caution)
+        r["_msg_id"] = send_telegram(alert_text)
+        r["_alert_text"] = alert_text
         time.sleep(1)  # تجنب تجاوز حد تيليجرام لعدد الرسائل بالثانية
 
     for r in fresh_early:
-        send_telegram(format_early_alert(r))
+        alert_text = format_early_alert(r)
+        r["_msg_id"] = send_telegram(alert_text)
+        r["_alert_text"] = alert_text
         time.sleep(1)
 
     # تسجيل الإشارات الجديدة كصفقات مفتوحة قيد المتابعة لاحقًا (رسمية + مبكرة)
