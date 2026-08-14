@@ -58,8 +58,8 @@ ACCUM_FLOW_RATIO_MIN = 0.3      # أدنى نسبة صافي تدفق شراء (
 # ---------------- إعدادات أهداف الإشارات المبكرة (تقديرية، أقل ثقة من الإشارة الرسمية) ----------------
 # وقف خسارة أوسع من الإشارة الرسمية (1.5×ATR) لأن نقطة الدخول أقل دقة والتقلب حولها أعلى
 EARLY_SL_ATR_MULT = 2.0
-# "احتمالية" (شرط واحد فقط: squeeze أو accumulation) مقابل "مؤكدة" (شرطان فأكثر، بما فيها الانحراف الصعودي)
-EARLY_CONFIRMED_MIN_CONDITIONS = 2
+# عدد الأهداف والثقة يعتمدان مباشرة على عدد الشروط المتحققة (squeeze / accumulation / divergence / momentum):
+# شرط واحد = احتمالية (هدف واحد)، شرطان = مؤكدة (هدفان)، 3 فأكثر = مؤكدة قوية (3-4 أهداف)
 
 
 # ---------------- دوال المؤشرات الفنية ----------------
@@ -267,6 +267,20 @@ def nearest_resistance(highs, closes, lookback=RESISTANCE_LOOKBACK, pivot_span=R
             pivots.append(highs[i])
     above = [p for p in pivots if p > price]
     return min(above) if above else None
+
+
+def momentum_strength(macd_line, signal, rsi_vals, i):
+    """
+    قوة الزخم: تتحقق لما يكون MACD فوق خط الإشارة وهيستوغرام الفرق بينهما يتسع
+    (الزخم يتسارع لا يتباطأ)، مع RSI في منطقة صاعدة (بين 45 و65: زخم بدون تشبع شرائي).
+    """
+    if i < 1 or macd_line[i] is None or signal[i] is None or rsi_vals[i] is None:
+        return False
+    hist_now = macd_line[i] - signal[i]
+    hist_prev = macd_line[i - 1] - signal[i - 1]
+    macd_bull = hist_now > 0 and hist_now > hist_prev
+    rsi_rising = rsi_vals[i] > rsi_vals[i - 1] and 45 <= rsi_vals[i] <= 65
+    return macd_bull and rsi_rising
 
 
 def atr_value_at(ind, i, period=14):
@@ -497,14 +511,20 @@ def analyze_symbol(t, interval):
         early_entry = early_sl = None
         early_tps = []
         early_confidence = None
+        momentum = momentum_strength(ind["macd"], ind["signal"], ind["rsi"], last)
         if squeeze or accumulation:
-            conditions_met = sum([squeeze, accumulation, r["divergence"]])
-            early_confidence = "مؤكدة" if conditions_met >= EARLY_CONFIRMED_MIN_CONDITIONS else "احتمالية"
+            conditions_met = sum([squeeze, accumulation, r["divergence"], momentum])
+            if conditions_met >= 3:
+                early_confidence = "مؤكدة قوية"
+            elif conditions_met >= 2:
+                early_confidence = "مؤكدة"
+            else:
+                early_confidence = "احتمالية"
             early_entry = ind["closes"][last]
             atrv = atr_value(ind)
             early_sl = early_entry - atrv * EARLY_SL_ATR_MULT
             early_risk = early_entry - early_sl
-            early_tp_count = 2 if conditions_met >= EARLY_CONFIRMED_MIN_CONDITIONS else 1
+            early_tp_count = conditions_met  # عدد الأهداف = عدد الشروط المتحققة فعليًا لهاي العملة (1 إلى 4)
             raw_tps = [early_entry + early_risk * i for i in range(1, early_tp_count + 1)]
             resistance = r.get("resistance")
             early_tps = [min(tp, resistance) for tp in raw_tps] if resistance else raw_tps
@@ -548,6 +568,7 @@ def analyze_symbol(t, interval):
             "extended": r["extended"],
             "squeeze": squeeze,
             "accumulation": accumulation,
+            "momentum": momentum,
             "entry": entry, "sl": sl, "tps": tps,
             "early_entry": early_entry, "early_sl": early_sl, "early_tps": early_tps,
             "early_confidence": early_confidence,
@@ -640,6 +661,57 @@ def edit_telegram_strike(message_id, original_text, result_text):
         print("خطأ تعديل رسالة تيليجرام:", e)
 
 
+def delete_telegram_message(message_id):
+    """يحذف رسالة تيليجرام سابقة — يُستخدم لحذف إشعار هدف سابق عند تحقق هدف جديد بنفس الصفقة."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not message_id:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteMessage"
+    try:
+        resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id}, timeout=15)
+        if not resp.ok:
+            print("فشل حذف رسالة تيليجرام:", resp.text)
+    except Exception as e:
+        print("خطأ حذف رسالة تيليجرام:", e)
+
+
+def edit_telegram_append(message_id, original_text, extra_lines):
+    """
+    يعدّل رسالة الإشارة الأصلية بإضافة سطر مختصر تحت نصها لكل هدف تحقق حتى الآن (تراكميًا،
+    الأسطر السابقة تبقى كما هي ويُضاف الجديد تحتها) — بدون شطب النص، لأن هذا ليس إغلاقًا نهائيًا
+    بمعنى "شطب واستبدال" بل تحديثًا مستمرًا لنفس رسالة الإشارة مع كل هدف.
+    """
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not message_id:
+        return
+    new_text = original_text + "\n\n" + "\n".join(extra_lines)
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
+    try:
+        resp = requests.post(url, data={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "message_id": message_id,
+            "text": new_text,
+        }, timeout=15)
+        if not resp.ok:
+            print("فشل تعديل رسالة تيليجرام:", resp.text)
+    except Exception as e:
+        print("خطأ تعديل رسالة تيليجرام:", e)
+
+
+def tp_ordinal(i):
+    words = ["الأول", "الثاني", "الثالث", "الرابع"]
+    return words[i] if i < len(words) else f"رقم {i + 1}"
+
+
+def format_tp_line(pos, tp_index):
+    """سطر مختصر لهدف واحد متحقق (يُستخدم بالتعديل التراكمي على رسالة الإشارة الأصلية فقط)."""
+    entry = pos["entry"]
+    tp = pos["tps"][tp_index]
+    pct_gain = (tp - entry) / entry * 100
+    is_early = pos.get("type") == "early"
+    ordinal = tp_ordinal(tp_index)
+    label = f"الهدف التقديري {ordinal}" if is_early else f"الهدف {ordinal}"
+    return f"✅ تحقق {label}: {tp:.6g} (+{pct_gain:.2f}%)"
+
+
 def format_alert(r, market_caution=False):
     is_buy = r["score"] >= 2.5
     dot = "🟢" if is_buy else "🔴"
@@ -698,12 +770,14 @@ def format_early_alert(r):
         badges.append("تراكم صامت (OBV)")
     if r.get("divergence"):
         badges.append("انحراف صعودي")
+    if r.get("momentum"):
+        badges.append("قوة زخم")
     if r.get("extended"):
         badges.append("⚠️ حركة ممتدة (احتمال فوات الفرصة)")
     badge_txt = ", ".join(badges)
 
     confidence = r.get("early_confidence")
-    dot = "🟣" if confidence == "مؤكدة" else "🔵"
+    dot = "🟢" if confidence == "مؤكدة قوية" else ("🟣" if confidence == "مؤكدة" else "🔵")
     title = f"إشارة مبكرة — {confidence}" if confidence else "إشارة مبكرة"
 
     lines = [
@@ -842,6 +916,7 @@ def open_new_positions(positions, fresh_signals):
             "sl": r["sl"],
             "tps": r["tps"],
             "hit_tps": [],
+            "tp_notify_ids": [None] * len(r["tps"]),
             "score": r["score"],
             "trend_up": r["trend_up"],   # اتجاه EMA9/21 وقت فتح الصفقة، يُستخدم لاحقًا لكشف انعكاس الإشارة
             "interval": INTERVAL,
@@ -872,6 +947,7 @@ def open_new_early_positions(positions, fresh_early_signals):
             "sl": r["early_sl"],
             "tps": r["early_tps"],
             "hit_tps": [],
+            "tp_notify_ids": [None] * len(r["early_tps"]),
             "score": r["score"],
             "trend_up": r["trend_up"],
             "interval": INTERVAL,
@@ -1019,21 +1095,34 @@ def check_open_positions(positions, price_map):
             continue
 
         newly_hit = [i for i, tp in enumerate(pos["tps"]) if i not in pos["hit_tps"] and price >= tp]
-        last_tp_text = None
         if newly_hit:
-            pos["hit_tps"].extend(newly_hit)
+            if "tp_notify_ids" not in pos or len(pos["tp_notify_ids"]) != len(pos["tps"]):
+                pos["tp_notify_ids"] = [None] * len(pos["tps"])  # توافق مع صفقات فُتحت قبل هذا التحديث
+
             for i in newly_hit:
-                last_tp_text = format_tp_hit(pos, i, price)
-                send_telegram(last_tp_text)
+                tp_text = format_tp_hit(pos, i, price)
+                msg_id = send_telegram(tp_text)
+                pos["tp_notify_ids"][i] = msg_id
                 time.sleep(1)
+
+                # احذف إشعار الهدف السابق المستقل (إن وُجد) كي لا تتراكم إشعارات منفصلة لكل هدف
+                prev_index = i - 1
+                if prev_index >= 0 and pos["tp_notify_ids"][prev_index]:
+                    delete_telegram_message(pos["tp_notify_ids"][prev_index])
+                    pos["tp_notify_ids"][prev_index] = None
+
+                pos["hit_tps"].append(i)
+
+                # عدّل رسالة الإشارة الأصلية تراكميًا: كل الأهداف المتحققة حتى الآن، كل واحد بسطره الخاص
+                hit_sorted = sorted(pos["hit_tps"])
+                lines = [format_tp_line(pos, j) for j in hit_sorted]
+                edit_telegram_append(pos.get("alert_message_id"), pos.get("alert_text", ""), lines)
+
             if pos["sl"] < pos["entry"]:
                 pos["sl"] = pos["entry"]  # نقل SL لنقطة التعادل بعد أول هدف محقق
 
         if len(pos["hit_tps"]) >= len(pos["tps"]):
-            edit_telegram_strike(
-                pos.get("alert_message_id"), pos.get("alert_text", ""),
-                last_tp_text or format_tp_hit(pos, len(pos["tps"]) - 1, price)
-            )
+            # كل الأهداف تحققت -> إغلاق داخلي للصفقة (بدون رسالة/تعديل إضافي، لأن كل هدف أُرسل وعُدّل بالتراكم أعلاه)
             pos["closed_reason"] = "ALL_TP"
             pos["closed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
             pos["exit_price"] = price
