@@ -50,6 +50,12 @@ FEE_PCT = float(os.environ.get("FEE_PCT", "0.1"))
 # لأنها أثبتت أداءً أفضل في الاختبارات السابقة). القيمة الأولى (2.5) هي الأساس الحالي في scanner.py.
 SCORE_THRESHOLDS = [float(x) for x in os.environ.get("SCORE_THRESHOLDS", "2.5,3.0,3.5,4.0").split(",")]
 
+# عملات تُستثنى يدويًا من اختيار الباكتست (مثلاً للتحقق هل عملة واحدة ذات صفقة شاذة تحرّف
+# الـ EV الإجمالي). صيغة القيمة: أسماء مفصولة بفواصل، بنفس صيغة Binance (مثال: "COTIUSDT,BANKUSDT").
+BACKTEST_EXCLUDE_SYMBOLS = {
+    s.strip().upper() for s in os.environ.get("BACKTEST_EXCLUDE_SYMBOLS", "").split(",") if s.strip()
+}
+
 
 # ---------------- جلب بيانات تاريخية طويلة (تتجاوز حد الـ1000 شمعة لكل طلب) ----------------
 def fetch_klines_range(symbol, interval, start_ms, end_ms):
@@ -82,6 +88,7 @@ def pick_backtest_symbols(count):
         if t["symbol"].endswith("USDT")
         and not t["symbol"].endswith(EXCLUDE_SUFFIX)
         and t["symbol"] not in EXCLUDE_SYMS
+        and t["symbol"] not in BACKTEST_EXCLUDE_SYMBOLS
         and float(t["quoteVolume"]) >= LIQUIDITY_FLOOR
     ]
     liquid.sort(key=lambda t: float(t["quoteVolume"]), reverse=True)
@@ -283,6 +290,8 @@ def summarize(all_trades, label, unresolved=0):
 def main():
     symbols = pick_backtest_symbols(BACKTEST_SYMBOL_COUNT)
     print(f"عملات الاختبار ({len(symbols)}): {', '.join(s.replace('USDT','/USDT') for s in symbols)}")
+    if BACKTEST_EXCLUDE_SYMBOLS:
+        print(f"عملات مستثناة يدويًا: {', '.join(s.replace('USDT','/USDT') for s in sorted(BACKTEST_EXCLUDE_SYMBOLS))}")
     print(f"رسوم مفترضة: {FEE_PCT:.3f}% لكل جهة ({FEE_PCT*2:.3f}% لكل صفقة كاملة)")
     print(f"عتبات الدرجة المُختبَرة (مع الفلاتر): {SCORE_THRESHOLDS}")
 
