@@ -56,13 +56,24 @@ def load_closed_trades():
 
 
 def fetch_klines_after(symbol, interval, start_ms, limit=500):
-    r = requests.get(
-        f"{BASE_URL}/klines",
-        params={"symbol": symbol, "interval": interval, "startTime": start_ms, "limit": limit},
-        timeout=20,
-    )
-    r.raise_for_status()
-    return r.json()
+    """يجلب الشموع مع إعادة محاولة تلقائية، بنفس منطق _request_with_retry في scanner.py."""
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.get(
+                f"{BASE_URL}/klines",
+                params={"symbol": symbol, "interval": interval, "startTime": start_ms, "limit": limit},
+                timeout=20,
+            )
+            if r.status_code == 429 or r.status_code >= 500:
+                raise requests.exceptions.HTTPError(f"status {r.status_code}")
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+    raise last_err
 
 
 def simulate_trade(trade):
@@ -83,12 +94,14 @@ def simulate_trade(trade):
             next_tp = tp
             break
     if next_tp is None or sl is None:
+        print(f"[تخطي] {symbol}: بيانات ناقصة (tps أو sl فارغة)")
         return None
 
     try:
         opened_at = dt.datetime.strptime(trade["opened_at"], "%Y-%m-%d %H:%M:%S")
         closed_at = dt.datetime.strptime(trade["closed_at"], "%Y-%m-%d %H:%M:%S")
-    except Exception:
+    except Exception as e:
+        print(f"[تخطي] {symbol}: تعذّر قراءة التاريخ ({e})")
         return None
 
     elapsed_hours = (closed_at - opened_at).total_seconds() / 3600
@@ -102,7 +115,8 @@ def simulate_trade(trade):
     start_ms = int(closed_at.timestamp() * 1000)
     try:
         klines = fetch_klines_after(symbol, interval, start_ms, limit=needed_candles)
-    except Exception:
+    except Exception as e:
+        print(f"[تخطي] {symbol}: فشل جلب البيانات من Binance ({e})")
         return None
 
     for k in klines:
