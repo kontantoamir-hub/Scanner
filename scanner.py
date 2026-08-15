@@ -1225,9 +1225,12 @@ def check_open_positions(positions, price_map):
         # السقف الزمني الأقصى (شبكة أمان فقط).
         hours_open = _hours_since(pos["opened_at"])
         if hours_open >= TIME_STOP_HOURS:
+            pct_change = (price - pos["entry"]) / pos["entry"] * 100
+            status = "بربح" if pct_change > 0 else ("بخسارة" if pct_change < 0 else "بدون تغيير")
             expired_text = (
-                f"⏱️ انتهت صلاحية المراقبة (سقف زمني)\n{pos['symbol'].replace('USDT','/USDT')}\n"
-                f"الدخول: {pos['entry']:.6g} | الحالي: {price:.6g} | مدة المراقبة: {hours_open:.0f}س"
+                f"⏱️ انتهت صلاحية المراقبة (سقف زمني) — متوقفة {status}\n{pos['symbol'].replace('USDT','/USDT')}\n"
+                f"الدخول: {pos['entry']:.6g} | الحالي: {price:.6g} | مدة المراقبة: {hours_open:.0f}س\n"
+                f"النسبة: {pct_change:+.2f}%"
             )
             send_telegram(expired_text)
             edit_telegram_strike(pos.get("alert_message_id"), build_progress_text(pos), expired_text)
