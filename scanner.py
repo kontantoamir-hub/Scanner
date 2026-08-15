@@ -709,20 +709,14 @@ def edit_telegram_append(message_id, original_text, extra_lines):
         print("خطأ تعديل رسالة تيليجرام:", e)
 
 
-def tp_ordinal(i):
-    words = ["الأول", "الثاني", "الثالث", "الرابع"]
-    return words[i] if i < len(words) else f"رقم {i + 1}"
-
-
 def format_tp_line(pos, tp_index):
-    """سطر مختصر لهدف واحد متحقق (يُستخدم بالتعديل التراكمي على رسالة الإشارة الأصلية فقط)."""
+    """سطر مختصر لهدف واحد متحقق (يُستخدم بالتعديل التراكمي على رسالة الإشارة الأصلية فقط) —
+    يقتطع فقط سطر التحقق من هذا الهدف، ولا يعيد كتابة الرسالة كاملة."""
     entry = pos["entry"]
     tp = pos["tps"][tp_index]
     pct_gain = (tp - entry) / entry * 100
-    is_early = pos.get("type") == "early"
-    ordinal = tp_ordinal(tp_index)
-    label = f"الهدف التقديري {ordinal}" if is_early else f"الهدف {ordinal}"
-    return f"✅ تحقق {label}: {tp:.6g} (+{pct_gain:.2f}%)"
+    tp_label = f"TP{tp_index + 1}"
+    return f"✅ تحقق {tp_label}: {tp:.6g} (+{pct_gain:.2f}%)"
 
 
 def build_progress_text(pos):
@@ -786,42 +780,31 @@ def format_alert(r, market_caution=False):
 def format_early_alert(r):
     """
     تنبيه رادار مبكر: انضغاط تقلب و/أو تراكم صامت لعملة لم تصل بعد لإشارة شراء كاملة.
-    يعرض أهدافًا تقديرية (وقف خسارة أوسع من الرسمية + هدف/هدفين حسب مستوى الثقة)،
+    يعرض أهدافًا تقديرية (وقف خسارة أوسع من الرسمية + عدد أهداف متغير حسب مستوى الثقة)،
     وتُتابَع تلقائيًا (TP/SL) ضمن نفس آلية الصفقات المفتوحة — لكنها تبقى أقل تأكيدًا
-    من الإشارة الرسمية.
+    من الإشارة الرسمية. قالب مختصر: بدون سطر المؤشرات وبدون السعر الحالي المنفصل،
+    مع الإبقاء فقط على تحذير الحركة الممتدة عند انطباقه.
     """
-    badges = []
-    if r.get("squeeze"):
-        badges.append("انضغاط تقلب (Squeeze)")
-    if r.get("accumulation"):
-        badges.append("تراكم صامت (OBV)")
-    if r.get("divergence"):
-        badges.append("انحراف صعودي")
-    if r.get("momentum"):
-        badges.append("قوة زخم")
-    if r.get("extended"):
-        badges.append("⚠️ حركة ممتدة (احتمال فوات الفرصة)")
-    badge_txt = ", ".join(badges)
-
     confidence = r.get("early_confidence")
     dot = "🟢" if confidence == "مؤكدة قوية" else ("🟣" if confidence == "مؤكدة" else "🔵")
-    title = f"إشارة مبكرة — {confidence}" if confidence else "إشارة مبكرة"
+    # لا لاحقة لمستوى "احتمالية" (القالب الافتراضي بدون نص إضافي بعد العنوان)
+    title = f"إشارة مبكرة - {confidence}" if confidence and confidence != "احتمالية" else "إشارة مبكرة"
 
     lines = [
         f"{dot} {title}",
         r['symbol'].replace('USDT', '/USDT'),
-        f"المؤشرات: {badge_txt}",
         f"الدرجة الحالية: {r['score']:.1f} | فريم: {INTERVAL}",
-        f"السعر الحالي: {r['price']:.6g}",
     ]
 
     if r.get("early_entry") is not None:
-        lines.append(f"الدخول التقديري: {r['early_entry']:.6g}")
+        lines.append(f"الدخول : {r['early_entry']:.6g}")
         for i, tp in enumerate(r.get("early_tps", []), start=1):
-            lines.append(f"هدف تقديري {i}: {tp:.6g}")
-        lines.append(f"وقف خسارة تقديري: {r['early_sl']:.6g}")
+            lines.append(f"TP {i}: {tp:.6g}")
+        lines.append(f"SL : {r['early_sl']:.6g}")
 
-    lines.append("⚠️ أهداف تقديرية أقل ثقة من الإشارة الرسمية — البوت سيتابعها تلقائيًا ويُشعرك عند تحقق هدف أو ضرب وقف الخسارة")
+    if r.get("extended"):
+        lines.append("⚠️ حركة ممتدة")
+
     return "\n".join(lines)
 
 
@@ -1163,7 +1146,7 @@ def format_tp_hit(pos, tp_index, price):
     duration = format_duration(_hours_since(pos["opened_at"]))
     is_early = pos.get("type") == "early"
     header = "✅ (إشارة مبكرة) " if is_early else "✅ "
-    tp_label = f"هدف تقديري {tp_index + 1}" if is_early else f"TP{tp_index + 1}"
+    tp_label = f"TP{tp_index + 1}"
     return (
         f"{header}{pos['symbol'].replace('USDT', '/USDT')}\n"
         f"سعر الدخول: {entry:.6g}\n"
@@ -1227,7 +1210,10 @@ def check_open_positions(positions, price_map):
                 pos["sl"] = pos["entry"]  # نقل SL لنقطة التعادل بعد أول هدف محقق
 
         if len(pos["hit_tps"]) >= len(pos["tps"]):
-            # كل الأهداف تحققت -> إغلاق داخلي للصفقة (بدون رسالة/تعديل إضافي، لأن كل هدف أُرسل وعُدّل بالتراكم أعلاه)
+            # كل الأهداف تحققت -> إغلاق نهائي: نشطب رسالة الإشارة الأصلية (بما فيها كل أسطر
+            # الأهداف المتراكمة) تمامًا كما يحصل عند SL/EXPIRED، بدل تركها بدون شطب نهائي
+            all_tp_text = "🏁 تحققت جميع الأهداف"
+            edit_telegram_strike(pos.get("alert_message_id"), build_progress_text(pos), all_tp_text)
             pos["closed_reason"] = "ALL_TP"
             pos["closed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
             pos["exit_price"] = price
