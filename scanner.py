@@ -1173,39 +1173,6 @@ def format_tp_hit(pos, tp_index, price):
     )
 
 
-def format_invalidated(pos, price):
-    """نتيجة إغلاق محايدة لصفقة انعكس اتجاهها قبل تحقيق أي هدف أو ضرب وقف خسارة."""
-    entry = pos["entry"]
-    pct = (price - entry) / entry * 100
-    duration = format_duration(_hours_since(pos["opened_at"]))
-    is_early = pos.get("type") == "early"
-    header = "⚪ (إشارة مبكرة) " if is_early else "⚪ "
-    return (
-        f"{header}{pos['symbol'].replace('USDT', '/USDT')}\n"
-        f"انعكس الاتجاه قبل تحقيق أي هدف\n"
-        f"الدخول: {entry:.6g} | الخروج: {price:.6g}\n"
-        f"النتيجة الصافية: {pct:+.2f}%\n"
-        f"المدة الزمنية: {duration}"
-    )
-
-
-def trend_reversed(symbol, interval, original_trend_up):
-    """
-    يفحص هل انعكس اتجاه EMA9/21 منذ فتح الصفقة (إبطال الإشارة الأصلية).
-    يرجع True/False عند نجاح الفحص، أو None لو تعذّر الجلب (لا نغلق الصفقة بالخطأ في هذه الحالة).
-    """
-    try:
-        klines = fetch_klines(symbol, interval, limit=30)
-        klines = drop_unclosed_candle(klines)
-        closes = [float(k[4]) for k in klines]
-        if len(closes) < 22:
-            return None
-        current_trend_up = ema(closes, 9)[-1] > ema(closes, 21)[-1]
-        return current_trend_up != original_trend_up
-    except Exception:
-        return None
-
-
 def check_open_positions(positions, price_map):
     """
     يقارن الصفقات المفتوحة بالسعر الحالي، يرسل إشعار تيليجرام عند تحقق هدف أو ضرب وقف خسارة،
@@ -1267,19 +1234,9 @@ def check_open_positions(positions, price_map):
             closed_now.append(pos)
             continue
 
-        # لم يتحقق TP ولا SL بعد -> افحص إبطال الإشارة (انعكاس الاتجاه) قبل السقف الزمني.
-        # لا تُرسل رسالة جديدة صاخبة (حسب طلب سابق)، لكن الرسالة الأصلية تُعدَّل (شطب + نتيجة محايدة)
-        # كي تبقى كل صفقة مرئية النتيجة بالمحادثة، بدل ما تختفي بصمت.
-        reversed_signal = trend_reversed(pos["symbol"], pos.get("interval", INTERVAL), pos["trend_up"])
-        if reversed_signal:
-            edit_telegram_strike(pos.get("alert_message_id"), build_progress_text(pos),
-                                  format_invalidated(pos, price))
-            pos["closed_reason"] = "INVALIDATED"
-            pos["closed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            pos["exit_price"] = price
-            closed_now.append(pos)
-            continue
-
+        # لم يتحقق TP ولا SL بعد -> الصفقة تبقى مفتوحة لغاية تحقق أحد الأهداف أو ضرب
+        # وقف الخسارة (لا يوجد إغلاق مبكر بسبب انعكاس الاتجاه بعد الآن)، إلا لو تجاوزت
+        # السقف الزمني الأقصى (شبكة أمان فقط).
         hours_open = _hours_since(pos["opened_at"])
         if hours_open >= TIME_STOP_HOURS:
             expired_text = (
