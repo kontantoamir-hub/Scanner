@@ -14,6 +14,7 @@
 import os
 import json
 import time
+import datetime as dt
 import concurrent.futures
 import requests
 
@@ -527,7 +528,19 @@ def analyze_symbol(t, interval):
             early_tp_count = conditions_met  # عدد الأهداف = عدد الشروط المتحققة فعليًا لهاي العملة (1 إلى 4)
             raw_tps = [early_entry + early_risk * i for i in range(1, early_tp_count + 1)]
             resistance = r.get("resistance")
-            early_tps = [min(tp, resistance) for tp in raw_tps] if resistance else raw_tps
+            if resistance:
+                # نوقف توليد الأهداف عند أول هدف يتجاوز أقرب مقاومة بدل تقليم كل هدف
+                # لنفس سقف المقاومة — التقليم القديم كان يجعل TP1 وTP2 يتساويان بالضبط
+                # كلما تجاوز أكثر من هدف نفس المقاومة معًا.
+                trimmed = []
+                for tp in raw_tps:
+                    if tp >= resistance:
+                        trimmed.append(resistance)
+                        break
+                    trimmed.append(tp)
+                early_tps = trimmed
+            else:
+                early_tps = raw_tps
 
         # خطة دخول (شراء فقط — السوق الفوري لا يدعم فتح صفقة بيع مكشوفة)، محسوبة ديناميكيًا حسب التحليل:
         # وقف الخسارة من التقلب الفعلي (ATR) للعملة، وعدد الأهداف حسب قوة درجة التوافق
@@ -819,8 +832,10 @@ GIST_ID = os.environ.get("GIST_ID")
 GIST_FILENAME = "alerted_state.json"
 POSITIONS_GIST_FILE = "open_positions.json"   # الصفقات المفتوحة قيد المتابعة (نفس الـ Gist، ملف منفصل)
 CLOSED_GIST_FILE = "closed_trades.json"       # سجل الصفقات المغلقة (لإحصائية الأداء)
+STATS_GIST_FILE = "stats.json"                # إحصائيات أداء محسوبة دوريًا من closed_trades (خيار 3: تتبع فقط)
 MAX_CLOSED_HISTORY = 300                      # سقف لعدد الصفقات المؤرشفة كي لا يتضخم الـ Gist بلا حدود
 DOM_SHIFT_THRESHOLD = float(os.environ.get("DOM_SHIFT_THRESHOLD", "0.3"))  # نقطة مئوية خلال دورة تشغيل واحدة
+REPORT_EVERY_N_CLOSED = int(os.environ.get("REPORT_EVERY_N_CLOSED", "20"))  # كل كم صفقة مغلقة يُرسل تقرير أداء تلقائي عبر تيليجرام
 
 
 def _gist_headers():
@@ -895,10 +910,112 @@ def load_closed():
         return []
 
 
+def compute_stats(history):
+    """
+    يحسب إحصائيات أداء بحتة من سجل الصفقات المغلقة (خيار 3: تتبع فقط، بدون أي
+    تعديل تلقائي على منطق الفحص/الدخول/الأوزان). لا يُستخدم الناتج هنا لتغيير
+    أي قرار في البوت — فقط للعرض والمراقبة اليدوية.
+    """
+    if not history:
+        return None
+
+    total = len(history)
+    wins = losses = neutral = 0
+    pnl_list, durations = [], []
+    by_type, by_score, by_reason = {}, {}, {}
+
+    for t in history:
+        reason = t.get("closed_reason", "UNKNOWN")
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+
+        hit = len(t.get("hit_tps") or [])
+        entry, exit_price = t.get("entry"), t.get("exit_price")
+        if entry and exit_price:
+            pnl_list.append((exit_price - entry) / entry * 100)
+
+        if reason == "ALL_TP" or hit > 0:
+            wins += 1
+            outcome = "win"
+        elif reason == "SL" and hit == 0:
+            losses += 1
+            outcome = "loss"
+        else:
+            neutral += 1
+            outcome = "neutral"
+
+        try:
+            t0 = dt.datetime.strptime(t["opened_at"], "%Y-%m-%d %H:%M:%S")
+            t1 = dt.datetime.strptime(t["closed_at"], "%Y-%m-%d %H:%M:%S")
+            durations.append((t1 - t0).total_seconds() / 3600)
+        except Exception:
+            pass
+
+        ttype = t.get("type", "official")
+        b1 = by_type.setdefault(ttype, {"total": 0, "win": 0, "loss": 0, "neutral": 0})
+        b1["total"] += 1
+        b1[outcome] += 1
+
+        score = t.get("score")
+        if score is not None:
+            key = str(int(score)) if isinstance(score, (int, float)) else "?"
+            b2 = by_score.setdefault(key, {"total": 0, "win": 0, "loss": 0, "neutral": 0})
+            b2["total"] += 1
+            b2[outcome] += 1
+
+    return {
+        "total": total,
+        "wins": wins,
+        "losses": losses,
+        "neutral": neutral,
+        "win_rate_pct": round(wins / total * 100, 1),
+        "avg_pnl_pct": round(sum(pnl_list) / len(pnl_list), 2) if pnl_list else None,
+        "avg_duration_hours": round(sum(durations) / len(durations), 1) if durations else None,
+        "by_type": by_type,
+        "by_score": by_score,
+        "by_reason": by_reason,
+        "computed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def format_stats_report(stats):
+    """يبني نص تقرير أداء مقروء للإرسال عبر تيليجرام من مخرجات compute_stats."""
+    if not stats:
+        return None
+
+    lines = [
+        "📊 تقرير أداء دوري",
+        f"إجمالي الصفقات المغلقة: {stats['total']}",
+        f"نسبة النجاح: {stats['win_rate_pct']}% (ربح: {stats['wins']} | خسارة: {stats['losses']} | محايد: {stats['neutral']})",
+    ]
+    if stats["avg_pnl_pct"] is not None:
+        lines.append(f"متوسط العائد لكل صفقة: {stats['avg_pnl_pct']}%")
+    if stats["avg_duration_hours"] is not None:
+        lines.append(f"متوسط مدة الصفقة: {stats['avg_duration_hours']} ساعة")
+
+    if stats["by_type"]:
+        lines.append("— حسب النوع —")
+        label = {"official": "رسمية", "early": "مبكرة"}
+        for k, v in stats["by_type"].items():
+            wr = (v["win"] / v["total"] * 100) if v["total"] else 0
+            lines.append(f"{label.get(k, k)}: {v['total']} صفقة | نجاح {wr:.0f}%")
+
+    if stats["by_score"]:
+        lines.append("— حسب score —")
+        for k in sorted(stats["by_score"].keys()):
+            v = stats["by_score"][k]
+            wr = (v["win"] / v["total"] * 100) if v["total"] else 0
+            lines.append(f"score {k}: {v['total']} صفقة | نجاح {wr:.0f}%")
+
+    return "\n".join(lines)
+
+
 def save_all_state(alerted_symbols, btc_dominance, positions, closed_delta):
     """
     يحفظ في نفس الطلب: حالة التنبيهات + BTC Dominance + الصفقات المفتوحة،
     ويُلحق أي صفقات أُغلقت هذا التشغيل بسجل closed_trades (مع سقف للحجم).
+    كما يحسب إحصائيات أداء (stats.json) من السجل المحدَّث — تتبع فقط، بدون
+    أي تأثير على منطق الفحص أو الدخول. يرجع الإحصائيات (أو None) للاستخدام
+    الاختياري في إرسال تقرير دوري.
     """
     files = {
         GIST_FILENAME: json.dumps(
@@ -907,6 +1024,8 @@ def save_all_state(alerted_symbols, btc_dominance, positions, closed_delta):
         ),
         POSITIONS_GIST_FILE: json.dumps(positions, ensure_ascii=False, indent=2),
     }
+
+    stats = None
     if closed_delta:
         history = load_closed()
         history.extend(closed_delta)
@@ -914,7 +1033,12 @@ def save_all_state(alerted_symbols, btc_dominance, positions, closed_delta):
             history = history[-MAX_CLOSED_HISTORY:]
         files[CLOSED_GIST_FILE] = json.dumps(history, ensure_ascii=False, indent=2)
 
+        stats = compute_stats(history)
+        if stats:
+            files[STATS_GIST_FILE] = json.dumps(stats, ensure_ascii=False, indent=2)
+
     _gist_patch_files(files)
+    return stats
 
 
 # ---------------- تتبع الصفقات المفتوحة (TP / SL) ----------------
@@ -1256,7 +1380,16 @@ def main():
     open_new_early_positions(open_positions, fresh_early)
 
     # حفظ موحّد: ذاكرة الإشارات (رسمية + مبكرة) + BTC Dominance + الصفقات المفتوحة + أرشيف الصفقات المغلقة حديثًا
-    save_all_state(strong_symbols | early_keys, btc_dominance, open_positions, closed_now)
+    # + إحصائيات أداء محسوبة من السجل المحدَّث (خيار 3: تتبع فقط، بدون تعديل تلقائي على منطق البوت)
+    stats = save_all_state(strong_symbols | early_keys, btc_dominance, open_positions, closed_now)
+
+    # تقرير أداء دوري عبر تيليجرام كل REPORT_EVERY_N_CLOSED صفقة مغلقة (افتراضيًا كل 20 صفقة)
+    if stats and stats["total"] % REPORT_EVERY_N_CLOSED == 0:
+        report_text = format_stats_report(stats)
+        if report_text:
+            send_telegram(report_text)
+            time.sleep(1)
+
     print("انتهى المسح.")
 
 
