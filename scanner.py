@@ -1,15 +1,14 @@
 """
-ماسح السوق — النسخة المحسّنة (3 أنواع إشارات)
-• إشارات مبكرة (Early): قرب الانطلاق — أقرب للقاع
-• إشارات انفجار (Breakout): بداية الزخم — مع أول اختراق
-• إشارات رسمية (Official): تأكيد قوي — أعلى موثوقية
+ماسح السوق — نسخة البايثون (تعمل بجدولة تلقائية عبر GitHub Actions)
+نفس منطق أداة HTML: فلترة سيولة/حركة -> تحليل عميق -> تأكيد فريم أعلى -> استقرار -> تنبيه تيليجرام
 
-التعديلات الرئيسية:
-- EMA 7/14 بدلاً من 9/21 للاستجابة الأسرع
-- Score >= 1.5 للرسمية (بدل 2.5)
-- Early يتطلب 2 شروط فقط (بدل 3)
-- إضافة مؤشر Breakout مستقل (اختراق قمة + حجم)
-- فريم الزمن ثابت على 1h
+يضيف أيضًا مسارًا مستقلاً لـ"إشارات مبكرة" (انضغاط تقلب / تراكم صامت) لعملات لم تصل بعد
+لإشارة شراء كاملة، كتحذير رادار بدون خطة دخول مؤكدة — لتفادي مشكلة "شراء القمة" حيث
+الإشارة الرسمية تصل بعد ما الحركة صارت واضحة للجميع.
+
+يضيف كذلك فلتر "إرهاق/امتداد زائد" (Overextension) يعاقب درجة الإشارات الرسمية نفسها لو
+السعر بعيد جدًا عن EMA50 بوحدات ATR — لمعالجة نفس مشكلة "شراء القمة" من جهة الإشارة
+الرسمية مباشرة، وليس فقط عبر تحذير مبكر منفصل.
 """
 
 import os
@@ -19,13 +18,13 @@ import datetime as dt
 import concurrent.futures
 import requests
 
-# ---------- الإعدادات ----------
+# ---------- الإعدادات (تُقرأ من متغيرات البيئة / GitHub Secrets) ----------
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-INTERVAL = os.environ.get("SCAN_INTERVAL", "1h")
-DEPTH = int(os.environ.get("SCAN_DEPTH", "40"))
-SCAN_LIMIT = 400
-LIQUIDITY_FLOOR = 1_000_000
+INTERVAL = os.environ.get("SCAN_INTERVAL", "1h")          # 15m / 1h / 4h / 1d
+DEPTH = int(os.environ.get("SCAN_DEPTH", "40"))            # عدد العملات للفحص العميق
+SCAN_LIMIT = 400                                            # عدد الشموع التاريخية لكل عملة
+LIQUIDITY_FLOOR = 1_000_000                                 # أدنى سيولة 24س بالدولار
 
 EXCLUDE_SUFFIX = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
 EXCLUDE_SYMS = {"USDCUSDT","FDUSDUSDT","TUSDUSDT","DAIUSDT","USDPUSDT",
@@ -35,45 +34,41 @@ HTF_MAP = {"15m": "1h", "1h": "4h", "4h": "1d", "1d": "1w"}
 
 BASE_URL = "https://data-api.binance.vision/api/v3"
 
-# ---------- إعدادات المؤشرات ----------
+# ---------- إعدادات فلاتر التحليل الإضافية (ADX / الانحراف / المقاومة / OBV) ----------
 ADX_PERIOD = 14
-ADX_THRESHOLD = 20
-DIVERGENCE_LOOKBACK = 20
-DIVERGENCE_PIVOT_SPAN = 3
-RESISTANCE_LOOKBACK = 50
-RESISTANCE_PIVOT_SPAN = 3
-RESISTANCE_PROXIMITY_PCT = 1.5
-OBV_TREND_WINDOW = 10
+ADX_THRESHOLD = 20              # تحت هذا المستوى يُعتبر السوق عرضيًا (بلا اتجاه واضح)
+DIVERGENCE_LOOKBACK = 20        # عدد الشموع للبحث فيها عن قيعان سعرية للمقارنة مع RSI
+DIVERGENCE_PIVOT_SPAN = 3       # عدد الشموع على كل جانب لاعتبار نقطة "قاع محلي"
+RESISTANCE_LOOKBACK = 50        # عدد الشموع للبحث فيها عن أقرب مقاومة سابقة
+RESISTANCE_PIVOT_SPAN = 3       # عدد الشموع على كل جانب لاعتبار نقطة "قمة محلية"
+RESISTANCE_PROXIMITY_PCT = 1.5  # لو السعر أقرب من هذه النسبة% لمقاومة فوقه -> تحذير
+OBV_TREND_WINDOW = 10           # عدد الشموع لقياس اتجاه OBV مقابل اتجاه السعر
 
-EXTENSION_EMA_PERIOD = 50
+# ---------- إعدادات فلتر الإرهاق/الامتداد الزائد (Overextension) ----------
+EXTENSION_EMA_PERIOD = 50       # المتوسط المتحرك المرجعي لقياس "المسافة المقطوعة" عن خط الأساس
 EXTENSION_ATR_THRESHOLD = float(os.environ.get("EXTENSION_ATR_THRESHOLD", "3.0"))
+# المسافة بين السعر وEMA50 بوحدات ATR — فوق هذا الحد يُعتبر السعر ممتدًا بشكل مفرط (احتمال شراء متأخر)
 
-SQUEEZE_LOOKBACK = 20
-SQUEEZE_RATIO_THRESHOLD = 0.6
-ACCUM_WINDOW = 20
-ACCUM_PRICE_MAX_MOVE_PCT = 4.0
-ACCUM_FLOW_RATIO_MIN = 0.3
+# ---------- إعدادات الإشارات المبكرة (انضغاط تقلب / تراكم صامت) ----------
+SQUEEZE_LOOKBACK = 20           # عدد الشموع لحساب متوسط عرض نطاق Bollinger
+SQUEEZE_RATIO_THRESHOLD = 0.6   # عرض النطاق الحالي <= هذه النسبة من المتوسط -> يُعتبر انضغاطًا
+ACCUM_WINDOW = 20               # عدد الشموع لقياس التراكم الصامت
+ACCUM_PRICE_MAX_MOVE_PCT = 4.0  # أقصى تحرك سعري% خلال النافذة كي يُعتبر السعر "شبه ثابت"
+ACCUM_FLOW_RATIO_MIN = 0.3      # أدنى نسبة صافي تدفق شراء (OBV/حجم) كي يُعتبر تراكمًا واضحًا
 
-# إعدادات Breakout
-BREAKOUT_LOOKBACK = 10
-BREAKOUT_VOL_MULT = 1.3
-BREAKOUT_MIN_ATR_PCT = 0.08
+# ---------- إعدادات إشارة الانفجار (Breakout) ----------
+BREAKOUT_LOOKBACK = 10          # عدد الشموع للبحث فيها عن أعلى قمة سابقة قبل الاختراق
+BREAKOUT_VOL_MULT = 1.3         # الحجم الحالي يجب أن يتجاوز متوسط الحجم بهذا المضاعف
+BREAKOUT_MIN_ATR_PCT = 0.08     # أدنى نسبة تقلب (ATR%) لقبول إشارة الانفجار
 
+# ---------------- إعدادات أهداف الإشارات المبكرة (تقديرية، أقل ثقة من الإشارة الرسمية) ----------------
+# وقف خسارة أوسع من الإشارة الرسمية (1.5×ATR) لأن نقطة الدخول أقل دقة والتقلب حولها أعلى
 EARLY_SL_ATR_MULT = 2.0
-TIME_STOP_HOURS = float(os.environ.get("TIME_STOP_HOURS", "96"))
-DOM_SHIFT_THRESHOLD = float(os.environ.get("DOM_SHIFT_THRESHOLD", "0.3"))
-REPORT_EVERY_N_CLOSED = int(os.environ.get("REPORT_EVERY_N_CLOSED", "20"))
-
-GIST_TOKEN = os.environ.get("GIST_TOKEN")
-GIST_ID = os.environ.get("GIST_ID")
-GIST_FILENAME = "alerted_state.json"
-POSITIONS_GIST_FILE = "open_positions.json"
-CLOSED_GIST_FILE = "closed_trades.json"
-STATS_GIST_FILE = "stats.json"
-MAX_CLOSED_HISTORY = 300
+# عدد الأهداف والثقة يعتمدان مباشرة على عدد الشروط المتحققة (squeeze / accumulation / divergence / momentum):
+# شرط واحد = احتمالية (هدف واحد)، شرطان = مؤكدة (هدفان)، 3 فأكثر = مؤكدة قوية (3-4 أهداف)
 
 
-# ==================== دوال المؤشرات الفنية ====================
+# ---------------- دوال المؤشرات الفنية ----------------
 
 def ema(values, period):
     k = 2 / (period + 1)
@@ -131,10 +126,16 @@ def rolling_avg(values, period):
 
 
 def adx(highs, lows, closes, period=ADX_PERIOD):
+    """
+    مؤشر قوة الاتجاه (ADX) — يميّز السوق المتجه بوضوح عن السوق العرضي المتذبذب.
+    قيمة أقل من ~20 تعني غالبًا سوقًا بلا اتجاه واضح، حيث تكثر الإشارات الكاذبة.
+    يرجع قائمة بنفس طول closes، بقيم None قبل اكتمال فترة الحساب.
+    """
     n = len(closes)
     out = [None] * n
     if n <= period * 2:
         return out
+
     tr = [0.0] * n
     plus_dm = [0.0] * n
     minus_dm = [0.0] * n
@@ -144,9 +145,11 @@ def adx(highs, lows, closes, period=ADX_PERIOD):
         plus_dm[i] = up_move if (up_move > down_move and up_move > 0) else 0.0
         minus_dm[i] = down_move if (down_move > up_move and down_move > 0) else 0.0
         tr[i] = max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+
     tr_sum = sum(tr[1:period + 1])
     plus_sum = sum(plus_dm[1:period + 1])
     minus_sum = sum(minus_dm[1:period + 1])
+
     dx = [None] * n
     for i in range(period + 1, n):
         tr_sum = tr_sum - (tr_sum / period) + tr[i]
@@ -155,6 +158,7 @@ def adx(highs, lows, closes, period=ADX_PERIOD):
         pdi = 100 * plus_sum / tr_sum if tr_sum else 0
         mdi = 100 * minus_sum / tr_sum if tr_sum else 0
         dx[i] = 100 * abs(pdi - mdi) / (pdi + mdi) if (pdi + mdi) else 0
+
     start = period * 2
     valid_dx = [x for x in dx[period + 1:start + 1] if x is not None]
     if not valid_dx:
@@ -168,6 +172,10 @@ def adx(highs, lows, closes, period=ADX_PERIOD):
 
 
 def obv(closes, vols):
+    """
+    On-Balance Volume — يجمع الحجم مع اتجاه السعر، لكشف هل الحجم يدعم الحركة فعليًا
+    أم أن الصعود/الهبوط يحدث بحجم ضعيف (أقل موثوقية).
+    """
     out = [0.0] * len(closes)
     for i in range(1, len(closes)):
         if closes[i] > closes[i - 1]:
@@ -180,6 +188,7 @@ def obv(closes, vols):
 
 
 def obv_confirms_trend(obv_vals, trend_up, window=OBV_TREND_WINDOW):
+    """يتحقق هل اتجاه OBV خلال آخر window شمعة يتماشى مع اتجاه السعر (EMA9/21)."""
     if len(obv_vals) <= window:
         return False
     obv_slope_up = obv_vals[-1] > obv_vals[-1 - window]
@@ -187,6 +196,11 @@ def obv_confirms_trend(obv_vals, trend_up, window=OBV_TREND_WINDOW):
 
 
 def volatility_squeeze(bb_upper, bb_lower, closes, lookback=SQUEEZE_LOOKBACK):
+    """
+    يكشف انضغاط تقلب (Squeeze): عرض نطاق Bollinger الحالي أضيق بشكل ملحوظ من متوسطه
+    خلال آخر lookback شمعة — غالبًا يسبق حركة سعرية قوية (بالاتجاهين)، فهو مؤشر
+    "ترقّب" وليس اتجاهًا بحد ذاته، ويُستخدم كإشارة مبكرة قبل تأكيد الاتجاه الكامل.
+    """
     n = len(closes)
     if n <= lookback or bb_upper[-1] is None or bb_lower[-1] is None:
         return False
@@ -204,6 +218,11 @@ def volatility_squeeze(bb_upper, bb_lower, closes, lookback=SQUEEZE_LOOKBACK):
 
 
 def silent_accumulation(closes, vols, obv_vals, window=ACCUM_WINDOW):
+    """
+    يكشف تراكم صامت: صافي تدفق الشراء (OBV) نسبة لإجمالي الحجم المتداول خلال النافذة
+    يميل بوضوح لضغط شراء، بينما السعر نفسه بالكاد تحرك -- إشارة على تجميع مركز
+    قبل انعكاس سعري محتمل، دون انتظار تأكيد الاتجاه الكامل بالمؤشرات اللحظية.
+    """
     n = len(closes)
     if n <= window:
         return False
@@ -216,6 +235,10 @@ def silent_accumulation(closes, vols, obv_vals, window=ACCUM_WINDOW):
 
 
 def bullish_divergence(closes, rsi_vals, lookback=DIVERGENCE_LOOKBACK, pivot_span=DIVERGENCE_PIVOT_SPAN):
+    """
+    يكشف انحراف صعودي: السعر يصنع قاعًا أدنى من القاع السابق، بينما RSI يصنع قاعًا أعلى —
+    من أقوى إشارات احتمال الانعكاس للأعلى عند المحترفين.
+    """
     n = len(closes)
     if n < lookback + pivot_span * 2:
         return False
@@ -238,6 +261,7 @@ def bullish_divergence(closes, rsi_vals, lookback=DIVERGENCE_LOOKBACK, pivot_spa
 
 
 def nearest_resistance(highs, closes, lookback=RESISTANCE_LOOKBACK, pivot_span=RESISTANCE_PIVOT_SPAN):
+    """يرجع أقرب مستوى مقاومة (قمة سعرية سابقة) فوق السعر الحالي، أو None لو لا توجد."""
     n = len(highs)
     window_n = min(lookback, n)
     start = n - window_n
@@ -252,6 +276,10 @@ def nearest_resistance(highs, closes, lookback=RESISTANCE_LOOKBACK, pivot_span=R
 
 
 def momentum_strength(macd_line, signal, rsi_vals, i):
+    """
+    قوة الزخم: تتحقق لما يكون MACD فوق خط الإشارة وهيستوغرام الفرق بينهما يتسع
+    (الزخم يتسارع لا يتباطأ)، مع RSI في منطقة صاعدة (بين 45 و65: زخم بدون تشبع شرائي).
+    """
     if i < 1 or macd_line[i] is None or signal[i] is None or rsi_vals[i] is None:
         return False
     hist_now = macd_line[i] - signal[i]
@@ -261,9 +289,11 @@ def momentum_strength(macd_line, signal, rsi_vals, i):
     return macd_bull and rsi_rising
 
 
-# ==================== Breakout Detection (جديد) ====================
-
 def breakout_detect(highs, closes, vols, lookback=BREAKOUT_LOOKBACK, vol_mult=BREAKOUT_VOL_MULT):
+    """
+    إشارة انفجار: اختراق أعلى قمة خلال آخر lookback شمعة (بدون احتساب الشمعة الحالية)
+    مصحوبًا بحجم يتجاوز متوسط الحجم السابق بمضاعف vol_mult.
+    """
     n = len(closes)
     if n < lookback + 5:
         return False
@@ -275,6 +305,10 @@ def breakout_detect(highs, closes, vols, lookback=BREAKOUT_LOOKBACK, vol_mult=BR
 
 
 def breakout_quality(ind, i):
+    """
+    تقييم جودة إشارة الانفجار (0 إلى 3): دعم الاتجاه (EMA7>EMA14)، تأكيد MACD،
+    وRSI في منطقة صحية (لا تشبع بيعي ولا شرائي).
+    """
     if i < 1:
         return 0, {}
     ema7 = ind.get("ema7")
@@ -296,9 +330,11 @@ def breakout_quality(ind, i):
     return score, details
 
 
-# ==================== ATR & Overextension ====================
-
 def atr_value_at(ind, i, period=14):
+    """
+    نفس فكرة atr_value لكن عند شمعة i محددة (وليس دائمًا آخر شمعة) — يُستخدم لقياس
+    الإرهاق/الامتداد عند نقطة زمنية معيّنة، ويسمح لنفس المنطق يشتغل حيًا وبالاختبار الرجعي.
+    """
     trs = []
     start = max(1, i - period + 1)
     for j in range(start, i + 1):
@@ -311,6 +347,11 @@ def atr_value_at(ind, i, period=14):
 
 
 def overextended(ind, i, trend_up):
+    """
+    يكشف امتدادًا سعريًا مفرطًا: المسافة بين السعر الحالي وEMA50 بوحدات ATR فوق عتبة معيّنة،
+    بمعنى أن العملة صعدت (أو هبطت) كثيرًا خلال فترة قصيرة نسبيًا — احتمال دخول متأخر
+    (شراء القمة) حتى لو باقي المؤشرات اللحظية تبدو إيجابية.
+    """
     ema50 = ind.get("ema50")
     if not ema50 or i >= len(ema50) or ema50[i] is None:
         return False
@@ -356,15 +397,23 @@ def score_at(i, ind, apply_extra_filters=True):
     vol_score = trend_dir * 0.5 if vol_confirm else 0
     score = trend_dir + rsi_state + (1 if macd_bull else -1) + bb_state + vol_score
 
+    # --- فلاتر إضافية لتحسين جودة الإشارة (ADX / انحراف / مقاومة / OBV / إرهاق) ---
+    # تُحسب دائمًا للعرض التشخيصي، لكن تُطبَّق على الدرجة فقط لو apply_extra_filters=True
+    # (يُستخدم False في الاختبار الرجعي لمقارنة الأداء بدونها)
+
     adx_val = ind["adx"][i] if i < len(ind["adx"]) else None
     ranging = adx_val is not None and adx_val < ADX_THRESHOLD
+
     divergence = bullish_divergence(ind["closes"][:i + 1], ind["rsi"][:i + 1])
+
     resistance = nearest_resistance(ind["highs"][:i + 1], ind["closes"][:i + 1])
     near_resistance = False
     if resistance:
         dist_pct = (resistance - price) / price * 100
         near_resistance = 0 <= dist_pct <= RESISTANCE_PROXIMITY_PCT
+
     obv_confirm = obv_confirms_trend(ind["obv"][:i + 1], trend_up)
+
     extended = overextended(ind, i, trend_up)
 
     if apply_extra_filters:
@@ -377,7 +426,7 @@ def score_at(i, ind, apply_extra_filters=True):
         if obv_confirm:
             score += trend_dir * 0.5
         if extended:
-            score -= trend_dir * 1
+            score -= trend_dir * 1  # عقوبة على الامتداد المفرط -- احتمال دخول متأخر (شراء القمة)
 
     return {
         "score": score, "trend_up": trend_up, "vol_confirm": vol_confirm, "rv": rv,
@@ -394,6 +443,7 @@ def atr_percent(ind, period=14):
 
 
 def atr_value(ind, period=14):
+    """متوسط المدى الحقيقي بالقيمة المطلقة (وحدة السعر نفسها)، يُستخدم لحساب وقف خسارة يتناسب مع تقلب كل عملة."""
     n = len(ind["closes"])
     trs = []
     for i in range(n - period, n):
@@ -405,9 +455,10 @@ def atr_value(ind, period=14):
     return sum(trs) / len(trs)
 
 
-# ==================== جلب البيانات ====================
+# ---------------- جلب البيانات من Binance ----------------
 
 def _request_with_retry(url, params=None, timeout=20, retries=3, backoff=1.5):
+    """طلب HTTP مع إعادة محاولة تلقائية عند فشل الشبكة أو ضغط مؤقت من Binance (429/5xx)."""
     last_err = None
     for attempt in range(retries):
         try:
@@ -419,7 +470,7 @@ def _request_with_retry(url, params=None, timeout=20, retries=3, backoff=1.5):
         except Exception as e:
             last_err = e
             if attempt < retries - 1:
-                time.sleep(backoff * (attempt + 1))
+                time.sleep(backoff * (attempt + 1))  # انتظار متزايد بين المحاولات
     raise last_err
 
 
@@ -429,6 +480,7 @@ def fetch_ticker24h():
 
 
 def fetch_prices_map(tickers):
+    """يبني قاموسًا {رمز: آخر سعر} من نفس بيانات ticker24h بدون طلب إضافي."""
     out = {}
     for t in tickers:
         try:
@@ -445,6 +497,11 @@ def fetch_klines(symbol, interval, limit=SCAN_LIMIT):
 
 
 def drop_unclosed_candle(klines):
+    """
+    يستبعد آخر شمعة إذا كانت لسا مفتوحة (لم تُغلق بعد وقت التشغيل)، لتفادي تحليل
+    بيانات ناقصة قابلة للتغيّر (Repainting) — Binance ترجع الشمعة الجارية كآخر عنصر دائمًا.
+    عنصر الشمعة: [open_time, open, high, low, close, volume, close_time, ...]
+    """
     if not klines:
         return klines
     now_ms = time.time() * 1000
@@ -454,7 +511,7 @@ def drop_unclosed_candle(klines):
     return klines
 
 
-# ==================== تحليل عملة واحدة ====================
+# ---------------- تحليل عملة واحدة ----------------
 
 def analyze_symbol(t, interval):
     symbol = t["symbol"]
@@ -489,13 +546,19 @@ def analyze_symbol(t, interval):
                 except Exception:
                     pass
 
+        # إشارات مبكرة (انضغاط تقلب / تراكم صامت) — مستقلة عن الدرجة الرسمية، تُحسب دائمًا
+        # للعرض، وتُستخدم لاحقًا فقط لعملات لم تصل بعد لإشارة شراء كاملة
         squeeze = volatility_squeeze(ind["bb_upper"], ind["bb_lower"], ind["closes"])
         accumulation = silent_accumulation(ind["closes"], ind["vols"], ind["obv"])
-        momentum = momentum_strength(ind["macd"], ind["signal"], ind["rsi"], last)
 
+        # أهداف تقديرية للإشارة المبكرة نفسها (وليس فقط تحذير بدون أرقام):
+        # وقف خسارة أوسع (ATR×2) لأن الدخول أقل تأكيدًا، وعدد أهداف حسب مستوى الثقة
+        # (شرط واحد = احتمالية وهدف واحد، شرطان فأكثر = مؤكدة وهدفان)، مع تقليم أي هدف
+        # يتجاوز أقرب مقاومة معروفة كي لا نضع هدفًا خلف حاجز سعري واضح.
         early_entry = early_sl = None
         early_tps = []
         early_confidence = None
+        momentum = momentum_strength(ind["macd"], ind["signal"], ind["rsi"], last)
         if squeeze or accumulation:
             conditions_met = sum([squeeze, accumulation, r["divergence"], momentum])
             if conditions_met >= 2:
@@ -509,10 +572,13 @@ def analyze_symbol(t, interval):
                 atrv = atr_value(ind)
                 early_sl = early_entry - atrv * EARLY_SL_ATR_MULT
                 early_risk = early_entry - early_sl
-                early_tp_count = conditions_met
+                early_tp_count = conditions_met  # عدد الأهداف = عدد الشروط المتحققة فعليًا لهاي العملة (1 إلى 4)
                 raw_tps = [early_entry + early_risk * i for i in range(1, early_tp_count + 1)]
                 resistance = r.get("resistance")
                 if resistance:
+                    # نوقف توليد الأهداف عند أول هدف يتجاوز أقرب مقاومة بدل تقليم كل هدف
+                    # لنفس سقف المقاومة — التقليم القديم كان يجعل TP1 وTP2 يتساويان بالضبط
+                    # كلما تجاوز أكثر من هدف نفس المقاومة معًا.
                     trimmed = []
                     for tp in raw_tps:
                         if tp >= resistance:
@@ -523,6 +589,7 @@ def analyze_symbol(t, interval):
                 else:
                     early_tps = raw_tps
 
+        # إشارة انفجار (Breakout) — اختراق قمة سابقة مع تأكيد حجم، مستقلة عن الدرجة الرسمية
         breakout = breakout_detect(ind["highs"], ind["closes"], ind["vols"])
         breakout_score, breakout_details = 0, {}
         breakout_entry = breakout_sl = None
@@ -553,13 +620,16 @@ def analyze_symbol(t, interval):
                 else:
                     breakout_tps = raw_tps
 
+        # خطة دخول (شراء فقط — السوق الفوري لا يدعم فتح صفقة بيع مكشوفة)، محسوبة ديناميكيًا حسب التحليل:
+        # وقف الخسارة من التقلب الفعلي (ATR) للعملة، وعدد الأهداف حسب قوة درجة التوافق
         entry = sl = None
         tps = []
-        if final_score >= 1.0:
+        if final_score >= 1:
             entry = ind["closes"][last]
             atrv = atr_value(ind)
             sl = entry - atrv * 1.5
             risk = entry - sl
+
             if final_score >= 3.5:
                 tp_count = 4
             elif final_score >= 2.5:
@@ -568,6 +638,7 @@ def analyze_symbol(t, interval):
                 tp_count = 2
             else:
                 tp_count = 1
+
             tps = [entry + risk * i for i in range(1, tp_count + 1)]
 
         return {
@@ -602,11 +673,12 @@ def analyze_symbol(t, interval):
         return None
 
 
-# ==================== المسح الكامل ====================
+# ---------------- المسح الكامل (مرحلتين) ----------------
 
 def run_scan(tickers=None):
     if tickers is None:
         tickers = fetch_ticker24h()
+
     liquid = [
         t for t in tickers
         if t["symbol"].endswith("USDT")
@@ -614,13 +686,17 @@ def run_scan(tickers=None):
         and t["symbol"] not in EXCLUDE_SYMS
         and float(t["quoteVolume"]) >= LIQUIDITY_FLOOR
     ]
+    # ترتيب مركّب: يجمع بين رتبة السيولة الحالية ورتبة قوة الحركة، بدل الاعتماد على الحركة وحدها
+    # (عملة عالية السيولة لكن حركتها المئوية بسيطة قد تكون أهم من عملة صغيرة تحركت كثيرًا نسبيًا)
     by_volume = sorted(liquid, key=lambda t: float(t["quoteVolume"]), reverse=True)
     by_momentum = sorted(liquid, key=lambda t: abs(float(t["priceChangePercent"])), reverse=True)
     volume_rank = {t["symbol"]: i for i, t in enumerate(by_volume)}
     momentum_rank = {t["symbol"]: i for i, t in enumerate(by_momentum)}
     combined = sorted(liquid, key=lambda t: volume_rank[t["symbol"]] + momentum_rank[t["symbol"]])
     shortlist = combined[:DEPTH]
+
     print(f"سيولة كافية: {len(liquid)} عملة | فحص عميق: {len(shortlist)} عملة | فريم: {INTERVAL}")
+
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
         futures = [pool.submit(analyze_symbol, t, INTERVAL) for t in shortlist]
@@ -628,12 +704,15 @@ def run_scan(tickers=None):
             r = f.result()
             if r:
                 results.append(r)
+
     return results
 
 
-# ==================== تيليجرام ====================
+# ---------------- تيليجرام ----------------
 
 def send_telegram(text):
+    """يرسل رسالة تيليجرام جديدة، ويرجع message_id الخاص فيها (أو None عند الفشل) —
+    يُستخدم لاحقًا لتعديل نفس الرسالة (شطبها + إضافة النتيجة) عند إغلاق الصفقة."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ TELEGRAM_TOKEN أو TELEGRAM_CHAT_ID غير موجودين — تخطي الإرسال.")
         return None
@@ -650,10 +729,16 @@ def send_telegram(text):
 
 
 def _escape_html(text):
+    """يهرب رموز HTML الخاصة قبل الإرسال بوضع parse_mode=HTML (تفاديًا لكسر التنسيق)."""
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def edit_telegram_strike(message_id, original_text, result_text):
+    """
+    يعدّل رسالة تيليجرام الأصلية (الإشارة) بعد إغلاق الصفقة: يشطب نصها الأصلي (Strikethrough)
+    ويضيف نتيجة الإغلاق تحته بنفس الرسالة — بالإضافة إلى رسالة النتيجة الجديدة المنفصلة،
+    وليس بديلاً عنها.
+    """
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not message_id:
         return
     new_text = f"<s>{_escape_html(original_text)}</s>\n\n{_escape_html(result_text)}"
@@ -672,6 +757,7 @@ def edit_telegram_strike(message_id, original_text, result_text):
 
 
 def delete_telegram_message(message_id):
+    """يحذف رسالة تيليجرام سابقة — يُستخدم لحذف إشعار هدف سابق عند تحقق هدف جديد بنفس الصفقة."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not message_id:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteMessage"
@@ -684,6 +770,11 @@ def delete_telegram_message(message_id):
 
 
 def edit_telegram_append(message_id, original_text, extra_lines):
+    """
+    يعدّل رسالة الإشارة الأصلية بإضافة سطر مختصر تحت نصها لكل هدف تحقق حتى الآن (تراكميًا،
+    الأسطر السابقة تبقى كما هي ويُضاف الجديد تحتها) — بدون شطب النص، لأن هذا ليس إغلاقًا نهائيًا
+    بمعنى "شطب واستبدال" بل تحديثًا مستمرًا لنفس رسالة الإشارة مع كل هدف.
+    """
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not message_id:
         return
     new_text = original_text + "\n\n" + "\n".join(extra_lines)
@@ -701,6 +792,8 @@ def edit_telegram_append(message_id, original_text, extra_lines):
 
 
 def format_tp_line(pos, tp_index):
+    """سطر مختصر لهدف واحد متحقق (يُستخدم بالتعديل التراكمي على رسالة الإشارة الأصلية فقط) —
+    يقتطع فقط سطر التحقق من هذا الهدف، ولا يعيد كتابة الرسالة كاملة."""
     entry = pos["entry"]
     tp = pos["tps"][tp_index]
     pct_gain = (tp - entry) / entry * 100
@@ -709,6 +802,11 @@ def format_tp_line(pos, tp_index):
 
 
 def build_progress_text(pos):
+    """
+    النص الأساسي الذي يُبنى عليه أي تعديل نهائي للرسالة (SL / انعكاس / انتهاء وقت):
+    النص الأصلي + سطر لكل هدف تحقق قبل الإغلاق (إن وُجد)، حتى ما يضيع سجل الأهداف
+    المتحققة سابقًا عند الشطب النهائي.
+    """
     base = pos.get("alert_text", "")
     hit_sorted = sorted(pos.get("hit_tps", []))
     if not hit_sorted:
@@ -717,12 +815,11 @@ def build_progress_text(pos):
     return base + "\n\n" + "\n".join(lines)
 
 
-# ==================== تنسيق الإشارات (3 أنواع) ====================
-
 def format_alert(r, market_caution=False):
     is_buy = r["score"] >= 1.5
     dot = "🟢" if is_buy else "🔴"
     title = "إشارة شراء" if is_buy else "تجنب شراء"
+
     badges = []
     if r["persistent"]:
         badges.append("مستقرة")
@@ -739,44 +836,62 @@ def format_alert(r, market_caution=False):
     if r.get("extended"):
         badges.append("⚠️ حركة ممتدة (احتمال شراء متأخر)")
     badge_txt = f" ({', '.join(badges)})" if badges else ""
+
     lines = [
-        f"{dot} {title} (رسمية)",
+        f"{dot} {title}",
         r['symbol'].replace('USDT', '/USDT'),
         f"الدرجة: {r['score']:.1f} | فريم: {INTERVAL}{badge_txt}",
         f"السعر: {r['price']:.6g}",
     ]
+
     if r.get("entry") is not None:
         lines.append(f"الدخول: {r['entry']:.6g}")
         for i, tp in enumerate(r.get("tps", []), start=1):
             lines.append(f"TP{i}: {tp:.6g}")
         lines.append(f"وقف الخسارة: {r['sl']:.6g}")
     else:
+        # السوق الفوري لا يدعم فتح صفقة بيع مكشوفة — فلا توجد خطة دخول لإشارات "تجنب شراء"
         lines.append("لا توجد خطة دخول (تحذير فقط)")
+
     if market_caution:
-        lines.append("⚠️ سيطرة BTC تتحرك بقوة — إشارات العملات البديلة أقل موثوقية")
+        lines.append("⚠️ سيطرة BTC (Dominance) تتحرك بقوة الآن — إشارات العملات البديلة أقل موثوقية مؤقتًا")
+
     return "\n".join(lines)
 
 
 def format_early_alert(r):
+    """
+    تنبيه رادار مبكر: انضغاط تقلب و/أو تراكم صامت لعملة لم تصل بعد لإشارة شراء كاملة.
+    يعرض أهدافًا تقديرية (وقف خسارة أوسع من الرسمية + عدد أهداف متغير حسب مستوى الثقة)،
+    وتُتابَع تلقائيًا (TP/SL) ضمن نفس آلية الصفقات المفتوحة — لكنها تبقى أقل تأكيدًا
+    من الإشارة الرسمية. قالب مختصر: بدون سطر المؤشرات وبدون السعر الحالي المنفصل،
+    مع الإبقاء فقط على تحذير الحركة الممتدة عند انطباقه.
+    """
     confidence = r.get("early_confidence")
     dot = "🟢" if confidence == "مؤكدة قوية" else ("🟣" if confidence == "مؤكدة" else "🔵")
+    # لا لاحقة لمستوى "احتمالية" (القالب الافتراضي بدون نص إضافي بعد العنوان)
     title = f"إشارة مبكرة - {confidence}" if confidence and confidence != "احتمالية" else "إشارة مبكرة"
+
     lines = [
         f"{dot} {title}",
         r['symbol'].replace('USDT', '/USDT'),
         f"الدرجة الحالية: {r['score']:.1f} | فريم: {INTERVAL}",
     ]
+
     if r.get("early_entry") is not None:
-        lines.append(f"الدخول: {r['early_entry']:.6g}")
+        lines.append(f"الدخول : {r['early_entry']:.6g}")
         for i, tp in enumerate(r.get("early_tps", []), start=1):
-            lines.append(f"TP{i}: {tp:.6g}")
-        lines.append(f"SL: {r['early_sl']:.6g}")
+            lines.append(f"TP {i}: {tp:.6g}")
+        lines.append(f"SL : {r['early_sl']:.6g}")
+
     if r.get("extended"):
         lines.append("⚠️ حركة ممتدة")
+
     return "\n".join(lines)
 
 
 def format_breakout_alert(r):
+    """إشارة انفجار زخم: اختراق قمة سابقة مع تأكيد حجم — تدخل مبكرًا مع بداية الزخم."""
     b_score = r.get("breakout_score", 0)
     dot = "🟠" if b_score >= 3 else ("🟡" if b_score >= 2 else "⚪")
     title = "إشارة انفجار زخم"
@@ -806,13 +921,25 @@ def format_breakout_alert(r):
     return "\n".join(lines)
 
 
-# ==================== إدارة الحالة عبر Gist ====================
+# ---------------- إدارة الحالة عبر GitHub Gist (بديل عن الكتابة داخل المستودع) ----------------
+
+GIST_TOKEN = os.environ.get("GIST_TOKEN")
+GIST_ID = os.environ.get("GIST_ID")
+GIST_FILENAME = "alerted_state.json"
+POSITIONS_GIST_FILE = "open_positions.json"   # الصفقات المفتوحة قيد المتابعة (نفس الـ Gist، ملف منفصل)
+CLOSED_GIST_FILE = "closed_trades.json"       # سجل الصفقات المغلقة (لإحصائية الأداء)
+STATS_GIST_FILE = "stats.json"                # إحصائيات أداء محسوبة دوريًا من closed_trades (خيار 3: تتبع فقط)
+MAX_CLOSED_HISTORY = 300                      # سقف لعدد الصفقات المؤرشفة كي لا يتضخم الـ Gist بلا حدود
+DOM_SHIFT_THRESHOLD = float(os.environ.get("DOM_SHIFT_THRESHOLD", "0.3"))  # نقطة مئوية خلال دورة تشغيل واحدة
+REPORT_EVERY_N_CLOSED = int(os.environ.get("REPORT_EVERY_N_CLOSED", "20"))  # كل كم صفقة مغلقة يُرسل تقرير أداء تلقائي عبر تيليجرام
+
 
 def _gist_headers():
     return {"Authorization": f"token {GIST_TOKEN}", "Accept": "application/vnd.github+json"}
 
 
 def _gist_get_file(filename):
+    """يقرأ محتوى ملف واحد داخل الـ Gist (يرجع None لو غير موجود أو حصل خطأ)."""
     if not GIST_TOKEN or not GIST_ID:
         return None
     try:
@@ -828,6 +955,7 @@ def _gist_get_file(filename):
 
 
 def _gist_patch_files(files_dict):
+    """يحفظ عدة ملفات دفعة واحدة داخل نفس الـ Gist (الملفات غير المذكورة تبقى كما هي)."""
     if not GIST_TOKEN or not GIST_ID:
         return
     payload = {"files": {fn: {"content": content} for fn, content in files_dict.items()}}
@@ -841,8 +969,9 @@ def _gist_patch_files(files_dict):
 
 
 def load_state():
+    """يحمّل ذاكرة الإشارات المرسلة وآخر قيمة BTC Dominance من Gist خاص، بدل ملف داخل المستودع."""
     if not GIST_TOKEN or not GIST_ID:
-        print("⚠️ GIST_TOKEN أو GIST_ID غير موجودين — سيبدأ البوت بذاكرة فارغة.")
+        print("⚠️ GIST_TOKEN أو GIST_ID غير موجودين — سيبدأ البوت بذاكرة فارغة هذا التشغيل.")
         return set(), None
     content = _gist_get_file(GIST_FILENAME)
     if not content:
@@ -856,6 +985,7 @@ def load_state():
 
 
 def load_positions():
+    """يحمّل الصفقات المفتوحة قيد المتابعة من الـ Gist."""
     content = _gist_get_file(POSITIONS_GIST_FILE)
     if not content:
         return []
@@ -877,19 +1007,28 @@ def load_closed():
 
 
 def compute_stats(history):
+    """
+    يحسب إحصائيات أداء بحتة من سجل الصفقات المغلقة (خيار 3: تتبع فقط، بدون أي
+    تعديل تلقائي على منطق الفحص/الدخول/الأوزان). لا يُستخدم الناتج هنا لتغيير
+    أي قرار في البوت — فقط للعرض والمراقبة اليدوية.
+    """
     if not history:
         return None
+
     total = len(history)
     wins = losses = neutral = 0
     pnl_list, durations = [], []
     by_type, by_score, by_reason = {}, {}, {}
+
     for t in history:
         reason = t.get("closed_reason", "UNKNOWN")
         by_reason[reason] = by_reason.get(reason, 0) + 1
+
         hit = len(t.get("hit_tps") or [])
         entry, exit_price = t.get("entry"), t.get("exit_price")
         if entry and exit_price:
             pnl_list.append((exit_price - entry) / entry * 100)
+
         if reason == "ALL_TP" or hit > 0:
             wins += 1
             outcome = "win"
@@ -899,22 +1038,26 @@ def compute_stats(history):
         else:
             neutral += 1
             outcome = "neutral"
+
         try:
             t0 = dt.datetime.strptime(t["opened_at"], "%Y-%m-%d %H:%M:%S")
             t1 = dt.datetime.strptime(t["closed_at"], "%Y-%m-%d %H:%M:%S")
             durations.append((t1 - t0).total_seconds() / 3600)
         except Exception:
             pass
+
         ttype = t.get("type", "official")
         b1 = by_type.setdefault(ttype, {"total": 0, "win": 0, "loss": 0, "neutral": 0})
         b1["total"] += 1
         b1[outcome] += 1
+
         score = t.get("score")
         if score is not None:
             key = str(int(score)) if isinstance(score, (int, float)) else "?"
             b2 = by_score.setdefault(key, {"total": 0, "win": 0, "loss": 0, "neutral": 0})
             b2["total"] += 1
             b2[outcome] += 1
+
     return {
         "total": total,
         "wins": wins,
@@ -931,8 +1074,10 @@ def compute_stats(history):
 
 
 def format_stats_report(stats):
+    """يبني نص تقرير أداء مقروء للإرسال عبر تيليجرام من مخرجات compute_stats."""
     if not stats:
         return None
+
     lines = [
         "📊 تقرير أداء دوري",
         f"إجمالي الصفقات المغلقة: {stats['total']}",
@@ -942,22 +1087,32 @@ def format_stats_report(stats):
         lines.append(f"متوسط العائد لكل صفقة: {stats['avg_pnl_pct']}%")
     if stats["avg_duration_hours"] is not None:
         lines.append(f"متوسط مدة الصفقة: {stats['avg_duration_hours']} ساعة")
+
     if stats["by_type"]:
         lines.append("— حسب النوع —")
         label = {"official": "رسمية", "early": "مبكرة", "breakout": "انفجار"}
         for k, v in stats["by_type"].items():
             wr = (v["win"] / v["total"] * 100) if v["total"] else 0
             lines.append(f"{label.get(k, k)}: {v['total']} صفقة | نجاح {wr:.0f}%")
+
     if stats["by_score"]:
         lines.append("— حسب score —")
         for k in sorted(stats["by_score"].keys()):
             v = stats["by_score"][k]
             wr = (v["win"] / v["total"] * 100) if v["total"] else 0
             lines.append(f"score {k}: {v['total']} صفقة | نجاح {wr:.0f}%")
+
     return "\n".join(lines)
 
 
 def save_all_state(alerted_symbols, btc_dominance, positions, closed_delta):
+    """
+    يحفظ في نفس الطلب: حالة التنبيهات + BTC Dominance + الصفقات المفتوحة،
+    ويُلحق أي صفقات أُغلقت هذا التشغيل بسجل closed_trades (مع سقف للحجم).
+    كما يحسب إحصائيات أداء (stats.json) من السجل المحدَّث — تتبع فقط، بدون
+    أي تأثير على منطق الفحص أو الدخول. يرجع الإحصائيات (أو None) للاستخدام
+    الاختياري في إرسال تقرير دوري.
+    """
     files = {
         GIST_FILENAME: json.dumps(
             {"alerted": sorted(alerted_symbols), "btc_dominance_prev": btc_dominance},
@@ -965,6 +1120,7 @@ def save_all_state(alerted_symbols, btc_dominance, positions, closed_delta):
         ),
         POSITIONS_GIST_FILE: json.dumps(positions, ensure_ascii=False, indent=2),
     }
+
     stats = None
     if closed_delta:
         history = load_closed()
@@ -972,19 +1128,22 @@ def save_all_state(alerted_symbols, btc_dominance, positions, closed_delta):
         if len(history) > MAX_CLOSED_HISTORY:
             history = history[-MAX_CLOSED_HISTORY:]
         files[CLOSED_GIST_FILE] = json.dumps(history, ensure_ascii=False, indent=2)
+
         stats = compute_stats(history)
         if stats:
             files[STATS_GIST_FILE] = json.dumps(stats, ensure_ascii=False, indent=2)
+
     _gist_patch_files(files)
     return stats
 
 
-# ==================== تتبع الصفقات المفتوحة ====================
+# ---------------- تتبع الصفقات المفتوحة (TP / SL) ----------------
 
 def open_new_positions(positions, fresh_signals):
+    """يضيف كل إشارة شراء جديدة أُرسلت كصفقة مفتوحة قيد المتابعة. يُعدّل القائمة في المكان (in place)."""
     for r in fresh_signals:
         if r.get("entry") is None:
-            continue
+            continue  # لا خطة دخول (تجنب شراء) -> لا داعي لتتبعها
         positions.append({
             "symbol": r["symbol"],
             "entry": r["entry"],
@@ -993,20 +1152,26 @@ def open_new_positions(positions, fresh_signals):
             "hit_tps": [],
             "tp_notify_ids": [None] * len(r["tps"]),
             "score": r["score"],
-            "trend_up": r["trend_up"],
+            "trend_up": r["trend_up"],   # اتجاه EMA9/21 وقت فتح الصفقة، يُستخدم لاحقًا لكشف انعكاس الإشارة
             "interval": INTERVAL,
             "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "type": "official",
+            # حقول تشخيصية: أي عوامل كانت حاضرة وقت الدخول -> تحليل لاحق لأثر كل عامل على النجاح/الفشل
             "squeeze": r.get("squeeze"),
             "accumulation": r.get("accumulation"),
             "divergence": r.get("divergence"),
             "extended": r.get("extended"),
+            # message_id ونص رسالة الإشارة الأصلية -> تُستخدم لاحقًا لتعديل نفس الرسالة (شطب + نتيجة) عند الإغلاق
             "alert_message_id": r.get("_msg_id"),
             "alert_text": r.get("_alert_text"),
         })
 
 
 def open_new_early_positions(positions, fresh_early_signals):
+    """
+    يفتح متابعة تلقائية (TP/SL) لإشارات مبكرة توفّرت لها أهداف تقديرية، بنفس آلية
+    الصفقات الرسمية لكن بحقل type="early" يُستخدم لاحقًا لتمييز رسائل النتيجة.
+    """
     for r in fresh_early_signals:
         if r.get("early_entry") is None:
             continue
@@ -1023,6 +1188,8 @@ def open_new_early_positions(positions, fresh_early_signals):
             "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "type": "early",
             "confidence": r.get("early_confidence"),
+            # نفس الحقول التشخيصية للإشارات المبكرة، عشان نعرف أي مزيج (squeeze/accumulation/divergence)
+            # فرّق فعليًا بين "احتمالية" ناجحة و"مؤكدة" فاشلة، بدل ما نكتفي بتصنيف الثقة العام
             "squeeze": r.get("squeeze"),
             "accumulation": r.get("accumulation"),
             "divergence": r.get("divergence"),
@@ -1033,6 +1200,10 @@ def open_new_early_positions(positions, fresh_early_signals):
 
 
 def open_new_breakout_positions(positions, fresh_breakout_signals):
+    """
+    يفتح متابعة تلقائية (TP/SL) لإشارات الانفجار (breakout) بنفس آلية الصفقات
+    الرسمية/المبكرة، بحقل type="breakout" يُستخدم لاحقًا لتمييز رسائل النتيجة.
+    """
     for r in fresh_breakout_signals:
         if r.get("breakout_entry") is None:
             continue
@@ -1055,6 +1226,9 @@ def open_new_breakout_positions(positions, fresh_breakout_signals):
         })
 
 
+TIME_STOP_HOURS = float(os.environ.get("TIME_STOP_HOURS", "96"))  # سقف زمني أقصى (شبكة أمان) قبل اعتبار الصفقة منتهية الصلاحية — افتراضيًا 4 أيام
+
+
 def _hours_since(opened_at_str):
     try:
         opened = time.strptime(opened_at_str, "%Y-%m-%d %H:%M:%S")
@@ -1065,9 +1239,11 @@ def _hours_since(opened_at_str):
 
 
 def format_duration(hours):
+    """يحوّل عدد الساعات لصيغة مقروءة: أيام + ساعات، بجمع عربي مبسّط."""
     total_minutes = round(hours * 60)
     days, rem_minutes = divmod(total_minutes, 24 * 60)
     hrs, minutes = divmod(rem_minutes, 60)
+
     def hours_word(n):
         if n == 1:
             return "ساعة"
@@ -1076,6 +1252,7 @@ def format_duration(hours):
         if 3 <= n <= 10:
             return f"{n} ساعات"
         return f"{n} ساعة"
+
     parts = []
     if days:
         parts.append("يوم" if days == 1 else ("يومين" if days == 2 else f"{days} أيام"))
@@ -1091,14 +1268,10 @@ def format_sl_hit(pos, price):
     sl = pos["sl"]
     pct_drop = (sl - entry) / entry * 100
     duration = format_duration(_hours_since(pos["opened_at"]))
-    type_labels = {
-        "early": "❌ (إشارة مبكرة)",
-        "breakout": "❌ (إشارة انفجار)",
-        "official": "❌"
-    }
-    header = type_labels.get(pos.get("type"), "❌")
+    type_labels = {"early": "❌ (إشارة مبكرة) ", "breakout": "❌ (إشارة انفجار) "}
+    header = type_labels.get(pos.get("type"), "❌ ")
     return (
-        f"{header} {pos['symbol'].replace('USDT', '/USDT')}\n"
+        f"{header}{pos['symbol'].replace('USDT', '/USDT')}\n"
         f"سعر الدخول: {entry:.6g}\n"
         f"SL: {sl:.6g}\n"
         f"نسبة النزول: {pct_drop:.2f}%\n"
@@ -1111,15 +1284,11 @@ def format_tp_hit(pos, tp_index, price):
     tp = pos["tps"][tp_index]
     pct_gain = (tp - entry) / entry * 100
     duration = format_duration(_hours_since(pos["opened_at"]))
-    type_labels = {
-        "early": "✅ (إشارة مبكرة)",
-        "breakout": "✅ (إشارة انفجار)",
-        "official": "✅"
-    }
-    header = type_labels.get(pos.get("type"), "✅")
+    type_labels = {"early": "✅ (إشارة مبكرة) ", "breakout": "✅ (إشارة انفجار) "}
+    header = type_labels.get(pos.get("type"), "✅ ")
     tp_label = f"TP{tp_index + 1}"
     return (
-        f"{header} {pos['symbol'].replace('USDT', '/USDT')}\n"
+        f"{header}{pos['symbol'].replace('USDT', '/USDT')}\n"
         f"سعر الدخول: {entry:.6g}\n"
         f"{tp_label}: {tp:.6g}\n"
         f"نسبة الصعود: +{pct_gain:.2f}%\n"
@@ -1128,12 +1297,20 @@ def format_tp_hit(pos, tp_index, price):
 
 
 def check_open_positions(positions, price_map):
+    """
+    يقارن الصفقات المفتوحة بالسعر الحالي، يرسل إشعار تيليجرام عند تحقق هدف أو ضرب وقف خسارة،
+    وينقل SL لنقطة الدخول (Breakeven) بمجرد لمس أول هدف. الإغلاق بسبب انعكاس الاتجاه (EMA)
+    أو انتهاء السقف الزمني يبقى فعّالاً لإدارة المخاطر، لكن بدون إرسال إشعار تيليجرام له.
+    يرجع (الصفقات المتبقية مفتوحة، الصفقات التي أُغلقت الآن).
+    """
     still_open, closed_now = [], []
+
     for pos in positions:
         price = price_map.get(pos["symbol"])
         if price is None:
             still_open.append(pos)
             continue
+
         if price <= pos["sl"]:
             result_text = format_sl_hit(pos, price)
             send_telegram(result_text)
@@ -1144,26 +1321,37 @@ def check_open_positions(positions, price_map):
             closed_now.append(pos)
             time.sleep(1)
             continue
+
         newly_hit = [i for i, tp in enumerate(pos["tps"]) if i not in pos["hit_tps"] and price >= tp]
         if newly_hit:
             if "tp_notify_ids" not in pos or len(pos["tp_notify_ids"]) != len(pos["tps"]):
-                pos["tp_notify_ids"] = [None] * len(pos["tps"])
+                pos["tp_notify_ids"] = [None] * len(pos["tps"])  # توافق مع صفقات فُتحت قبل هذا التحديث
+
             for i in newly_hit:
                 tp_text = format_tp_hit(pos, i, price)
                 msg_id = send_telegram(tp_text)
                 pos["tp_notify_ids"][i] = msg_id
                 time.sleep(1)
+
+                # احذف إشعار الهدف السابق المستقل (إن وُجد) كي لا تتراكم إشعارات منفصلة لكل هدف
                 prev_index = i - 1
                 if prev_index >= 0 and pos["tp_notify_ids"][prev_index]:
                     delete_telegram_message(pos["tp_notify_ids"][prev_index])
                     pos["tp_notify_ids"][prev_index] = None
+
                 pos["hit_tps"].append(i)
+
+                # عدّل رسالة الإشارة الأصلية تراكميًا: كل الأهداف المتحققة حتى الآن، كل واحد بسطره الخاص
                 hit_sorted = sorted(pos["hit_tps"])
                 lines = [format_tp_line(pos, j) for j in hit_sorted]
                 edit_telegram_append(pos.get("alert_message_id"), pos.get("alert_text", ""), lines)
+
             if pos["sl"] < pos["entry"]:
-                pos["sl"] = pos["entry"]
+                pos["sl"] = pos["entry"]  # نقل SL لنقطة التعادل بعد أول هدف محقق
+
         if len(pos["hit_tps"]) >= len(pos["tps"]):
+            # كل الأهداف تحققت -> إغلاق نهائي: نشطب رسالة الإشارة الأصلية (بما فيها كل أسطر
+            # الأهداف المتراكمة) تمامًا كما يحصل عند SL/EXPIRED، بدل تركها بدون شطب نهائي
             all_tp_text = "🏁 تحققت جميع الأهداف"
             edit_telegram_strike(pos.get("alert_message_id"), build_progress_text(pos), all_tp_text)
             pos["closed_reason"] = "ALL_TP"
@@ -1171,6 +1359,10 @@ def check_open_positions(positions, price_map):
             pos["exit_price"] = price
             closed_now.append(pos)
             continue
+
+        # لم يتحقق TP ولا SL بعد -> الصفقة تبقى مفتوحة لغاية تحقق أحد الأهداف أو ضرب
+        # وقف الخسارة (لا يوجد إغلاق مبكر بسبب انعكاس الاتجاه بعد الآن)، إلا لو تجاوزت
+        # السقف الزمني الأقصى (شبكة أمان فقط).
         hours_open = _hours_since(pos["opened_at"])
         if hours_open >= TIME_STOP_HOURS:
             pct_change = (price - pos["entry"]) / pos["entry"] * 100
@@ -1188,30 +1380,37 @@ def check_open_positions(positions, price_map):
             closed_now.append(pos)
             time.sleep(1)
             continue
+
         still_open.append(pos)
+
     if closed_now:
         print(f"صفقات أُغلقت هذا المسح: {len(closed_now)}")
+
     return still_open, closed_now
 
 
-# ==================== BTC Dominance ====================
+# ---------------- BTC Dominance (تحذير جودة إشارات العملات البديلة) ----------------
+
 
 def fetch_btc_dominance():
     r = _request_with_retry("https://api.coingecko.com/api/v3/global")
     return r.json()["data"]["market_cap_percentage"]["btc"]
 
 
-# ==================== التشغيل الرئيسي ====================
+# ---------------- التشغيل الرئيسي ----------------
 
 def main():
     print(f"بدء المسح — {time.strftime('%Y-%m-%d %H:%M:%S')}")
+
     tickers = fetch_ticker24h()
     price_map = fetch_prices_map(tickers)
+
+    # قبل أي مسح جديد: تفقّد الصفقات المفتوحة سابقًا مقابل السعر الحالي (TP / SL)
     open_positions = load_positions()
     open_positions, closed_now = check_open_positions(open_positions, price_map)
+
     results = run_scan(tickers)
 
-    # 1. الإشارات الرسمية
     strong = [
         r for r in results
         if r["score"] >= 1.5 and r["vol_confirm"] and r["atr_pct"] >= 0.08 and r["persistent"]
@@ -1219,7 +1418,8 @@ def main():
     ]
     strong_symbols = {r["symbol"] for r in strong}
 
-    # 2. الإشارات المبكرة
+    # إشارات مبكرة (انضغاط تقلب / تراكم صامت) لعملات لم تصل بعد لإشارة شراء كاملة —
+    # تُميَّز بمفتاح منفصل (":early") في ذاكرة التنبيهات كي لا تتعارض مع إشارات الشراء الرسمية
     early_eligible = [
         r for r in results
         if r["score"] < 1.5 and (r["squeeze"] or r["accumulation"])
@@ -1227,7 +1427,8 @@ def main():
     ]
     early_keys = {f"{r['symbol']}:early" for r in early_eligible}
 
-    # 3. إشارات الانفجار
+    # إشارات انفجار (breakout) — اختراق قمة سابقة مع تأكيد حجم، مستقلة عن الإشارة الرسمية،
+    # تُستبعد العملات اللي أصلاً عندها إشارة رسمية جديدة تجنبًا للتكرار
     breakout_eligible = [
         r for r in results
         if r.get("breakout_entry") is not None
@@ -1240,6 +1441,7 @@ def main():
     fresh_early = [r for r in early_eligible if f"{r['symbol']}:early" not in prev_alerted]
     fresh_breakout = [r for r in breakout_eligible if f"{r['symbol']}:breakout" not in prev_alerted]
 
+    # تتبّع BTC Dominance: تحذير إضافي لو تحركت بقوة منذ آخر تشغيل (إشارات العملات البديلة تصير أقل موثوقية)
     btc_dominance = None
     market_caution = False
     try:
@@ -1247,22 +1449,22 @@ def main():
         if prev_dominance is not None:
             shift = btc_dominance - prev_dominance
             market_caution = abs(shift) >= DOM_SHIFT_THRESHOLD
-            print(f"BTC Dominance: {btc_dominance:.2f}% (تغيّر {shift:+.2f} نقطة)"
+            print(f"BTC Dominance: {btc_dominance:.2f}% (تغيّر {shift:+.2f} نقطة منذ آخر تشغيل)"
                   + (" — تحذير سوق مفعّل" if market_caution else ""))
         else:
-            print(f"BTC Dominance: {btc_dominance:.2f}% (أول قراءة)")
+            print(f"BTC Dominance: {btc_dominance:.2f}% (أول قراءة، لا مقارنة بعد)")
     except Exception as e:
         print("تعذّر جلب BTC Dominance:", e)
 
-    print(f"رسمية: {len(strong)} | مبكرة: {len(early_eligible)} | انفجار: {len(breakout_eligible)}")
-    print(f"جديدة — رسمية: {len(fresh)} | مبكرة: {len(fresh_early)} | انفجار: {len(fresh_breakout)}")
+    print(f"إشارات قوية حاليًا: {len(strong)} | جديدة (لم تُرسل قبل): {len(fresh)} | "
+          f"إشارات مبكرة جديدة: {len(fresh_early)} | إشارات انفجار جديدة: {len(fresh_breakout)}")
 
     for r in fresh:
         caution = market_caution and not r["symbol"].startswith("BTC")
         alert_text = format_alert(r, caution)
         r["_msg_id"] = send_telegram(alert_text)
         r["_alert_text"] = alert_text
-        time.sleep(1)
+        time.sleep(1)  # تجنب تجاوز حد تيليجرام لعدد الرسائل بالثانية
 
     for r in fresh_early:
         alert_text = format_early_alert(r)
@@ -1276,13 +1478,16 @@ def main():
         r["_alert_text"] = alert_text
         time.sleep(1)
 
+    # تسجيل الإشارات الجديدة كصفقات مفتوحة قيد المتابعة لاحقًا (رسمية + مبكرة + انفجار)
     open_new_positions(open_positions, fresh)
     open_new_early_positions(open_positions, fresh_early)
     open_new_breakout_positions(open_positions, fresh_breakout)
 
-    all_alerted = strong_symbols | early_keys | breakout_keys
-    stats = save_all_state(all_alerted, btc_dominance, open_positions, closed_now)
+    # حفظ موحّد: ذاكرة الإشارات (رسمية + مبكرة + انفجار) + BTC Dominance + الصفقات المفتوحة + أرشيف الصفقات المغلقة حديثًا
+    # + إحصائيات أداء محسوبة من السجل المحدَّث (خيار 3: تتبع فقط، بدون تعديل تلقائي على منطق البوت)
+    stats = save_all_state(strong_symbols | early_keys | breakout_keys, btc_dominance, open_positions, closed_now)
 
+    # تقرير أداء دوري عبر تيليجرام كل REPORT_EVERY_N_CLOSED صفقة مغلقة (افتراضيًا كل 20 صفقة)
     if stats and stats["total"] % REPORT_EVERY_N_CLOSED == 0:
         report_text = format_stats_report(stats)
         if report_text:
