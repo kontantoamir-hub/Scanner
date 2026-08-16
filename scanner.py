@@ -529,7 +529,7 @@ def analyze_symbol(t, interval):
         breakout_tps = []
         if breakout:
             breakout_score, breakout_details = breakout_quality(ind, last)
-            if breakout_score >= 1 and not r["extended"] and r["atr_pct"] >= BREAKOUT_MIN_ATR_PCT:
+            if breakout_score >= 1 and r["atr_pct"] >= BREAKOUT_MIN_ATR_PCT:
                 breakout_entry = ind["closes"][last]
                 atrv = atr_value(ind)
                 breakout_sl = breakout_entry - atrv * 1.8
@@ -1232,7 +1232,6 @@ def main():
         r for r in results
         if r.get("breakout_entry") is not None
         and r["symbol"] not in strong_symbols
-        and not r["extended"]
     ]
     breakout_keys = {f"{r['symbol']}:breakout" for r in breakout_eligible}
 
