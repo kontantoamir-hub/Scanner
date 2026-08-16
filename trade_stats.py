@@ -4,8 +4,13 @@ trade_stats.py — تقرير مستقل لإحصائيات الصفقات ال�
 يقرأ closed_trades.json من نفس الـ Gist المستخدم في scanner.py، ويحسب:
 - عدد الصفقات المنجزة: رابحة / خاسرة / مغلقة بشكل محايد (بدون ربح ولا خسارة فعلية)
 - نسبة الربح ونسبة الخسارة لكل فئة
-- لكل صفقة: نوع المؤشر (المؤشرات) التي كانت حاضرة وقت الدخول والنتيجة
-- نسبة نجاح كل مؤشر على حدة (squeeze / accumulation / divergence / extended) عبر كل الصفقات
+- تصنيف حسب نوع الإشارة (رسمية / مبكرة / انفجار)
+- لكل صفقة رسمية أو مبكرة: نوع المؤشر (المؤشرات) التي كانت حاضرة وقت الدخول والنتيجة
+- لكل صفقة انفجار: عوامل جودة الاختراق (دعم الاتجاه / MACD / RSI) والنتيجة
+  (مؤشرات Squeeze/Accumulation/Divergence لا تُحسب لصفقات الانفجار لأنها غير محسوبة أصلاً
+  عند فتح هذا النوع من الصفقات في scanner.py — استخدام عوامل الانفجار الخاصة بدل ذلك
+  يمنع تلوّث فئة "بدون مؤشر إضافي" بصفقات الانفجار التي لا علاقة لها بها)
+- نسبة نجاح كل مؤشر على حدة (squeeze / accumulation / divergence / extended) عبر الصفقات الرسمية/المبكرة
 
 لا يُعدّل أي شيء في منطق البوت أو ملفاته — قراءة وعرض فقط (يمكن تشغيله يدويًا
 عبر workflow_dispatch أو محليًا بدون أي تأثير على عمل scanner.py).
@@ -28,6 +33,7 @@ CLOSED_GIST_FILE = "closed_trades.json"
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
+# مؤشرات الصفقات الرسمية/المبكرة (تُحسب فقط لهذين النوعين في scanner.py)
 INDICATOR_KEYS = ["squeeze", "accumulation", "divergence", "extended"]
 INDICATOR_LABELS = {
     "squeeze": "انضغاط تقلب (Squeeze)",
@@ -35,6 +41,16 @@ INDICATOR_LABELS = {
     "divergence": "دايفرجنس (Divergence)",
     "extended": "امتداد زائد (Overextension)",
 }
+
+# عوامل جودة صفقات الانفجار (breakout_details في scanner.py)
+BREAKOUT_FACTOR_KEYS = ["trend_support", "macd_bull", "rsi_ok"]
+BREAKOUT_FACTOR_LABELS = {
+    "trend_support": "دعم اتجاه EMA7/14",
+    "macd_bull": "MACD إيجابي",
+    "rsi_ok": "RSI في نطاق صحي",
+}
+
+TYPE_LABELS = {"official": "رسمية", "early": "مبكرة", "breakout": "انفجار"}
 
 
 def _gist_headers():
@@ -84,8 +100,14 @@ def duration_hours(trade):
 
 
 def active_indicators(trade):
-    """يرجع قائمة أسماء المؤشرات/العوامل التي كانت True وقت فتح هذه الصفقة."""
+    """يرجع قائمة أسماء المؤشرات/العوامل التي كانت True وقت فتح هذه الصفقة (رسمية/مبكرة فقط)."""
     return [k for k in INDICATOR_KEYS if trade.get(k) is True]
+
+
+def active_breakout_factors(trade):
+    """يرجع قائمة عوامل جودة الاختراق التي كانت True وقت فتح صفقة انفجار."""
+    details = trade.get("breakout_details") or {}
+    return [k for k in BREAKOUT_FACTOR_KEYS if details.get(k) is True]
 
 
 def build_report(trades):
@@ -101,31 +123,50 @@ def build_report(trades):
     loss_rate = len(losses) / total * 100
     neutral_rate = len(neutral) / total * 100
 
-    # --- نجاح كل مؤشر على حدة ---
+    # --- تصنيف حسب النوع (رسمية / مبكرة / انفجار) ---
+    type_stats = {}
+    for t in trades:
+        ttype = t.get("type", "official")
+        s = type_stats.setdefault(ttype, {"total": 0, "win": 0, "loss": 0, "neutral": 0})
+        s["total"] += 1
+        s[classify(t)] += 1
+
+    # --- نجاح كل مؤشر على حدة (رسمية/مبكرة فقط) ---
     indicator_stats = {k: {"total": 0, "win": 0, "loss": 0, "neutral": 0} for k in INDICATOR_KEYS}
     no_indicator_stats = {"total": 0, "win": 0, "loss": 0, "neutral": 0}
+
+    # --- نجاح كل عامل جودة انفجار على حدة ---
+    breakout_factor_stats = {k: {"total": 0, "win": 0, "loss": 0, "neutral": 0} for k in BREAKOUT_FACTOR_KEYS}
 
     per_trade_lines = []
     for t in trades:
         outcome = classify(t)
-        inds = active_indicators(t)
+        ttype = t.get("type", "official")
         pnl = pnl_pct(t)
         dur = duration_hours(t)
 
-        if inds:
-            for k in inds:
-                indicator_stats[k]["total"] += 1
-                indicator_stats[k][outcome] += 1
+        if ttype == "breakout":
+            factors = active_breakout_factors(t)
+            for k in factors:
+                breakout_factor_stats[k]["total"] += 1
+                breakout_factor_stats[k][outcome] += 1
+            inds_ar = "، ".join(BREAKOUT_FACTOR_LABELS[k] for k in factors) if factors else "بدون عوامل مسجّلة"
         else:
-            no_indicator_stats["total"] += 1
-            no_indicator_stats[outcome] += 1
+            inds = active_indicators(t)
+            if inds:
+                for k in inds:
+                    indicator_stats[k]["total"] += 1
+                    indicator_stats[k][outcome] += 1
+            else:
+                no_indicator_stats["total"] += 1
+                no_indicator_stats[outcome] += 1
+            inds_ar = "، ".join(INDICATOR_LABELS[k] for k in inds) if inds else "بدون مؤشر إضافي"
 
         outcome_ar = {"win": "✅ ربح", "loss": "❌ خسارة", "neutral": "⚪ محايد"}[outcome]
-        inds_ar = "، ".join(INDICATOR_LABELS[k] for k in inds) if inds else "بدون مؤشر إضافي (إشارة رسمية عادية)"
         pnl_txt = f"{pnl:+.2f}%" if pnl is not None else "—"
         dur_txt = f"{dur:.0f}س" if dur is not None else "—"
         per_trade_lines.append(
-            f"{t.get('symbol','?')} | نوع: {t.get('type','official')} | score: {t.get('score','?')} | "
+            f"{t.get('symbol','?')} | نوع: {TYPE_LABELS.get(ttype, ttype)} | score: {t.get('score','?')} | "
             f"{outcome_ar} | عائد: {pnl_txt} | مدة: {dur_txt} | المؤشرات: {inds_ar}"
         )
 
@@ -137,8 +178,17 @@ def build_report(trades):
         f"❌ خاسرة: {len(losses)} ({loss_rate:.1f}%)",
         f"⚪ محايدة (مغلقة بدون ربح/خسارة فعلية): {len(neutral)} ({neutral_rate:.1f}%)",
         "",
-        "— نسبة النجاح حسب المؤشر —",
+        "— نسبة النجاح حسب النوع —",
     ]
+    for ttype in ["official", "early", "breakout"]:
+        s = type_stats.get(ttype)
+        if not s or s["total"] == 0:
+            continue
+        wr = s["win"] / s["total"] * 100
+        lines.append(f"{TYPE_LABELS[ttype]}: {s['total']} صفقة | نجاح {wr:.0f}% (رابحة {s['win']} / خاسرة {s['loss']})")
+
+    lines.append("")
+    lines.append("— نسبة النجاح حسب المؤشر (رسمية/مبكرة) —")
     for k in INDICATOR_KEYS:
         s = indicator_stats[k]
         if s["total"] == 0:
@@ -150,6 +200,17 @@ def build_report(trades):
         s = no_indicator_stats
         wr = s["win"] / s["total"] * 100
         lines.append(f"بدون مؤشر إضافي: {s['total']} صفقة | نجاح {wr:.0f}% (رابحة {s['win']} / خاسرة {s['loss']})")
+
+    breakout_total = type_stats.get("breakout", {}).get("total", 0)
+    if breakout_total > 0:
+        lines.append("")
+        lines.append("— نسبة النجاح حسب عوامل جودة الانفجار —")
+        for k in BREAKOUT_FACTOR_KEYS:
+            s = breakout_factor_stats[k]
+            if s["total"] == 0:
+                continue
+            wr = s["win"] / s["total"] * 100
+            lines.append(f"{BREAKOUT_FACTOR_LABELS[k]}: {s['total']} صفقة | نجاح {wr:.0f}% (رابحة {s['win']} / خاسرة {s['loss']})")
 
     return "\n".join(lines), per_trade_lines
 
