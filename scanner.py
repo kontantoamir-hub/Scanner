@@ -939,7 +939,6 @@ CLOSED_GIST_FILE = "closed_trades.json"       # سجل الصفقات المغل
 STATS_GIST_FILE = "stats.json"                # إحصائيات أداء محسوبة دوريًا من closed_trades (خيار 3: تتبع فقط)
 MAX_CLOSED_HISTORY = 300                      # سقف لعدد الصفقات المؤرشفة كي لا يتضخم الـ Gist بلا حدود
 DOM_SHIFT_THRESHOLD = float(os.environ.get("DOM_SHIFT_THRESHOLD", "0.3"))  # نقطة مئوية خلال دورة تشغيل واحدة
-REPORT_EVERY_N_CLOSED = int(os.environ.get("REPORT_EVERY_N_CLOSED", "20"))  # كل كم صفقة مغلقة يُرسل تقرير أداء تلقائي عبر تيليجرام
 
 
 def _gist_headers():
@@ -1079,38 +1078,6 @@ def compute_stats(history):
         "by_reason": by_reason,
         "computed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
-
-
-def format_stats_report(stats):
-    """يبني نص تقرير أداء مقروء للإرسال عبر تيليجرام من مخرجات compute_stats."""
-    if not stats:
-        return None
-
-    lines = [
-        "📊 تقرير أداء دوري",
-        f"إجمالي الصفقات المغلقة: {stats['total']}",
-        f"نسبة النجاح: {stats['win_rate_pct']}% (ربح: {stats['wins']} | خسارة: {stats['losses']} | محايد: {stats['neutral']})",
-    ]
-    if stats["avg_pnl_pct"] is not None:
-        lines.append(f"متوسط العائد لكل صفقة: {stats['avg_pnl_pct']}%")
-    if stats["avg_duration_hours"] is not None:
-        lines.append(f"متوسط مدة الصفقة: {stats['avg_duration_hours']} ساعة")
-
-    if stats["by_type"]:
-        lines.append("— حسب النوع —")
-        label = {"official": "رسمية", "early": "مبكرة", "breakout": "انفجار"}
-        for k, v in stats["by_type"].items():
-            wr = (v["win"] / v["total"] * 100) if v["total"] else 0
-            lines.append(f"{label.get(k, k)}: {v['total']} صفقة | نجاح {wr:.0f}%")
-
-    if stats["by_score"]:
-        lines.append("— حسب score —")
-        for k in sorted(stats["by_score"].keys()):
-            v = stats["by_score"][k]
-            wr = (v["win"] / v["total"] * 100) if v["total"] else 0
-            lines.append(f"score {k}: {v['total']} صفقة | نجاح {wr:.0f}%")
-
-    return "\n".join(lines)
 
 
 def save_all_state(alerted_symbols, btc_dominance, positions, closed_delta):
@@ -1511,14 +1478,7 @@ def main():
 
     # حفظ موحّد: ذاكرة الإشارات (رسمية + مبكرة + انفجار) + BTC Dominance + الصفقات المفتوحة + أرشيف الصفقات المغلقة حديثًا
     # + إحصائيات أداء محسوبة من السجل المحدَّث (خيار 3: تتبع فقط، بدون تعديل تلقائي على منطق البوت)
-    stats = save_all_state(strong_symbols | early_keys | breakout_keys, btc_dominance, open_positions, closed_now)
-
-    # تقرير أداء دوري عبر تيليجرام كل REPORT_EVERY_N_CLOSED صفقة مغلقة (افتراضيًا كل 20 صفقة)
-    if stats and stats["total"] % REPORT_EVERY_N_CLOSED == 0:
-        report_text = format_stats_report(stats)
-        if report_text:
-            send_telegram(report_text)
-            time.sleep(1)
+    save_all_state(strong_symbols | early_keys | breakout_keys, btc_dominance, open_positions, closed_now)
 
     print("انتهى المسح.")
 
