@@ -561,7 +561,7 @@ def analyze_symbol(t, interval):
         momentum = momentum_strength(ind["macd"], ind["signal"], ind["rsi"], last)
         if squeeze or accumulation:
             conditions_met = sum([squeeze, accumulation, r["divergence"], momentum])
-            if conditions_met >= 2:
+            if conditions_met >= 1:
                 if conditions_met >= 3:
                     early_confidence = "مؤكدة قوية"
                 elif conditions_met >= 2:
