@@ -2,9 +2,12 @@
 trade_stats.py — تقرير مستقل لإحصائيات الصفقات المغلقة
 
 يقرأ closed_trades.json من نفس الـ Gist المستخدم في scanner.py، ويحسب:
-- عدد الصفقات المنجزة: رابحة / خاسرة / مغلقة بشكل محايد (بدون ربح ولا خسارة فعلية)
+- عدد الصفقات المنجزة: رابحة / خاسرة (تصنيف "محايدة" أُزيل بالكامل من كل التحليل لأن
+  إشارة الإغلاق المحايد ⚪ نفسها أُزيلت أصلاً من البوت — لا تُحسب أي صفقة محايدة ضمن
+  أي إحصائية أدناه: لا بالملخص العام، ولا حسب النوع، ولا حسب المؤشر، ولا حسب "بدون مؤشر")
 - نسبة الربح ونسبة الخسارة لكل فئة
-- تصنيف حسب نوع الإشارة (رسمية / مبكرة / انفجار)
+- تصنيف حسب نوع الإشارة (رسمية / مبكرة / انفجار)، مع مجموع نسب الربح الإجمالية لكل
+  الصفقات الرابحة ومجموع نسب الخسارة الإجمالية لكل الصفقات الخاسرة (رسمية ومبكرة فقط)
 - لكل صفقة رسمية أو مبكرة: نوع المؤشر (المؤشرات) التي كانت حاضرة وقت الدخول والنتيجة
 - لكل صفقة انفجار: عوامل جودة الاختراق (دعم الاتجاه / MACD / RSI) والنتيجة
   (مؤشرات Squeeze/Accumulation/Divergence لا تُحسب لصفقات الانفجار لأنها غير محسوبة أصلاً
@@ -94,7 +97,9 @@ def load_closed_trades():
 
 
 def classify(trade):
-    """يحدد نتيجة الصفقة: win / loss / neutral، بناءً على سبب الإغلاق وعدد الأهداف المتحققة."""
+    """يحدد نتيجة الصفقة: win / loss / neutral، بناءً على سبب الإغلاق وعدد الأهداف المتحققة.
+    ملاحظة: نتيجة "neutral" ما زالت تُحسب هنا للحفاظ على البيانات القديمة قابلة للقراءة،
+    لكن build_report يتجاهلها بالكامل في كل الإحصائيات لأن إشارة الإغلاق المحايد أُزيلت من البوت."""
     reason = trade.get("closed_reason", "UNKNOWN")
     hit = len(trade.get("hit_tps") or [])
     if reason == "ALL_TP" or hit > 0:
@@ -152,35 +157,49 @@ def build_report(trades):
     total = len(trades)
     wins = [t for t in trades if classify(t) == "win"]
     losses = [t for t in trades if classify(t) == "loss"]
-    neutral = [t for t in trades if classify(t) == "neutral"]
 
     win_rate = len(wins) / total * 100
     loss_rate = len(losses) / total * 100
-    neutral_rate = len(neutral) / total * 100
 
     # --- تصنيف حسب النوع (رسمية / مبكرة / انفجار) ---
+    # صفقات "neutral" (⚪) تُستبعد بالكامل من هذا التصنيف وكل ما يليه، لأن هذه الإشارة أُزيلت
+    # أصلاً من البوت. لكل نوع نجمع أيضًا مجموع نسب الربح لكل الصفقات الرابحة ومجموع نسب
+    # الخسارة لكل الصفقات الخاسرة (win_pnl_sum / loss_pnl_sum).
     type_stats = {}
     for t in trades:
+        outcome = classify(t)
+        if outcome == "neutral":
+            continue
         ttype = t.get("type", "official")
-        s = type_stats.setdefault(ttype, {"total": 0, "win": 0, "loss": 0, "neutral": 0})
+        s = type_stats.setdefault(
+            ttype, {"total": 0, "win": 0, "loss": 0, "win_pnl_sum": 0.0, "loss_pnl_sum": 0.0}
+        )
         s["total"] += 1
-        s[classify(t)] += 1
+        s[outcome] += 1
+        pnl = pnl_pct(t)
+        if pnl is not None:
+            if outcome == "win":
+                s["win_pnl_sum"] += pnl
+            else:
+                s["loss_pnl_sum"] += pnl
 
     # --- نجاح كل مؤشر على حدة (رسمية/مبكرة فقط) ---
-    indicator_stats = {k: {"total": 0, "win": 0, "loss": 0, "neutral": 0} for k in INDICATOR_KEYS}
-    no_indicator_stats = {"total": 0, "win": 0, "loss": 0, "neutral": 0}
+    indicator_stats = {k: {"total": 0, "win": 0, "loss": 0} for k in INDICATOR_KEYS}
+    no_indicator_stats = {"total": 0, "win": 0, "loss": 0}
 
     # --- نجاح كل عامل جودة انفجار على حدة ---
-    breakout_factor_stats = {k: {"total": 0, "win": 0, "loss": 0, "neutral": 0} for k in BREAKOUT_FACTOR_KEYS}
+    breakout_factor_stats = {k: {"total": 0, "win": 0, "loss": 0} for k in BREAKOUT_FACTOR_KEYS}
 
     # --- تفصيل صفقات "بدون مؤشر إضافي" حسب المؤشرات الأساسية (state -> stats) ---
-    # بنية: base_indicator_stats[key][state_label] = {"total":..,"win":..,"loss":..,"neutral":..}
     base_indicator_stats = {k: {} for k in BASE_INDICATOR_KEYS}
     no_indicator_no_basedata = 0  # صفقات "بدون مؤشر إضافي" لكن أقدم من تحديث الحفظ (لا تحوي الحقول الثمانية)
 
     per_trade_lines = []
     for t in trades:
         outcome = classify(t)
+        if outcome == "neutral":
+            continue  # مُستبعدة بالكامل من التحليل والتفصيل، لأن هذه الإشارة أُزيلت من البوت
+
         ttype = t.get("type", "official")
         pnl = pnl_pct(t)
         dur = duration_hours(t)
@@ -212,12 +231,12 @@ def build_report(trades):
                             continue
                         label = base_indicator_state_label(k, t.get(k))
                         s = base_indicator_stats[k].setdefault(
-                            label, {"total": 0, "win": 0, "loss": 0, "neutral": 0}
+                            label, {"total": 0, "win": 0, "loss": 0}
                         )
                         s["total"] += 1
                         s[outcome] += 1
 
-        outcome_ar = {"win": "✅ ربح", "loss": "❌ خسارة", "neutral": "⚪ محايد"}[outcome]
+        outcome_ar = {"win": "✅ ربح", "loss": "❌ خسارة"}[outcome]
         pnl_txt = f"{pnl:+.2f}%" if pnl is not None else "—"
         dur_txt = f"{dur:.0f}س" if dur is not None else "—"
         per_trade_lines.append(
@@ -231,7 +250,6 @@ def build_report(trades):
         f"الإجمالي: {total} صفقة",
         f"✅ رابحة: {len(wins)} ({win_rate:.1f}%)",
         f"❌ خاسرة: {len(losses)} ({loss_rate:.1f}%)",
-        f"⚪ محايدة (مغلقة بدون ربح/خسارة فعلية): {len(neutral)} ({neutral_rate:.1f}%)",
         "",
         "— نسبة النجاح حسب النوع —",
     ]
@@ -240,7 +258,10 @@ def build_report(trades):
         if not s or s["total"] == 0:
             continue
         wr = s["win"] / s["total"] * 100
-        lines.append(f"{TYPE_LABELS[ttype]}: {s['total']} صفقة | نجاح {wr:.0f}% (رابحة {s['win']} / خاسرة {s['loss']})")
+        line = f"{TYPE_LABELS[ttype]}: {s['total']} صفقة | نجاح {wr:.0f}% (رابحة {s['win']} / خاسرة {s['loss']})"
+        if ttype in ("official", "early"):
+            line += f" | مجموع ربح الرابحة: {s['win_pnl_sum']:+.2f}% | مجموع خسارة الخاسرة: {s['loss_pnl_sum']:+.2f}%"
+        lines.append(line)
 
     lines.append("")
     lines.append("— نسبة النجاح حسب المؤشر (رسمية/مبكرة) —")
