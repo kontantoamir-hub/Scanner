@@ -22,7 +22,7 @@ import requests
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 INTERVAL = os.environ.get("SCAN_INTERVAL", "1h")          # 15m / 1h / 4h / 1d
-DEPTH = int(os.environ.get("SCAN_DEPTH", "40"))            # عدد العملات للفحص العميق
+DEPTH = int(os.environ.get("SCAN_DEPTH", "60"))            # عدد العملات للفحص العميق
 SCAN_LIMIT = 400                                            # عدد الشموع التاريخية لكل عملة
 LIQUIDITY_FLOOR = 1_000_000                                 # أدنى سيولة 24س بالدولار
 
@@ -706,7 +706,7 @@ def run_scan(tickers=None):
     print(f"سيولة كافية: {len(liquid)} عملة | فحص عميق: {len(shortlist)} عملة | فريم: {INTERVAL}")
 
     results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
         futures = [pool.submit(analyze_symbol, t, INTERVAL) for t in shortlist]
         for f in concurrent.futures.as_completed(futures):
             r = f.result()
