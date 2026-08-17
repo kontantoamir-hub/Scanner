@@ -27,5 +27,5 @@ jobs:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
           SCAN_INTERVAL: '1h'
-          SCAN_DEPTH: '40'
+          SCAN_DEPTH: '60'
         run: python scanner.py
