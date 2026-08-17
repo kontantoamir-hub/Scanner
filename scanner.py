@@ -435,6 +435,11 @@ def score_at(i, ind, apply_extra_filters=True):
         "near_resistance": near_resistance, "resistance": resistance,
         "obv_confirm": obv_confirm,
         "extended": extended,
+        # حقول أساسية إضافية للحفظ التشخيصي (rsi_state: 1 تشبع بيعي / -1 تشبع شرائي / 0 محايد،
+        # bb_state: 1 عند الحد السفلي / -1 عند الحد العلوي / 0 منتصف النطاق)
+        "rsi_state": rsi_state,
+        "macd_bull": macd_bull,
+        "bb_state": bb_state,
     }
 
 
@@ -657,6 +662,9 @@ def analyze_symbol(t, interval):
             "near_resistance": r["near_resistance"],
             "obv_confirm": r["obv_confirm"],
             "extended": r["extended"],
+            "rsi_state": r["rsi_state"],
+            "macd_bull": r["macd_bull"],
+            "bb_state": r["bb_state"],
             "squeeze": squeeze,
             "accumulation": accumulation,
             "momentum": momentum,
@@ -1161,6 +1169,16 @@ def open_new_positions(positions, fresh_signals):
             "accumulation": r.get("accumulation"),
             "divergence": r.get("divergence"),
             "extended": r.get("extended"),
+            # مؤشرات الدرجة الأساسية (توسيع تشخيصي) -> لمعرفة مزيج المؤشرات الأساسية وراء
+            # كل إشارة، حتى الصفقات التي لا يوجد فيها أي عامل إضافي أعلاه
+            "rsi_state": r.get("rsi_state"),
+            "macd_bull": r.get("macd_bull"),
+            "bb_state": r.get("bb_state"),
+            "vol_confirm": r.get("vol_confirm"),
+            "ranging": r.get("ranging"),
+            "near_resistance": r.get("near_resistance"),
+            "obv_confirm": r.get("obv_confirm"),
+            "htf_aligned": r.get("htf_aligned"),
             # message_id ونص رسالة الإشارة الأصلية -> تُستخدم لاحقًا لتعديل نفس الرسالة (شطب + نتيجة) عند الإغلاق
             "alert_message_id": r.get("_msg_id"),
             "alert_text": r.get("_alert_text"),
@@ -1194,6 +1212,14 @@ def open_new_early_positions(positions, fresh_early_signals):
             "accumulation": r.get("accumulation"),
             "divergence": r.get("divergence"),
             "extended": r.get("extended"),
+            "rsi_state": r.get("rsi_state"),
+            "macd_bull": r.get("macd_bull"),
+            "bb_state": r.get("bb_state"),
+            "vol_confirm": r.get("vol_confirm"),
+            "ranging": r.get("ranging"),
+            "near_resistance": r.get("near_resistance"),
+            "obv_confirm": r.get("obv_confirm"),
+            "htf_aligned": r.get("htf_aligned"),
             "alert_message_id": r.get("_msg_id"),
             "alert_text": r.get("_alert_text"),
         })
