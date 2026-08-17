@@ -11,6 +11,10 @@ trade_stats.py — تقرير مستقل لإحصائيات الصفقات ال�
   عند فتح هذا النوع من الصفقات في scanner.py — استخدام عوامل الانفجار الخاصة بدل ذلك
   يمنع تلوّث فئة "بدون مؤشر إضافي" بصفقات الانفجار التي لا علاقة لها بها)
 - نسبة نجاح كل مؤشر على حدة (squeeze / accumulation / divergence / extended) عبر الصفقات الرسمية/المبكرة
+- لصفقات "بدون مؤشر إضافي" تحديدًا: تفصيل حسب المؤشرات الأساسية الثمانية التي تصنع الدرجة
+  (rsi_state / macd_bull / bb_state / vol_confirm / ranging / near_resistance / obv_confirm /
+  htf_aligned) — متاح فقط للصفقات المفتوحة بعد إضافة هذه الحقول لسجل الصفقة في scanner.py؛
+  الصفقات الأقدم لا تحتوي هذه الحقول وتُستثنى تلقائيًا من هذا القسم فقط دون التأثير على بقية التقرير
 
 لا يُعدّل أي شيء في منطق البوت أو ملفاته — قراءة وعرض فقط (يمكن تشغيله يدويًا
 عبر workflow_dispatch أو محليًا بدون أي تأثير على عمل scanner.py).
@@ -48,6 +52,23 @@ BREAKOUT_FACTOR_LABELS = {
     "trend_support": "دعم اتجاه EMA7/14",
     "macd_bull": "MACD إيجابي",
     "rsi_ok": "RSI في نطاق صحي",
+}
+
+# المؤشرات الأساسية اللي تصنع الدرجة (score) — تُحفظ فقط في الصفقات المفتوحة بعد تحديث
+# schema الحفظ في scanner.py؛ تُستخدم لتفصيل صفقات "بدون مؤشر إضافي" تحديدًا (see below)
+BASE_INDICATOR_KEYS = [
+    "rsi_state", "macd_bull", "bb_state", "vol_confirm",
+    "ranging", "near_resistance", "obv_confirm", "htf_aligned",
+]
+BASE_INDICATOR_LABELS = {
+    "rsi_state": "RSI",
+    "macd_bull": "MACD إيجابي",
+    "bb_state": "بولينجر",
+    "vol_confirm": "تأكيد الحجم",
+    "ranging": "سوق عرضي (ADX منخفض)",
+    "near_resistance": "قرب مقاومة",
+    "obv_confirm": "تأكيد OBV",
+    "htf_aligned": "توافق فريم أعلى",
 }
 
 TYPE_LABELS = {"official": "رسمية", "early": "مبكرة", "breakout": "انفجار"}
@@ -110,6 +131,20 @@ def active_breakout_factors(trade):
     return [k for k in BREAKOUT_FACTOR_KEYS if details.get(k) is True]
 
 
+def base_indicator_state_label(key, value):
+    """يحوّل قيمة مؤشر أساسي إلى وصف عربي قابل للعرض حسب نوع الحقل."""
+    if key == "rsi_state":
+        return {1: "تشبع بيعي (RSI<35)", -1: "تشبع شرائي (RSI>65)", 0: "محايد"}.get(value, "غير معروف")
+    if key == "bb_state":
+        return {1: "عند الحد السفلي", -1: "عند الحد العلوي", 0: "منتصف النطاق"}.get(value, "غير معروف")
+    # باقي الحقول منطقية (True/False)، وhtf_aligned ممكن تكون None لو لم تُفحص
+    if value is True:
+        return "حاضر"
+    if value is False:
+        return "غائب"
+    return "لم يُفحص"
+
+
 def build_report(trades):
     if not trades:
         return "لا توجد صفقات مغلقة بعد في السجل.", []
@@ -138,6 +173,11 @@ def build_report(trades):
     # --- نجاح كل عامل جودة انفجار على حدة ---
     breakout_factor_stats = {k: {"total": 0, "win": 0, "loss": 0, "neutral": 0} for k in BREAKOUT_FACTOR_KEYS}
 
+    # --- تفصيل صفقات "بدون مؤشر إضافي" حسب المؤشرات الأساسية (state -> stats) ---
+    # بنية: base_indicator_stats[key][state_label] = {"total":..,"win":..,"loss":..,"neutral":..}
+    base_indicator_stats = {k: {} for k in BASE_INDICATOR_KEYS}
+    no_indicator_no_basedata = 0  # صفقات "بدون مؤشر إضافي" لكن أقدم من تحديث الحفظ (لا تحوي الحقول الثمانية)
+
     per_trade_lines = []
     for t in trades:
         outcome = classify(t)
@@ -157,10 +197,25 @@ def build_report(trades):
                 for k in inds:
                     indicator_stats[k]["total"] += 1
                     indicator_stats[k][outcome] += 1
+                inds_ar = "، ".join(INDICATOR_LABELS[k] for k in inds)
             else:
                 no_indicator_stats["total"] += 1
                 no_indicator_stats[outcome] += 1
-            inds_ar = "، ".join(INDICATOR_LABELS[k] for k in inds) if inds else "بدون مؤشر إضافي"
+                inds_ar = "بدون مؤشر إضافي"
+
+                has_base_data = any(k in t for k in BASE_INDICATOR_KEYS)
+                if not has_base_data:
+                    no_indicator_no_basedata += 1
+                else:
+                    for k in BASE_INDICATOR_KEYS:
+                        if k not in t:
+                            continue
+                        label = base_indicator_state_label(k, t.get(k))
+                        s = base_indicator_stats[k].setdefault(
+                            label, {"total": 0, "win": 0, "loss": 0, "neutral": 0}
+                        )
+                        s["total"] += 1
+                        s[outcome] += 1
 
         outcome_ar = {"win": "✅ ربح", "loss": "❌ خسارة", "neutral": "⚪ محايد"}[outcome]
         pnl_txt = f"{pnl:+.2f}%" if pnl is not None else "—"
@@ -200,6 +255,37 @@ def build_report(trades):
         s = no_indicator_stats
         wr = s["win"] / s["total"] * 100
         lines.append(f"بدون مؤشر إضافي: {s['total']} صفقة | نجاح {wr:.0f}% (رابحة {s['win']} / خاسرة {s['loss']})")
+
+    # --- تفصيل صفقات "بدون مؤشر إضافي" حسب المؤشرات الأساسية ---
+    if no_indicator_stats["total"] > 0:
+        with_base_data = no_indicator_stats["total"] - no_indicator_no_basedata
+        if with_base_data > 0:
+            lines.append("")
+            lines.append(
+                f"— تفصيل 'بدون مؤشر إضافي' حسب المؤشرات الأساسية ({with_base_data} صفقة تحوي بيانات) —"
+            )
+            for k in BASE_INDICATOR_KEYS:
+                states = base_indicator_stats[k]
+                if not states:
+                    continue
+                lines.append(f"{BASE_INDICATOR_LABELS[k]}:")
+                for label, s in states.items():
+                    if s["total"] == 0:
+                        continue
+                    wr = s["win"] / s["total"] * 100
+                    lines.append(
+                        f"  • {label}: {s['total']} صفقة | نجاح {wr:.0f}% (رابحة {s['win']} / خاسرة {s['loss']})"
+                    )
+            if no_indicator_no_basedata > 0:
+                lines.append(
+                    f"(ملاحظة: {no_indicator_no_basedata} صفقة من 'بدون مؤشر إضافي' أقدم من تحديث "
+                    f"الحفظ التشخيصي ولا تحوي بيانات المؤشرات الأساسية، فاستُبعدت من هذا التفصيل فقط)"
+                )
+        else:
+            lines.append(
+                f"(كل صفقات 'بدون مؤشر إضافي' الـ{no_indicator_stats['total']} أقدم من تحديث الحفظ "
+                f"التشخيصي — لا تتوفر بيانات المؤشرات الأساسية بعد، ستظهر تدريجيًا مع الصفقات الجديدة)"
+            )
 
     breakout_total = type_stats.get("breakout", {}).get("total", 0)
     if breakout_total > 0:
