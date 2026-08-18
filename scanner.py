@@ -64,8 +64,10 @@ BREAKOUT_MIN_ATR_PCT = 0.08     # أدنى نسبة تقلب (ATR%) لقبول �
 # ---------------- إعدادات أهداف الإشارات المبكرة (تقديرية، أقل ثقة من الإشارة الرسمية) ----------------
 # وقف خسارة أوسع من الإشارة الرسمية (1.5×ATR) لأن نقطة الدخول أقل دقة والتقلب حولها أعلى
 EARLY_SL_ATR_MULT = 2.0
-# عدد الأهداف والثقة يعتمدان مباشرة على عدد الشروط المتحققة (squeeze / accumulation / divergence / momentum):
-# شرط واحد = احتمالية (هدف واحد)، شرطان = مؤكدة (هدفان)، 3 فأكثر = مؤكدة قوية (3-4 أهداف)
+# عدد الأهداف يعتمد على عدد الشروط المتحققة (squeeze / accumulation / divergence / momentum: 1-4 أهداف).
+# الثقة (بعد تعديل مبني على بيانات فعلية بتاريخ 2026-08-18): accumulation حاضر -> مؤكدة
+# مباشرة (حتى لو وحيدًا)؛ squeeze حاضر بدون accumulation -> يحتاج شرطًا إضافيًا وإلا
+# لا تُطلق إشارة أصلاً؛ 3 شروط فأكثر (بأي مزيج) -> مؤكدة قوية.
 
 
 # ---------------- دوال المؤشرات الفنية ----------------
@@ -557,22 +559,33 @@ def analyze_symbol(t, interval):
         accumulation = silent_accumulation(ind["closes"], ind["vols"], ind["obv"])
 
         # أهداف تقديرية للإشارة المبكرة نفسها (وليس فقط تحذير بدون أرقام):
-        # وقف خسارة أوسع (ATR×2) لأن الدخول أقل تأكيدًا، وعدد أهداف حسب مستوى الثقة
-        # (شرط واحد = احتمالية وهدف واحد، شرطان فأكثر = مؤكدة وهدفان)، مع تقليم أي هدف
-        # يتجاوز أقرب مقاومة معروفة كي لا نضع هدفًا خلف حاجز سعري واضح.
+        # وقف خسارة أوسع (ATR×2) لأن الدخول أقل تأكيدًا، وعدد أهداف حسب مستوى الثقة،
+        # مع تقليم أي هدف يتجاوز أقرب مقاومة معروفة كي لا نضع هدفًا خلف حاجز سعري واضح.
+        #
+        # وزن الثقة مبني على بيانات فعلية (score_breakdown_by_factor.py على 212 صفقة
+        # مبكرة مغلقة): accumulation لوحده أثبت نجاحًا عاليًا وثابتًا (83-100%) بغض
+        # النظر عن أي شرط إضافي، بينما squeeze لوحده (بدون accumulation) كان أضعف من
+        # عدم وجوده أصلاً عند نفس مستوى الدرجة. لذلك:
+        #   - accumulation حاضر -> "مؤكدة" مباشرة حتى لو كان الشرط الوحيد (أو "مؤكدة
+        #     قوية" لو توفرت 3 شروط فأكثر)
+        #   - squeeze حاضر بدون accumulation -> يحتاج شرطًا إضافيًا (divergence أو
+        #     momentum) ليُطلق إشارة أصلاً؛ squeeze وحيدًا لا يكفي بعد الآن (لا إشارة)
         early_entry = early_sl = None
         early_tps = []
         early_confidence = None
+        early_source = None
         momentum = momentum_strength(ind["macd"], ind["signal"], ind["rsi"], last)
         if squeeze or accumulation:
             conditions_met = sum([squeeze, accumulation, r["divergence"], momentum])
-            if conditions_met >= 1:
-                if conditions_met >= 3:
-                    early_confidence = "مؤكدة قوية"
-                elif conditions_met >= 2:
-                    early_confidence = "مؤكدة"
+            valid_early = accumulation or (squeeze and conditions_met >= 2)
+            if valid_early:
+                early_confidence = "مؤكدة قوية" if conditions_met >= 3 else "مؤكدة"
+                if accumulation and squeeze:
+                    early_source = "accumulation+squeeze"
+                elif accumulation:
+                    early_source = "accumulation"
                 else:
-                    early_confidence = "احتمالية"
+                    early_source = "squeeze"
                 early_entry = ind["closes"][last]
                 atrv = atr_value(ind)
                 early_sl = early_entry - atrv * EARLY_SL_ATR_MULT
@@ -673,7 +686,7 @@ def analyze_symbol(t, interval):
             "breakout_details": breakout_details,
             "entry": entry, "sl": sl, "tps": tps,
             "early_entry": early_entry, "early_sl": early_sl, "early_tps": early_tps,
-            "early_confidence": early_confidence,
+            "early_confidence": early_confidence, "early_source": early_source,
             "breakout_entry": breakout_entry, "breakout_sl": breakout_sl, "breakout_tps": breakout_tps,
         }
     except Exception as e:
@@ -877,14 +890,22 @@ def format_early_alert(r):
     """
     confidence = r.get("early_confidence")
     dot = "🟢" if confidence == "مؤكدة قوية" else ("🟣" if confidence == "مؤكدة" else "🔵")
-    # لا لاحقة لمستوى "احتمالية" (القالب الافتراضي بدون نص إضافي بعد العنوان)
-    title = f"إشارة مبكرة - {confidence}" if confidence and confidence != "احتمالية" else "إشارة مبكرة"
+    title = f"إشارة مبكرة - {confidence}" if confidence else "إشارة مبكرة"
+
+    source_labels = {
+        "accumulation": "تراكم صامت",
+        "squeeze": "انضغاط تقلب",
+        "accumulation+squeeze": "تراكم صامت + انضغاط تقلب",
+    }
+    source_label = source_labels.get(r.get("early_source"))
 
     lines = [
         f"{dot} {title}",
         r['symbol'].replace('USDT', '/USDT'),
         f"الدرجة الحالية: {r['score']:.1f} | فريم: {INTERVAL}",
     ]
+    if source_label:
+        lines.append(f"المصدر: {source_label}")
 
     if r.get("early_entry") is not None:
         lines.append(f"الدخول : {r['early_entry']:.6g}")
@@ -1173,6 +1194,9 @@ def open_new_early_positions(positions, fresh_early_signals):
             "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "type": "early",
             "confidence": r.get("early_confidence"),
+            # مصدر الإشارة الأساسي (accumulation / squeeze / accumulation+squeeze) —
+            # لتحليل لاحق سهل لأي مصدر أدق بدون الحاجة لتقاطع squeeze/accumulation يدويًا
+            "source": r.get("early_source"),
             # نفس الحقول التشخيصية للإشارات المبكرة، عشان نعرف أي مزيج (squeeze/accumulation/divergence)
             # فرّق فعليًا بين "احتمالية" ناجحة و"مؤكدة" فاشلة، بدل ما نكتفي بتصنيف الثقة العام
             "squeeze": r.get("squeeze"),
