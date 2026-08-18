@@ -35,31 +35,13 @@ STATS_GIST_FILE = "stats.json"
 
 
 def confirm():
-    print("⚠️  هذا سيحذف نهائيًا:")
+    print("⚠️  جارٍ تنفيذ إعادة الضبط الكاملة:")
     print("   - كل الصفقات المفتوحة حاليًا (بدون تسجيلها كمكسب أو خسارة)")
     print("   - كل الإشارات المحفوظة (ذاكرة alerted)")
     print("   - كل سجل الصفقات المغلقة السابق")
     print("   - كل الإحصائيات المحسوبة")
     print()
-
-    # داخل GitHub Actions لا يوجد إدخال تفاعلي (لا TTY)، لذا يتم أخذ التأكيد
-    # من متغير بيئة CONFIRM_RESET بدلاً من input().
-    env_confirm = os.environ.get("CONFIRM_RESET", "").strip()
-    if env_confirm:
-        if env_confirm != "RESET":
-            print("❌ CONFIRM_RESET يجب أن تكون بالضبط RESET. تم الإلغاء.")
-            sys.exit(0)
-        print("✅ تم التأكيد عبر متغير البيئة CONFIRM_RESET.")
-        return
-
-    if not sys.stdin.isatty():
-        print("❌ لا يوجد إدخال تفاعلي (كأنك داخل GitHub Actions) ولم يتم تمرير CONFIRM_RESET=RESET. تم الإلغاء.")
-        sys.exit(0)
-
-    ans = input("اكتب RESET للتأكيد والمتابعة: ").strip()
-    if ans != "RESET":
-        print("تم الإلغاء — لم يتم تغيير أي شيء.")
-        sys.exit(0)
+    print("(الحماية اليدوية معطّلة — التشغيل عبر GitHub Actions workflow_dispatch يُعتبر تأكيدًا كافيًا)")
 
 
 def reset_gist():
