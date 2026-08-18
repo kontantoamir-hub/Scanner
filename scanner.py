@@ -61,6 +61,11 @@ BREAKOUT_LOOKBACK = 10          # عدد الشموع للبحث فيها عن �
 BREAKOUT_VOL_MULT = 1.3         # الحجم الحالي يجب أن يتجاوز متوسط الحجم بهذا المضاعف
 BREAKOUT_MIN_ATR_PCT = 0.08     # أدنى نسبة تقلب (ATR%) لقبول إشارة الانفجار
 
+# ---------------- إعدادات الحد الأدنى لنسبة الربح المستهدفة ----------------
+# لا تُرسل أي إشارة (رسمية أو مبكرة) إلا لو كانت نسبة الربح المتوقعة عند أول هدف (TP1)
+# مقارنة بسعر الدخول >= هذه النسبة% — لتفادي إشارات ذات هدف قريب جدًا لا يستحق الدخول
+MIN_PROFIT_PCT = float(os.environ.get("MIN_PROFIT_PCT", "1.0"))
+
 # ---------------- إعدادات أهداف الإشارات المبكرة (تقديرية، أقل ثقة من الإشارة الرسمية) ----------------
 # وقف خسارة أوسع من الإشارة الرسمية (1.5×ATR) لأن نقطة الدخول أقل دقة والتقلب حولها أعلى
 EARLY_SL_ATR_MULT = 2.0
@@ -463,6 +468,18 @@ def atr_value(ind, period=14):
 
 
 # ---------------- جلب البيانات من Binance ----------------
+
+def meets_min_profit(entry, tps, min_pct=MIN_PROFIT_PCT):
+    """
+    يتحقق أن أقرب هدف (TP1) يحقق نسبة ربح >= الحد الأدنى المطلوب (MIN_PROFIT_PCT)
+    مقارنة بسعر الدخول. يُستخدم لتصفية أي إشارة (رسمية أو مبكرة) قبل اعتبارها
+    مؤهلة للإرسال، بصرف النظر عن مصدرها (accumulation / squeeze / كليهما).
+    """
+    if not entry or not tps:
+        return False
+    tp1_profit_pct = (tps[0] - entry) / entry * 100
+    return tp1_profit_pct >= min_pct
+
 
 def _request_with_retry(url, params=None, timeout=20, retries=3, backoff=1.5):
     """طلب HTTP مع إعادة محاولة تلقائية عند فشل الشبكة أو ضغط مؤقت من Binance (429/5xx)."""
@@ -1432,15 +1449,20 @@ def main():
         r for r in results
         if r["score"] >= 1.5 and r["vol_confirm"] and r["atr_pct"] >= 0.08 and r["persistent"]
         and not r["ranging"] and not r["near_resistance"]
+        and meets_min_profit(r["entry"], r["tps"])
     ]
     strong_symbols = {r["symbol"] for r in strong}
 
     # إشارات مبكرة (انضغاط تقلب / تراكم صامت) لعملات لم تصل بعد لإشارة شراء كاملة —
     # تُميَّز بمفتاح منفصل (":early") في ذاكرة التنبيهات كي لا تتعارض مع إشارات الشراء الرسمية
+    # (رسمية أو مبكرة accumulation/squeeze/كليهما) تُصفّى هنا أيضًا بنفس شرط الحد الأدنى
+    # لنسبة الربح (MIN_PROFIT_PCT) قبل اعتبارها مؤهلة أصلاً — وليس فقط عند الإرسال —
+    # كي لا تُسجَّل كـ"مُنبَّه عليها" في الذاكرة وتُحرَم من الإرسال لاحقًا إن تحسّن ربحها المتوقع
     early_eligible = [
         r for r in results
         if r["score"] < 1.5 and (r["squeeze"] or r["accumulation"])
         and r.get("early_confidence") is not None
+        and meets_min_profit(r["early_entry"], r["early_tps"])
     ]
     early_keys = {f"{r['symbol']}:early" for r in early_eligible}
 
