@@ -1,0 +1,25 @@
+name: Score Breakdown By Factor
+
+on:
+  workflow_dispatch:
+
+jobs:
+  score-breakdown-by-factor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run score breakdown by factor
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+        run: python score_breakdown_by_factor.py
