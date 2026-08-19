@@ -1255,6 +1255,14 @@ def open_new_breakout_positions(positions, fresh_breakout_signals):
             "type": "breakout",
             "breakout_details": r.get("breakout_details"),
             "extended": r.get("extended"),
+            "rsi_state": r.get("rsi_state"),
+            "macd_bull": r.get("macd_bull"),
+            "bb_state": r.get("bb_state"),
+            "vol_confirm": r.get("vol_confirm"),
+            "ranging": r.get("ranging"),
+            "near_resistance": r.get("near_resistance"),
+            "obv_confirm": r.get("obv_confirm"),
+            "htf_aligned": r.get("htf_aligned"),
             "alert_message_id": r.get("_msg_id"),
             "alert_text": r.get("_alert_text"),
         })
@@ -1472,6 +1480,7 @@ def main():
         r for r in results
         if r.get("breakout_entry") is not None
         and r["symbol"] not in strong_symbols
+        and meets_min_profit(r["breakout_entry"], r["breakout_tps"])
     ]
     breakout_keys = {f"{r['symbol']}:breakout" for r in breakout_eligible}
 
