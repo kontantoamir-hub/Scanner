@@ -605,8 +605,10 @@ def analyze_symbol(t, interval):
                     early_source = "squeeze"
                 early_entry = ind["closes"][last]
                 atrv = atr_value(ind)
-                early_sl = early_entry - atrv * EARLY_SL_ATR_MULT
-                early_risk = early_entry - early_sl
+                atr_risk = atrv * EARLY_SL_ATR_MULT
+                min_risk_for_target = early_entry * (MIN_PROFIT_PCT / 100)
+                early_risk = max(atr_risk, min_risk_for_target)
+                early_sl = early_entry - early_risk
                 early_tp_count = conditions_met  # عدد الأهداف = عدد الشروط المتحققة فعليًا لهاي العملة (1 إلى 4)
                 raw_tps = [early_entry + early_risk * i for i in range(1, early_tp_count + 1)]
                 resistance = r.get("resistance")
@@ -634,8 +636,10 @@ def analyze_symbol(t, interval):
             if breakout_score >= 1 and r["atr_pct"] >= BREAKOUT_MIN_ATR_PCT:
                 breakout_entry = ind["closes"][last]
                 atrv = atr_value(ind)
-                breakout_sl = breakout_entry - atrv * 1.8
-                risk = breakout_entry - breakout_sl
+                atr_risk = atrv * 1.8
+                min_risk_for_target = breakout_entry * (MIN_PROFIT_PCT / 100)
+                risk = max(atr_risk, min_risk_for_target)
+                breakout_sl = breakout_entry - risk
                 if breakout_score >= 3:
                     tp_count = 3
                 elif breakout_score >= 2:
