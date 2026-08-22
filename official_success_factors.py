@@ -3,15 +3,18 @@
 """
 official_success_factors.py
 ============================
-تحليل مقارن للإشارات الرسمية فقط (type == "official"): يقارن كل الحقول
-التشخيصية المحفوظة وقت فتح الصفقة بين مجموعتين:
+تحليل مقارن للإشارات الرسمية (type == "official") **وصفقات الانفجار**
+(type == "breakout" — أُضيف لاحقًا بعد أن صار Breakout يحتوي نفس الحقول
+التشخيصية الثمانية) — لكل نوع على حدة، يقارن كل الحقول التشخيصية بين مجموعتين:
 
   - ✅ الصفقات التي وصلت لكل أهدافها (closed_reason == "ALL_TP")
   - ❌ الصفقات التي لم تصل (SL / EXPIRED)
 
 الهدف: كشف أي عامل (أو مستوى منه) كان حاضرًا بشكل متكرر بالمجموعة الناجحة
-وغائبًا/نادرًا بالفاشلة (أو العكس)، لاستخدامه لاحقًا كفلتر إضافي على
-الإشارة الرسمية.
+وغائبًا/نادرًا بالفاشلة (أو العكس)، لاستخدامه لاحقًا كفلتر إضافي.
+لصفقات breakout تحديدًا يُضاف قسم خامس (analyze_breakout_factors) يقارن عوامل
+جودة الاختراق الخاصة (trend_support / macd_bull / rsi_ok من breakout_details)
+غير الموجودة إطلاقًا بصفقات official.
 
 الحقول المفحوصة (كما تُحفظ فعليًا في scanner.py):
   - score            (رقم متصل)      -> متوسط لكل مجموعة + توزيع دلاء
@@ -20,6 +23,7 @@ official_success_factors.py
   - macd_bull, vol_confirm, ranging, near_resistance, obv_confirm,
     extended, squeeze, accumulation, divergence   (True/False/None) -> نسبة الحضور
   - htf_aligned       (True / False / None)         -> توزيع نسبي
+  - (breakout فقط) trend_support, macd_bull, rsi_ok من breakout_details
 
 تشغيل:
     export GIST_TOKEN=xxx
@@ -45,6 +49,9 @@ TRISTATE_FIELDS = {  # قيم -1/0/1 وشرح كل قيمة
     "bb_state": {1: "الحد السفلي (1)", 0: "منتصف النطاق (0)", -1: "الحد العلوي (-1)"},
 }
 TRIBOOL_FIELDS = ["htf_aligned"]  # True/False/None
+
+# عوامل جودة الاختراق الخاصة بصفقات breakout فقط (محفوظة داخل breakout_details)
+BREAKOUT_FACTOR_KEYS = ["trend_support", "macd_bull", "rsi_ok"]
 
 
 def load_trades():
@@ -86,17 +93,12 @@ def score_bucket(score):
     return "<1.5"
 
 
-def main():
-    trades = load_trades()
-    official = [t for t in trades if t.get("type") == "official"]
-    if not official:
-        sys.exit("لا توجد صفقات رسمية بعد.")
-
-    win = [t for t in official if t.get("closed_reason") == "ALL_TP"]
-    lose = [t for t in official if t.get("closed_reason") in ("SL", "EXPIRED")]
-
+def analyze_group(win, lose, group_label, total_label):
+    """يشغّل نفس التحليل المقارن (الدرجة + الحقول الثنائية + الحقول ثلاثية القيم +
+    htf_aligned) على أي مجموعة صفقات (رسمية أو انفجار) — نفس منطق official_success_factors
+    الأصلي، مستخرج كدالة عشان يُعاد استخدامه بدل تكرار الكود لكل نوع."""
     print("=" * 72)
-    print(f"تحليل مقارن للإشارات الرسمية — إجمالي {len(official)} صفقة")
+    print(f"تحليل مقارن لـ{group_label} — إجمالي {total_label} صفقة")
     print(f"✅ وصلت لكل الأهداف: {len(win)}   |   ❌ لم تصل (SL/EXPIRED): {len(lose)}")
     print("=" * 72)
 
@@ -149,6 +151,49 @@ def main():
             l = sum(1 for t in lose if t.get(field) == val)
             wp, lp = pct(w, len(win)), pct(l, len(lose))
             print(f"{label:<20}{wp:<18.1f}{lp:<18.1f}{wp - lp:+.1f}")
+
+
+def analyze_breakout_factors(win, lose):
+    """قسم إضافي خاص بصفقات الانفجار فقط: يقارن عوامل جودة الاختراق الثلاثة
+    (trend_support / macd_bull / rsi_ok من breakout_details) بين الناجحة والفاشلة —
+    هذه العوامل غير موجودة إطلاقًا بصفقات official، لذا قسم منفصل عن analyze_group."""
+    print("\n--- عوامل جودة الاختراق (breakout_details) ---")
+    print(f"\n{'العامل':<18}{'% حاضر بالنجاح':<20}{'% حاضر بالفشل':<20}{'الفرق'}")
+    print("-" * 70)
+    rows = []
+    for field in BREAKOUT_FACTOR_KEYS:
+        w = sum(1 for t in win if (t.get("breakout_details") or {}).get(field) is True)
+        l = sum(1 for t in lose if (t.get("breakout_details") or {}).get(field) is True)
+        wp, lp = pct(w, len(win)), pct(l, len(lose))
+        rows.append((field, wp, lp, wp - lp))
+    rows.sort(key=lambda r: -abs(r[3]))
+    for field, wp, lp, diff in rows:
+        print(f"{field:<18}{wp:<20.1f}{lp:<20.1f}{diff:+.1f}")
+
+
+def main():
+    trades = load_trades()
+    official = [t for t in trades if t.get("type") == "official"]
+    breakout = [t for t in trades if t.get("type") == "breakout"]
+
+    if not official and not breakout:
+        sys.exit("لا توجد صفقات رسمية ولا صفقات انفجار بعد.")
+
+    if official:
+        win = [t for t in official if t.get("closed_reason") == "ALL_TP"]
+        lose = [t for t in official if t.get("closed_reason") in ("SL", "EXPIRED")]
+        analyze_group(win, lose, "الإشارات الرسمية", len(official))
+    else:
+        print("(لا توجد صفقات رسمية بعد — تم تخطي هذا القسم)")
+
+    if breakout:
+        print("\n\n")
+        b_win = [t for t in breakout if t.get("closed_reason") == "ALL_TP"]
+        b_lose = [t for t in breakout if t.get("closed_reason") in ("SL", "EXPIRED")]
+        analyze_group(b_win, b_lose, "صفقات الانفجار (Breakout)", len(breakout))
+        analyze_breakout_factors(b_win, b_lose)
+    else:
+        print("\n(لا توجد صفقات انفجار مغلقة بعد — تم تخطي هذا القسم، سيظهر تلقائيًا مع أول صفقات breakout مغلقة)")
 
     print("\n" + "=" * 72)
     print("ملاحظة: الفرق (win% - lose%) الأكبر (موجبًا أو سالبًا) هو أقوى مرشّح")
