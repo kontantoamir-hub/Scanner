@@ -1472,6 +1472,30 @@ def main():
     ]
     strong_symbols = {r["symbol"] for r in strong}
 
+    # --- تشخيص مؤقت: قياس أثر كل فلتر لوحده على عدد الإشارات الرسمية المؤهلة ---
+    # يطبع فقط بالـ logs (مو بتيليجرام)، للمساعدة بتحديد أي شرط يستبعد الأكثر
+    # بأيام السوق المتقلبة (مثل قفزة +7% ببيتكوين بيوم واحد بتاريخ 21-22 أوت).
+    _score_ok = [r for r in results if r["score"] >= 1.5]
+    _under_cap = [r for r in _score_ok if r["score"] < MAX_OFFICIAL_SCORE]
+    _capped_out = [r for r in _score_ok if r["score"] >= MAX_OFFICIAL_SCORE]
+    _also_vol_atr_persist = [
+        r for r in _under_cap
+        if r["vol_confirm"] and r["atr_pct"] >= 0.08 and r["persistent"]
+    ]
+    _also_not_ranging_res = [
+        r for r in _also_vol_atr_persist if not r["ranging"] and not r["near_resistance"]
+    ]
+    print(
+        "🔍 تشخيص فلترة الرسمية: "
+        f"score>=1.5: {len(_score_ok)} | "
+        f"مستبعدة بسقف MAX_OFFICIAL_SCORE={MAX_OFFICIAL_SCORE}: {len(_capped_out)} "
+        f"({', '.join(r['symbol'] for r in _capped_out) or '—'}) | "
+        f"تحت السقف: {len(_under_cap)} | "
+        f"+حجم/تقلب/استقرار: {len(_also_vol_atr_persist)} | "
+        f"+ليست عرضية/بعيدة عن مقاومة: {len(_also_not_ranging_res)} | "
+        f"+ربح أدنى محقق (strong نهائي): {len(strong)}"
+    )
+
     # إشارات مبكرة (انضغاط تقلب / تراكم صامت) لعملات لم تصل بعد لإشارة شراء كاملة —
     # تُميَّز بمفتاح منفصل (":early") في ذاكرة التنبيهات كي لا تتعارض مع إشارات الشراء الرسمية
     # (رسمية أو مبكرة accumulation/squeeze/كليهما) تُصفّى هنا أيضًا بنفس شرط الحد الأدنى
