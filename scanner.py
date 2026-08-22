@@ -49,6 +49,12 @@ EXTENSION_EMA_PERIOD = 50       # المتوسط المتحرك المرجعي �
 EXTENSION_ATR_THRESHOLD = float(os.environ.get("EXTENSION_ATR_THRESHOLD", "3.0"))
 # المسافة بين السعر وEMA50 بوحدات ATR — فوق هذا الحد يُعتبر السعر ممتدًا بشكل مفرط (احتمال شراء متأخر)
 
+# استبعاد صريح للإشارات الرسمية ذات الدرجة العالية جدًا (score >= هذا الحد):
+# official_success_factors.py أكّد على عينة 246 صفقة أن هذه الفئة الأضعف بثبات
+# (25.6% من الصفقات الفاشلة مقابل 10.9% فقط من الناجحة) — قبل كان يُعاقَب بالدرجة
+# فقط (extension penalty)، الآن يُرفض الإرسال نهائيًا لو تجاوزها.
+MAX_OFFICIAL_SCORE = float(os.environ.get("MAX_OFFICIAL_SCORE", "3.5"))
+
 # ---------- إعدادات الإشارات المبكرة (انضغاط تقلب / تراكم صامت) ----------
 SQUEEZE_LOOKBACK = 20           # عدد الشموع لحساب متوسط عرض نطاق Bollinger
 SQUEEZE_RATIO_THRESHOLD = 0.6   # عرض النطاق الحالي <= هذه النسبة من المتوسط -> يُعتبر انضغاطًا
@@ -1459,7 +1465,8 @@ def main():
 
     strong = [
         r for r in results
-        if r["score"] >= 1.5 and r["vol_confirm"] and r["atr_pct"] >= 0.08 and r["persistent"]
+        if r["score"] >= 1.5 and r["score"] < MAX_OFFICIAL_SCORE
+        and r["vol_confirm"] and r["atr_pct"] >= 0.08 and r["persistent"]
         and not r["ranging"] and not r["near_resistance"]
         and meets_min_profit(r["entry"], r["tps"])
     ]
