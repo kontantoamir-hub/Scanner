@@ -26,6 +26,9 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
+          TESTNET_API_KEY: ${{ secrets.TESTNET_API_KEY }}
+          TESTNET_API_SECRET: ${{ secrets.TESTNET_API_SECRET }}
+          TESTNET_ORDER_USDT: '100'
           SCAN_INTERVAL: '1h'
           SCAN_DEPTH: '60'
         run: python scanner.py
