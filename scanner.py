@@ -14,10 +14,6 @@
 import os
 import json
 import time
-import math
-import hmac
-import hashlib
-import urllib.parse
 import datetime as dt
 import concurrent.futures
 import requests
@@ -37,15 +33,6 @@ EXCLUDE_SYMS = {"USDCUSDT","FDUSDUSDT","TUSDUSDT","DAIUSDT","USDPUSDT",
 HTF_MAP = {"15m": "1h", "1h": "4h", "4h": "1d", "1d": "1w"}
 
 BASE_URL = "https://data-api.binance.vision/api/v3"
-
-# ---------- إعدادات التداول التجريبي الفعلي على Binance Spot Testnet ----------
-# تنفيذ حقيقي (لكن بأموال وهمية) لأوامر الشراء/البيع مقابل كل إشارة (رسمية/مبكرة/انفجار)،
-# بشكل منفصل تمامًا عن منطق المسح والتنبيهات: أي خطأ هنا لا يجب أن يوقف بقية البوت أبدًا.
-TESTNET_API_KEY = os.environ.get("TESTNET_API_KEY")
-TESTNET_API_SECRET = os.environ.get("TESTNET_API_SECRET")
-TESTNET_BASE_URL = "https://testnet.binance.vision/api/v3"
-TESTNET_TRADE_ENABLED = bool(TESTNET_API_KEY and TESTNET_API_SECRET)
-TESTNET_ORDER_USDT = float(os.environ.get("TESTNET_ORDER_USDT", "100"))
 
 # ---------- إعدادات فلاتر التحليل الإضافية (ADX / الانحراف / المقاومة / OBV) ----------
 ADX_PERIOD = 14
@@ -86,101 +73,6 @@ EARLY_SL_ATR_MULT = 2.0
 # الثقة (بعد تعديل مبني على بيانات فعلية بتاريخ 2026-08-18): accumulation حاضر -> مؤكدة
 # مباشرة (حتى لو وحيدًا)؛ squeeze حاضر بدون accumulation -> يحتاج شرطًا إضافيًا وإلا
 # لا تُطلق إشارة أصلاً؛ 3 شروط فأكثر (بأي مزيج) -> مؤكدة قوية.
-
-
-# ---------------- تنفيذ فعلي (تجريبي) على Binance Spot Testnet ----------------
-# كل الدوال هنا "معزولة أمانًا": أي فشل (شبكة/توقيع/رصيد/فلاتر) يُطبع فقط في السجل
-# (print) ولا يرفع استثناء للأعلى أبدًا، كي لا يؤثر إطلاقًا على منطق المسح/التنبيهات/التتبع.
-
-def _testnet_signed_request(method, path, params=None):
-    """يرسل طلبًا موقّعًا (HMAC-SHA256) إلى Binance Spot Testnet. يرجع JSON الاستجابة أو None عند أي فشل."""
-    if not TESTNET_TRADE_ENABLED:
-        return None
-    try:
-        query_params = dict(params or {})
-        query_params["timestamp"] = int(time.time() * 1000)
-        query_params["recvWindow"] = 5000
-        query = urllib.parse.urlencode(query_params)
-        signature = hmac.new(
-            TESTNET_API_SECRET.encode("utf-8"), query.encode("utf-8"), hashlib.sha256
-        ).hexdigest()
-        url = f"{TESTNET_BASE_URL}{path}?{query}&signature={signature}"
-        headers = {"X-MBX-APIKEY": TESTNET_API_KEY}
-        r = requests.request(method, url, headers=headers, timeout=15)
-        if not r.ok:
-            print(f"⚠️ Testnet: فشل طلب {path} ({r.status_code}): {r.text}")
-            return None
-        return r.json()
-    except Exception as e:
-        print(f"⚠️ Testnet: خطأ في طلب {path}: {e}")
-        return None
-
-
-def _testnet_lot_step(symbol):
-    """يجلب حجم الخطوة (stepSize) الخاص بفلتر LOT_SIZE للرمز، لضبط الكمية بدقة صحيحة عند البيع."""
-    try:
-        r = requests.get(f"{TESTNET_BASE_URL}/exchangeInfo", params={"symbol": symbol}, timeout=15)
-        if not r.ok:
-            return None
-        symbols = r.json().get("symbols") or []
-        if not symbols:
-            return None
-        for f in symbols[0].get("filters", []):
-            if f.get("filterType") == "LOT_SIZE":
-                return float(f["stepSize"])
-    except Exception as e:
-        print(f"⚠️ Testnet: تعذر جلب فلاتر {symbol}: {e}")
-    return None
-
-
-def _round_to_step(quantity, step):
-    if not step or step <= 0:
-        return quantity
-    return math.floor(quantity / step) * step
-
-
-def testnet_market_buy(symbol):
-    """
-    يشتري بقيمة TESTNET_ORDER_USDT دولار من الرمز عبر أمر Market فعلي على Testnet.
-    يرجع الكمية الفعلية المنفَّذة (executedQty) عند النجاح، أو None عند التعطيل/الفشل
-    (لا يمنع فتح المتابعة الداخلية للصفقة في كل الأحوال).
-    """
-    if not TESTNET_TRADE_ENABLED:
-        return None
-    result = _testnet_signed_request("POST", "/order", {
-        "symbol": symbol,
-        "side": "BUY",
-        "type": "MARKET",
-        "quoteOrderQty": TESTNET_ORDER_USDT,
-    })
-    if result and result.get("executedQty"):
-        qty = float(result["executedQty"])
-        print(f"✅ Testnet BUY {symbol}: qty={qty}")
-        return qty
-    print(f"⚠️ Testnet: لم يُنفَّذ أمر الشراء لـ {symbol} (سيبقى تتبع الإشارة داخليًا فقط)")
-    return None
-
-
-def testnet_market_sell(symbol, quantity):
-    """يبيع الكمية المحددة عبر أمر Market فعلي على Testnet عند إغلاق الصفقة (TP/SL/انتهاء الصلاحية)."""
-    if not TESTNET_TRADE_ENABLED or not quantity:
-        return None
-    step = _testnet_lot_step(symbol)
-    qty = _round_to_step(quantity, step) if step else quantity
-    if not qty or qty <= 0:
-        print(f"⚠️ Testnet: كمية غير صالحة للبيع ({symbol})")
-        return None
-    result = _testnet_signed_request("POST", "/order", {
-        "symbol": symbol,
-        "side": "SELL",
-        "type": "MARKET",
-        "quantity": qty,
-    })
-    if result:
-        print(f"✅ Testnet SELL {symbol}: qty={qty}")
-    else:
-        print(f"⚠️ Testnet: لم يُنفَّذ أمر البيع لـ {symbol}")
-    return result
 
 
 # ---------------- دوال المؤشرات الفنية ----------------
@@ -1269,7 +1161,6 @@ def open_new_positions(positions, fresh_signals):
     for r in fresh_signals:
         if r.get("entry") is None:
             continue  # لا خطة دخول (تجنب شراء) -> لا داعي لتتبعها
-        testnet_qty = testnet_market_buy(r["symbol"])
         positions.append({
             "symbol": r["symbol"],
             "entry": r["entry"],
@@ -1282,7 +1173,6 @@ def open_new_positions(positions, fresh_signals):
             "interval": INTERVAL,
             "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "type": "official",
-            "testnet_qty": testnet_qty,
             # حقول تشخيصية: أي عوامل كانت حاضرة وقت الدخول -> تحليل لاحق لأثر كل عامل على النجاح/الفشل
             "squeeze": r.get("squeeze"),
             "accumulation": r.get("accumulation"),
@@ -1312,7 +1202,6 @@ def open_new_early_positions(positions, fresh_early_signals):
     for r in fresh_early_signals:
         if r.get("early_entry") is None:
             continue
-        testnet_qty = testnet_market_buy(r["symbol"])
         positions.append({
             "symbol": r["symbol"],
             "entry": r["early_entry"],
@@ -1325,7 +1214,6 @@ def open_new_early_positions(positions, fresh_early_signals):
             "interval": INTERVAL,
             "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "type": "early",
-            "testnet_qty": testnet_qty,
             "confidence": r.get("early_confidence"),
             # مصدر الإشارة الأساسي (accumulation / squeeze / accumulation+squeeze) —
             # لتحليل لاحق سهل لأي مصدر أدق بدون الحاجة لتقاطع squeeze/accumulation يدويًا
@@ -1357,7 +1245,6 @@ def open_new_breakout_positions(positions, fresh_breakout_signals):
     for r in fresh_breakout_signals:
         if r.get("breakout_entry") is None:
             continue
-        testnet_qty = testnet_market_buy(r["symbol"])
         positions.append({
             "symbol": r["symbol"],
             "entry": r["breakout_entry"],
@@ -1370,7 +1257,6 @@ def open_new_breakout_positions(positions, fresh_breakout_signals):
             "interval": INTERVAL,
             "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "type": "breakout",
-            "testnet_qty": testnet_qty,
             "breakout_details": r.get("breakout_details"),
             "extended": r.get("extended"),
             "rsi_state": r.get("rsi_state"),
@@ -1472,7 +1358,6 @@ def check_open_positions(positions, price_map):
             continue
 
         if price <= pos["sl"]:
-            testnet_market_sell(pos["symbol"], pos.get("testnet_qty"))
             result_text = format_sl_hit(pos, price)
             send_telegram(result_text)
             edit_telegram_strike(pos.get("alert_message_id"), build_progress_text(pos), result_text)
@@ -1513,7 +1398,6 @@ def check_open_positions(positions, price_map):
         if len(pos["hit_tps"]) >= len(pos["tps"]):
             # كل الأهداف تحققت -> إغلاق نهائي: نشطب رسالة الإشارة الأصلية (بما فيها كل أسطر
             # الأهداف المتراكمة) تمامًا كما يحصل عند SL/EXPIRED، بدل تركها بدون شطب نهائي
-            testnet_market_sell(pos["symbol"], pos.get("testnet_qty"))
             all_tp_text = "🏁 تحققت جميع الأهداف"
             edit_telegram_strike(pos.get("alert_message_id"), build_progress_text(pos), all_tp_text)
             pos["closed_reason"] = "ALL_TP"
@@ -1527,7 +1411,6 @@ def check_open_positions(positions, price_map):
         # السقف الزمني الأقصى (شبكة أمان فقط).
         hours_open = _hours_since(pos["opened_at"])
         if hours_open >= TIME_STOP_HOURS:
-            testnet_market_sell(pos["symbol"], pos.get("testnet_qty"))
             pct_change = (price - pos["entry"]) / pos["entry"] * 100
             status = "بربح" if pct_change > 0 else ("بخسارة" if pct_change < 0 else "بدون تغيير")
             expired_text = (
