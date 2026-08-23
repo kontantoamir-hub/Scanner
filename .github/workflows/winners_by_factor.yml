@@ -1,0 +1,23 @@
+name: Winners By Factor
+
+on:
+  workflow_dispatch: {}   # تشغيل يدوي فقط: من تبويب Actions -> Winners By Factor -> Run workflow
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: تثبيت المتطلبات
+        run: pip install requests
+
+      - name: تشغيل تحليل الصفقات الرابحة حسب المصدر التشخيصي
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+        run: python winners_by_factor.py
