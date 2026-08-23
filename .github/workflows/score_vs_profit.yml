@@ -1,0 +1,23 @@
+name: Score Vs Profit
+
+on:
+  workflow_dispatch: {}   # تشغيل يدوي فقط: من تبويب Actions -> Score Vs Profit -> Run workflow
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: تثبيت المتطلبات
+        run: pip install requests
+
+      - name: تشغيل مقارنة الدرجة بالعائد الفعلي لكل صفقة
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+        run: python score_vs_profit.py
