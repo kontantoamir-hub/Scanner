@@ -38,7 +38,8 @@ from collections import defaultdict
 
 import requests
 
-GIST_FILENAME = "closed_trades.json"
+GIST_FILENAME = "closed_trades.json"          # السجل النشط: أحدث الصفقات فقط
+ARCHIVE_PREFIX = "closed_trades_archive_"     # ملفات الأرشيف المرقّمة (تحوي كل التاريخ الأقدم)
 
 BOOL_FIELDS = [
     "macd_bull", "vol_confirm", "ranging", "near_resistance", "obv_confirm",
@@ -52,6 +53,23 @@ TRIBOOL_FIELDS = ["htf_aligned"]  # True/False/None
 
 # عوامل جودة الاختراق الخاصة بصفقات breakout فقط (محفوظة داخل breakout_details)
 BREAKOUT_FACTOR_KEYS = ["trend_support", "macd_bull", "rsi_ok"]
+
+
+def _read_json_file(file_entry, filename):
+    """يقرأ محتوى ملف من استجابة Gist، مع التحقق من احتمال البتر (truncated) لملف كبير جدًا
+    والجلب من raw_url في هذه الحالة بدل الاعتماد على content فقط."""
+    if file_entry.get("truncated"):
+        raw_url = file_entry.get("raw_url")
+        try:
+            rr = requests.get(raw_url, timeout=15)
+            rr.raise_for_status()
+            content = rr.text
+        except Exception as e:
+            print(f"⚠️ تعذّر جلب المحتوى الكامل غير المبتور لـ {filename}: {e}")
+            content = file_entry.get("content", "[]")
+    else:
+        content = file_entry.get("content", "[]")
+    return json.loads(content)
 
 
 def load_trades():
@@ -72,9 +90,18 @@ def load_trades():
     )
     r.raise_for_status()
     files = r.json().get("files", {})
-    if GIST_FILENAME not in files:
+
+    # يجمع السجل النشط + كل ملفات الأرشيف المرقّمة = التاريخ الكامل بلا أي سقف
+    all_trades = []
+    archive_names = sorted(fn for fn in files if fn.startswith(ARCHIVE_PREFIX))
+    for name in archive_names:
+        all_trades.extend(_read_json_file(files[name], name))
+    if GIST_FILENAME in files:
+        all_trades.extend(_read_json_file(files[GIST_FILENAME], GIST_FILENAME))
+
+    if not all_trades and GIST_FILENAME not in files:
         sys.exit(f"لم يتم العثور على '{GIST_FILENAME}'. الملفات المتوفرة: {list(files.keys())}")
-    return json.loads(files[GIST_FILENAME]["content"])
+    return all_trades
 
 
 def pct(part, whole):
