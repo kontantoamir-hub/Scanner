@@ -983,9 +983,11 @@ GIST_TOKEN = os.environ.get("GIST_TOKEN")
 GIST_ID = os.environ.get("GIST_ID")
 GIST_FILENAME = "alerted_state.json"
 POSITIONS_GIST_FILE = "open_positions.json"   # الصفقات المفتوحة قيد المتابعة (نفس الـ Gist، ملف منفصل)
-CLOSED_GIST_FILE = "closed_trades.json"       # سجل الصفقات المغلقة (لإحصائية الأداء)
+CLOSED_GIST_FILE = "closed_trades.json"       # السجل "النشط": أحدث الصفقات فقط (قراءة سريعة، دائمًا صغير وآمن)
 STATS_GIST_FILE = "stats.json"                # إحصائيات أداء محسوبة دوريًا من closed_trades (خيار 3: تتبع فقط)
-MAX_CLOSED_HISTORY = 300                      # سقف لعدد الصفقات المؤرشفة كي لا يتضخم الـ Gist بلا حدود
+ACTIVE_HISTORY_SIZE = 400                     # عدد الصفقات المحفوظة في السجل النشط قبل ترحيل الأقدم للأرشيف
+ARCHIVE_PREFIX = "closed_trades_archive_"     # بادئة ملفات الأرشيف المرقّمة (كل ملف محدود الحجم، بلا سقف على عددها)
+ARCHIVE_CHUNK_SIZE = 400                      # حد أقصى للصفقات في كل ملف أرشيف (يبقيه دائمًا تحت حد GitHub ~1MB بأمان)
 DOM_SHIFT_THRESHOLD = float(os.environ.get("DOM_SHIFT_THRESHOLD", "0.3"))  # نقطة مئوية خلال دورة تشغيل واحدة
 
 
@@ -993,20 +995,68 @@ def _gist_headers():
     return {"Authorization": f"token {GIST_TOKEN}", "Accept": "application/vnd.github+json"}
 
 
-def _gist_get_file(filename):
-    """يقرأ محتوى ملف واحد داخل الـ Gist (يرجع None لو غير موجود أو حصل خطأ)."""
+def _gist_get_all_files():
+    """يقرأ قاموس كل ملفات الـ Gist دفعة واحدة (اسم -> بيانات الملف بما فيها content)."""
     if not GIST_TOKEN or not GIST_ID:
-        return None
+        return {}
     try:
         r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=_gist_headers(), timeout=15)
         r.raise_for_status()
-        files = r.json().get("files", {})
-        if filename not in files:
-            return None
-        return files[filename]["content"]
+        return r.json().get("files", {})
     except Exception as e:
-        print(f"تعذّر قراءة {filename} من Gist ({e})")
+        print(f"تعذّر قراءة ملفات Gist ({e})")
+        return {}
+
+
+def _gist_get_file(filename):
+    """يقرأ محتوى ملف واحد داخل الـ Gist (يرجع None لو غير موجود أو حصل خطأ)."""
+    files = _gist_get_all_files()
+    if filename not in files:
         return None
+    return files[filename]["content"]
+
+
+def archive_overflow(overflow_trades, gist_files):
+    """
+    يوزّع الصفقات القديمة الفائضة (التي خرجت من السجل النشط) على ملفات أرشيف مرقّمة
+    (closed_trades_archive_0001.json, 0002.json, ...)، كل ملف محدود بـARCHIVE_CHUNK_SIZE
+    صفقة كحد أقصى — هذا يضمن نموًا غير محدود إجمالاً (يمكن الوصول لملايين الصفقات عبر
+    آلاف الملفات الصغيرة) بلا أن يصطدم أي ملف منفرد بحد GitHub لحجم المحتوى (~1MB) الذي
+    يسبب بتر البيانات بصمت.
+    """
+    if not overflow_trades:
+        return {}
+
+    archive_names = sorted(fn for fn in gist_files if fn.startswith(ARCHIVE_PREFIX))
+    if archive_names:
+        last_name = archive_names[-1]
+        idx = int(last_name[len(ARCHIVE_PREFIX):].replace(".json", ""))
+        try:
+            last_content = json.loads(gist_files[last_name].get("content") or "[]")
+        except Exception:
+            last_content = []
+    else:
+        idx = 1
+        last_content = []
+
+    files_to_write = {}
+    remaining = list(overflow_trades)
+
+    # أكمل آخر ملف أرشيف موجود إن كان فيه مكان فارغ
+    space = ARCHIVE_CHUNK_SIZE - len(last_content)
+    if space > 0 and remaining:
+        last_content.extend(remaining[:space])
+        remaining = remaining[space:]
+        files_to_write[f"{ARCHIVE_PREFIX}{idx:04d}.json"] = json.dumps(last_content, ensure_ascii=False, indent=2)
+
+    # أنشئ ملفات أرشيف جديدة للباقي (بلا أي سقف على عدد الملفات)
+    while remaining:
+        idx += 1
+        chunk = remaining[:ARCHIVE_CHUNK_SIZE]
+        remaining = remaining[ARCHIVE_CHUNK_SIZE:]
+        files_to_write[f"{ARCHIVE_PREFIX}{idx:04d}.json"] = json.dumps(chunk, ensure_ascii=False, indent=2)
+
+    return files_to_write
 
 
 def _gist_patch_files(files_dict):
@@ -1146,12 +1196,25 @@ def save_all_state(alerted_symbols, btc_dominance, positions, closed_delta):
 
     stats = None
     if closed_delta:
-        history = load_closed()
+        # نجلب كل ملفات الـ Gist دفعة واحدة (نحتاجها للسجل النشط ولملفات الأرشيف معًا)
+        gist_files = _gist_get_all_files()
+        try:
+            history = json.loads(gist_files.get(CLOSED_GIST_FILE, {}).get("content") or "[]")
+        except Exception:
+            history = []
         history.extend(closed_delta)
-        if len(history) > MAX_CLOSED_HISTORY:
-            history = history[-MAX_CLOSED_HISTORY:]
+
+        # إذا تجاوز السجل النشط الحد، تُرحَّل أقدم الصفقات لملفات الأرشيف بدل حذفها نهائيًا —
+        # لا يُفقد أي شيء، والسجل النشط يبقى دائمًا صغيرًا وسريع القراءة
+        if len(history) > ACTIVE_HISTORY_SIZE:
+            overflow = history[:-ACTIVE_HISTORY_SIZE]
+            history = history[-ACTIVE_HISTORY_SIZE:]
+            files.update(archive_overflow(overflow, gist_files))
+
         files[CLOSED_GIST_FILE] = json.dumps(history, ensure_ascii=False, indent=2)
 
+        # ملاحظة: الإحصائيات الآنية تُحسب من السجل النشط فقط (آخر ACTIVE_HISTORY_SIZE صفقة)
+        # للتقرير الفوري — التحليل الشامل الكامل يحتاج قراءة السجل النشط + كل ملفات الأرشيف
         stats = compute_stats(history)
         if stats:
             files[STATS_GIST_FILE] = json.dumps(stats, ensure_ascii=False, indent=2)
