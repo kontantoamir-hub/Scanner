@@ -35,7 +35,8 @@ import requests
 
 GIST_TOKEN = os.environ.get("GIST_TOKEN")
 GIST_ID = os.environ.get("GIST_ID")
-CLOSED_GIST_FILE = "closed_trades.json"
+CLOSED_GIST_FILE = "closed_trades.json"     # السجل النشط: أحدث الصفقات فقط
+ARCHIVE_PREFIX = "closed_trades_archive_"   # ملفات الأرشيف المرقّمة (تحوي كل التاريخ الأقدم)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -81,19 +82,48 @@ def _gist_headers():
     return {"Authorization": f"token {GIST_TOKEN}", "Accept": "application/vnd.github+json"}
 
 
+def _read_json_file(file_entry, filename):
+    """يقرأ محتوى ملف من استجابة Gist، مع التحقق من احتمال البتر (truncated) لملف كبير جدًا
+    والجلب من raw_url في هذه الحالة بدل الاعتماد على content فقط."""
+    if file_entry.get("truncated"):
+        raw_url = file_entry.get("raw_url")
+        try:
+            rr = requests.get(raw_url, timeout=15)
+            rr.raise_for_status()
+            content = rr.text
+        except Exception as e:
+            print(f"⚠️ تعذّر جلب المحتوى الكامل غير المبتور لـ {filename}: {e}")
+            content = file_entry.get("content", "[]")
+    else:
+        content = file_entry.get("content", "[]")
+    try:
+        return json.loads(content)
+    except Exception as e:
+        print(f"⚠️ تعذّر تحليل {filename}: {e}")
+        return []
+
+
 def load_closed_trades():
+    """يجمع السجل النشط (closed_trades.json) مع كل ملفات الأرشيف المرقّمة، ليعطي
+    التاريخ الكامل للصفقات المغلقة بلا أي سقف على العدد الإجمالي."""
     if not GIST_TOKEN or not GIST_ID:
         raise SystemExit("❌ GIST_TOKEN أو GIST_ID غير موجودين في متغيرات البيئة.")
     r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=_gist_headers(), timeout=15)
     r.raise_for_status()
     files = r.json().get("files", {})
-    if CLOSED_GIST_FILE not in files:
-        return []
-    content = files[CLOSED_GIST_FILE]["content"]
-    try:
-        return json.loads(content)
-    except Exception as e:
-        raise SystemExit(f"❌ تعذّر قراءة {CLOSED_GIST_FILE}: {e}")
+
+    all_trades = []
+
+    # ملفات الأرشيف أولًا (الأقدم زمنيًا)، مرتبة حسب رقمها
+    archive_names = sorted(fn for fn in files if fn.startswith(ARCHIVE_PREFIX))
+    for name in archive_names:
+        all_trades.extend(_read_json_file(files[name], name))
+
+    # ثم السجل النشط (الأحدث)
+    if CLOSED_GIST_FILE in files:
+        all_trades.extend(_read_json_file(files[CLOSED_GIST_FILE], CLOSED_GIST_FILE))
+
+    return all_trades
 
 
 def classify(trade):
