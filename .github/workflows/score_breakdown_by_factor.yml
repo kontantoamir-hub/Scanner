@@ -1,0 +1,23 @@
+name: Score Breakdown By Factor
+
+on:
+  workflow_dispatch: {}   # تشغيل يدوي فقط: من تبويب Actions -> Score Breakdown By Factor -> Run workflow
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: تثبيت المتطلبات
+        run: pip install requests
+
+      - name: تشغيل تحليل الدرجة × كل عامل تشخيصي (الإشارات المبكرة)
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+        run: python score_breakdown_by_factor.py
