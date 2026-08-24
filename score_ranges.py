@@ -106,6 +106,7 @@ def split_into_3_ranges(score_table):
     if len(scores_sorted) < 3:
         groups = [[s] for s in scores_sorted]
     else:
+        n = len(scores_sorted)
         # نحسب نقطتي قطع بناءً على العدد التراكمي للصفقات (وليس عدد قيم الدرجة)
         cumulative = []
         running = 0
@@ -116,15 +117,14 @@ def split_into_3_ranges(score_table):
         target1 = total_trades / 3
         target2 = 2 * total_trades / 3
 
-        # أول فهرس تراكمي يتجاوز/يساوي كل هدف
         cut1 = next(i for i, c in enumerate(cumulative) if c >= target1)
         cut2 = next(i for i, c in enumerate(cumulative) if c >= target2)
 
-        # نضمن إن نقطة القطع الثانية بعد الأولى فعليًا (تكوين 3 مجموعات غير فارغة)
-        if cut2 <= cut1:
-            cut2 = min(cut1 + 1, len(scores_sorted) - 1)
-        if cut2 == len(scores_sorted) - 1 and cut1 == cut2:
-            cut1 = max(cut2 - 1, 0)
+        # نضمن رياضيًا وجود 3 مجموعات غير فارغة مهما كان توزيع البيانات:
+        # cut1 يترك مكانًا لمجموعتين بعده، وcut2 يترك مكانًا لمجموعة واحدة على الأقل بعده
+        cut1 = min(cut1, n - 3)
+        cut2 = max(cut2, cut1 + 1)
+        cut2 = min(cut2, n - 2)
 
         groups = [
             scores_sorted[0:cut1 + 1],
