@@ -102,24 +102,37 @@ def split_into_3_ranges(score_table):
     if total_trades == 0 or not scores_sorted:
         return []
 
-    target_per_group = total_trades / 3
-    groups = []
-    current_group = []
-    current_count = 0
+    # حالة خاصة: لو عدد قيم الدرجة المختلفة أقل من 3، لا يمكن تكوين 3 مجموعات منفصلة فعليًا
+    if len(scores_sorted) < 3:
+        groups = [[s] for s in scores_sorted]
+    else:
+        # نحسب نقطتي قطع بناءً على العدد التراكمي للصفقات (وليس عدد قيم الدرجة)
+        cumulative = []
+        running = 0
+        for s in scores_sorted:
+            running += score_table[s]["count"]
+            cumulative.append(running)
 
-    for s in scores_sorted:
-        current_group.append(s)
-        current_count += score_table[s]["count"]
-        if current_count >= target_per_group and len(groups) < 2:
-            groups.append(current_group)
-            current_group = []
-            current_count = 0
-    if current_group:
-        groups.append(current_group)
-    elif not groups:
-        groups.append(scores_sorted)
+        target1 = total_trades / 3
+        target2 = 2 * total_trades / 3
 
-    # دمج أي مجموعة فارغة محتملة بالمجموعة المجاورة
+        # أول فهرس تراكمي يتجاوز/يساوي كل هدف
+        cut1 = next(i for i, c in enumerate(cumulative) if c >= target1)
+        cut2 = next(i for i, c in enumerate(cumulative) if c >= target2)
+
+        # نضمن إن نقطة القطع الثانية بعد الأولى فعليًا (تكوين 3 مجموعات غير فارغة)
+        if cut2 <= cut1:
+            cut2 = min(cut1 + 1, len(scores_sorted) - 1)
+        if cut2 == len(scores_sorted) - 1 and cut1 == cut2:
+            cut1 = max(cut2 - 1, 0)
+
+        groups = [
+            scores_sorted[0:cut1 + 1],
+            scores_sorted[cut1 + 1:cut2 + 1],
+            scores_sorted[cut2 + 1:],
+        ]
+
+    # دمج أي مجموعة فارغة محتملة بالمجموعة المجاورة (يحدث فقط لو عدد قيم الدرجة صغير جدًا)
     groups = [g for g in groups if g]
 
     summarized = []
