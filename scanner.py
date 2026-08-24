@@ -881,18 +881,26 @@ def classify_official_score(score):
         return "ضعيفة"
 
 
-def classify_early_score(score):
+def classify_early_score(source):
     """
-    يحوّل درجة الإشارة المبكرة إلى تصنيف نصي (ضعيفة/قوية فقط حاليًا — مستويان لا 3،
-    لأن البيانات عند بعض الدرجات لا تزال قليلة جدًا للثقة بتقسيم أدق). بناءً على تحليل
-    score_ranges.py (أوت 2026):
-      -2.5 إلى 0.0  -> ضعيفة (74.0% نجاح، 50 صفقة)
-      0.5 فأعلى     -> قوية  (~90% نجاح، 31 صفقة)
+    يحوّل مصدر الإشارة المبكرة (early_source) إلى تصنيف نصي (ضعيفة/متوسطة/قوية).
+    مبني على المصدر لا على رقم الدرجة، لأن تحليل score_breakdown_by_factor.py أثبت
+    أن الدرجة السالبة/الموجبة لا تعني شيئًا ثابتًا بمعزل عن المصدر — فمثلاً "تراكم صامت"
+    يحافظ على نجاح مرتفع (88.9%-100%) عبر كل مستويات الدرجة تقريبًا، بعكس "انضغاط تقلب"
+    الذي تراجع أداؤه بثبات عند نفس مستويات الدرجة.
+    نسب النجاح الفعلية (trade_stats.py، 300 صفقة، أوت 2026):
+      تراكم صامت (accumulation)          -> قوية   (90% نجاح، 87 صفقة)
+      تراكم صامت + انضغاط تقلب (مزيج)     -> قوية   (المصدر الأقوى يحدد التصنيف)
+      انضغاط تقلب فقط (squeeze)          -> متوسطة (73% نجاح، 146 صفقة)
+    ملاحظة: هذان هما المصدران الوحيدان الفعليان حاليًا بـearly_source (extended مجرد
+    badge تحذيري منفصل، ليس مصدر إشارة) — الحالة الافتراضية أدناه شبكة أمان فقط.
     """
-    if score >= 0.5:
+    if source in ("accumulation", "accumulation+squeeze"):
         return "قوية"
+    elif source == "squeeze":
+        return "متوسطة"
     else:
-        return "ضعيفة"
+        return "متوسطة"
 
 
 def format_alert(r, market_caution=False):
@@ -961,7 +969,7 @@ def format_early_alert(r):
     lines = [
         f"{dot} {title}",
         r['symbol'].replace('USDT', '/USDT'),
-        f"القوة: {classify_early_score(r['score'])} ({r['score']:.1f}) | فريم: {INTERVAL}",
+        f"القوة: {classify_early_score(r.get('early_source'))} ({r['score']:.1f}) | فريم: {INTERVAL}",
     ]
     if source_label:
         lines.append(f"المصدر: {source_label}")
