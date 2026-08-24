@@ -158,9 +158,9 @@ def backtest_symbol(symbol, interval, klines, htf_klines, apply_extra_filters, s
                     open_trade = None
                     closed = True
 
-            # ج) انعكاس الاتجاه (EMA9/21) — نفس فحص trend_reversed في البوت الحي
+            # ج) انعكاس الاتجاه (EMA7/14 — نفس تعريف trend_up المستخدم فعليًا بـscore_at)
             if not closed and open_trade:
-                current_trend_up = ind["ema9"][i] > ind["ema21"][i]
+                current_trend_up = ind["ema7"][i] > ind["ema14"][i]
                 if current_trend_up != open_trade["trend_up"]:
                     open_trade.update(exit_price=price, exit_index=i, result="INVALIDATED")
                     trades.append(open_trade)
@@ -191,7 +191,7 @@ def backtest_symbol(symbol, interval, klines, htf_klines, apply_extra_filters, s
         if htf_ind and abs(r["score"]) >= 1:
             htf_idx = htf_index_for(klines[i][6], htf_close_times)
             if htf_idx is not None and htf_idx >= 21:
-                htf_up = htf_ind["ema9"][htf_idx] > htf_ind["ema21"][htf_idx]
+                htf_up = htf_ind["ema7"][htf_idx] > htf_ind["ema14"][htf_idx]
                 trend_dir = 1 if r["trend_up"] else -1
                 htf_aligned = htf_up == r["trend_up"]
                 final_score += (trend_dir * 0.5) if htf_aligned else (-trend_dir * 0.5)
