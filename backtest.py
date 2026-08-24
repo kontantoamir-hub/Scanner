@@ -50,11 +50,10 @@ FEE_PCT = float(os.environ.get("FEE_PCT", "0.1"))
 # لأنها أثبتت أداءً أفضل في الاختبارات السابقة). القيمة الأولى (2.5) هي الأساس الحالي في scanner.py.
 SCORE_THRESHOLDS = [float(x) for x in os.environ.get("SCORE_THRESHOLDS", "2.5,3.0,3.5,4.0").split(",")]
 
-# سقف أعلى للدرجة الرسمية — نفس MAX_OFFICIAL_SCORE في scanner.py. official_success_factors.py
-# على البيانات الحية أظهر أن فئة score>=3.5 هي الأضعف بثبات (25.6% من الفاشلة مقابل 10.9%
-# فقط من الناجحة على 246 صفقة)، فتحوّل الآن في الإنتاج من "عقوبة" إلى استبعاد صريح.
-# هنا نختبر هذا القرار على بيانات تاريخية أطول قبل التسليم بصحته على التتبع الحي القصير وحده.
-MAX_OFFICIAL_SCORE = float(os.environ.get("MAX_OFFICIAL_SCORE", "3.5"))
+# سقوف علوية للدرجة يُختبر عندها رفض الإشارات الأعلى منها (نفس فكرة MAX_OFFICIAL_SCORE
+# في scanner.py، لكن كقيم متعددة للمقارنة). القيمة 1000 تعني عمليًا "بدون سقف" (كخط أساس
+# للمقارنة)، و3.5 هي القيمة الحالية المفعّلة فعليًا بالبوت الحي.
+MAX_SCORE_CAPS = [float(x) for x in os.environ.get("MAX_SCORE_CAPS", "1000,3.5,3.0,2.5").split(",")]
 
 # عملات تُستثنى يدويًا من اختيار الباكتست (مثلاً للتحقق هل عملة واحدة ذات صفقة شاذة تحرّف
 # الـ EV الإجمالي). صيغة القيمة: أسماء مفصولة بفواصل، بنفس صيغة Binance (مثال: "COTIUSDT,BANKUSDT").
@@ -120,8 +119,7 @@ def htf_index_for(ltf_close_time, htf_close_times):
     return idx if idx >= 0 else None
 
 
-def backtest_symbol(symbol, interval, klines, htf_klines, apply_extra_filters, score_threshold=2.5,
-                     apply_score_cap=False):
+def backtest_symbol(symbol, interval, klines, htf_klines, apply_extra_filters, score_threshold=2.5, max_score_cap=None):
     ind = compute_indicators(klines)
     htf_ind = compute_indicators(htf_klines) if len(htf_klines) > 30 else None
     htf_close_times = [k[6] for k in htf_klines] if htf_ind else []
@@ -201,10 +199,10 @@ def backtest_symbol(symbol, interval, klines, htf_klines, apply_extra_filters, s
         strong = (
             final_score >= score_threshold and r["vol_confirm"] and persistent
         )
+        if max_score_cap is not None:
+            strong = strong and final_score < max_score_cap
         if apply_extra_filters:
             strong = strong and not r["ranging"] and not r["near_resistance"]
-        if apply_score_cap:
-            strong = strong and final_score < MAX_OFFICIAL_SCORE
 
         # فلتر الحد الأدنى للتقلب (ATR%) يُحسب لحظيًا عند الشمعة i، وليس آخر شمعة في السلسلة كلها
         atrv = atr_value_at(ind, i)
@@ -344,18 +342,6 @@ def main():
     summarize(trades_with_filters, f"مع الفلاتر الجديدة (ADX/انحراف/مقاومة/OBV) — عتبة {base_threshold}", unresolved_with)
     summarize(trades_without_filters, f"بدون الفلاتر الجديدة (المنطق القديم فقط) — عتبة {base_threshold}", unresolved_without)
 
-    # 1.5) نفس المقارنة، لكن مع تفعيل سقف MAX_OFFICIAL_SCORE — للتحقق المباشر من قرار
-    # استبعاد score>=3.5 على بيانات تاريخية أطول قبل تعميمه في الإنتاج
-    trades_with_cap, unresolved_cap = [], 0
-    for symbol, klines, htf_klines in symbol_data:
-        t_cap, u_cap = backtest_symbol(symbol, BACKTEST_INTERVAL, klines, htf_klines, True,
-                                        base_threshold, apply_score_cap=True)
-        trades_with_cap += t_cap
-        unresolved_cap += u_cap
-    summarize(trades_with_cap,
-              f"مع الفلاتر + سقف MAX_OFFICIAL_SCORE={MAX_OFFICIAL_SCORE} (استبعاد score عالٍ) — عتبة {base_threshold}",
-              unresolved_cap)
-
     # 2) اختبار العتبات الإضافية (مع الفلاتر فقط، لأنها أثبتت أنها الأفضل)
     threshold_summaries = [(base_threshold, trades_with_filters, unresolved_with)]
     for threshold in SCORE_THRESHOLDS[1:]:
@@ -380,6 +366,37 @@ def main():
         win_rate = sum(1 for p in pcts if p > 0) / len(pcts) * 100
         ev = sum(pcts) / len(pcts)
         print(f"{threshold:>8} | {len(trades_t):>8} | {win_rate:>11.1f}% | {ev:>+13.3f}%")
+
+    # 4) اختبار سقوف علوية مختلفة للدرجة (رفض الإشارات الأعلى من سقف معيّن)، بنفس عتبة
+    # الدخول الأساسية (base_threshold) — لمعرفة هل رفض الدرجات العالية جدًا يحسّن EV
+    # (بدل رفع عتبة الدخول الدنيا اللي أثبتت سابقًا أنها تزيد سوء الأداء بدل تحسينه)
+    print("\n" + "=" * 50)
+    print(f"اختبار سقوف علوية للدرجة (عتبة دخول ثابتة = {base_threshold}، مع الفلاتر)")
+    print("=" * 50)
+    cap_summaries = []
+    for cap in MAX_SCORE_CAPS:
+        trades_c, unresolved_c = [], 0
+        for symbol, klines, htf_klines in symbol_data:
+            t, u = backtest_symbol(symbol, BACKTEST_INTERVAL, klines, htf_klines, True,
+                                    base_threshold, max_score_cap=cap)
+            trades_c += t
+            unresolved_c += u
+        cap_label = "بدون سقف" if cap >= 1000 else str(cap)
+        summarize(trades_c, f"سقف الدرجة العليا = {cap_label} — عتبة دخول {base_threshold}", unresolved_c)
+        cap_summaries.append((cap_label, trades_c, unresolved_c))
+
+    print("\n" + "=" * 50)
+    print("جدول مقارنة سقوف الدرجة العليا")
+    print("=" * 50)
+    print(f"{'السقف':>10} | {'الصفقات':>8} | {'نسبة النجاح':>12} | {'EV صافي/صفقة':>14}")
+    for cap_label, trades_c, _ in cap_summaries:
+        if not trades_c:
+            print(f"{cap_label:>10} | {'0':>8} | {'-':>12} | {'-':>14}")
+            continue
+        pcts = [net_pct(t) for t in trades_c]
+        win_rate = sum(1 for p in pcts if p > 0) / len(pcts) * 100
+        ev = sum(pcts) / len(pcts)
+        print(f"{cap_label:>10} | {len(trades_c):>8} | {win_rate:>11.1f}% | {ev:>+13.3f}%")
 
 
 if __name__ == "__main__":
