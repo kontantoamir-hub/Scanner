@@ -863,6 +863,38 @@ def build_progress_text(pos):
     return base + "\n\n" + "\n".join(lines)
 
 
+def classify_official_score(score):
+    """
+    يحوّل درجة الإشارة الرسمية إلى تصنيف نصي (ضعيفة/متوسطة/قوية) بناءً على نجاح فعلي
+    محسوب من 354 صفقة مغلقة (score_ranges.py، أوت 2026):
+      1.5           -> قوية   (70.7% نجاح، 167 صفقة)
+      2.0 - 2.5     -> متوسطة (49.0% نجاح، 49 صفقة)
+      3.0 فأعلى     -> ضعيفة  (40.4% نجاح، 57 صفقة)
+    ملاحظة: هذه نطاقات ثابتة مبنية على تحليل تاريخي، لا تُحدَّث تلقائيًا — يُنصح بإعادة
+    تشغيل score_ranges.py دوريًا (كل شهر تقريبًا) ومراجعة هذه الحدود يدويًا إذا تغيّرت.
+    """
+    if score <= 1.5:
+        return "قوية"
+    elif score <= 2.5:
+        return "متوسطة"
+    else:
+        return "ضعيفة"
+
+
+def classify_early_score(score):
+    """
+    يحوّل درجة الإشارة المبكرة إلى تصنيف نصي (ضعيفة/قوية فقط حاليًا — مستويان لا 3،
+    لأن البيانات عند بعض الدرجات لا تزال قليلة جدًا للثقة بتقسيم أدق). بناءً على تحليل
+    score_ranges.py (أوت 2026):
+      -2.5 إلى 0.0  -> ضعيفة (74.0% نجاح، 50 صفقة)
+      0.5 فأعلى     -> قوية  (~90% نجاح، 31 صفقة)
+    """
+    if score >= 0.5:
+        return "قوية"
+    else:
+        return "ضعيفة"
+
+
 def format_alert(r, market_caution=False):
     is_buy = r["score"] >= 1.5
     dot = "🟢" if is_buy else "🔴"
@@ -888,7 +920,7 @@ def format_alert(r, market_caution=False):
     lines = [
         f"{dot} {title}",
         r['symbol'].replace('USDT', '/USDT'),
-        f"الدرجة: {r['score']:.1f} | فريم: {INTERVAL}{badge_txt}",
+        f"القوة: {classify_official_score(r['score'])} ({r['score']:.1f}) | فريم: {INTERVAL}{badge_txt}",
         f"السعر: {r['price']:.6g}",
     ]
 
@@ -929,7 +961,7 @@ def format_early_alert(r):
     lines = [
         f"{dot} {title}",
         r['symbol'].replace('USDT', '/USDT'),
-        f"الدرجة الحالية: {r['score']:.1f} | فريم: {INTERVAL}",
+        f"القوة: {classify_early_score(r['score'])} ({r['score']:.1f}) | فريم: {INTERVAL}",
     ]
     if source_label:
         lines.append(f"المصدر: {source_label}")
