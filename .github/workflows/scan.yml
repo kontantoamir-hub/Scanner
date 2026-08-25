@@ -28,4 +28,5 @@ jobs:
           GIST_ID: ${{ secrets.GIST_ID }}
           SCAN_INTERVAL: '1h'
           SCAN_DEPTH: '60'
+          MARKET_REGIME_ADX_THRESHOLD: '25'
         run: python scanner.py
