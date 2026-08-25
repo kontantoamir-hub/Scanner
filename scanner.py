@@ -184,6 +184,27 @@ def adx(highs, lows, closes, period=ADX_PERIOD):
     return out
 
 
+# عتبة ADX المستخدمة لتصنيف نظام السوق على الفريم الأعلى (منفصلة عن ADX_THRESHOLD
+# المستخدم لتصنيف "ranging" على فريم التحليل الأساسي، لإتاحة ضبط كل مستوى لوحده لاحقًا)
+MARKET_REGIME_ADX_THRESHOLD = float(os.environ.get("MARKET_REGIME_ADX_THRESHOLD", "25"))
+
+
+def classify_market_regime(htf_highs, htf_lows, htf_closes, htf_up):
+    """
+    يصنف حالة السوق على الفريم الأعلى: trending_up / trending_down / ranging.
+    يعتمد على ADX (قوة الاتجاه) محسوبًا على نفس شموع الفريم الأعلى المستخدمة أصلاً
+    لحساب htf_aligned (بدون أي طلب بيانات إضافي)، + اتجاه EMA7/14 (htf_up) لتحديد الجهة.
+    يرجع None لو العينة غير كافية لحساب ADX بثقة.
+    """
+    adx_series = adx(htf_highs, htf_lows, htf_closes)
+    htf_adx_val = next((v for v in reversed(adx_series) if v is not None), None)
+    if htf_adx_val is None:
+        return None
+    if htf_adx_val >= MARKET_REGIME_ADX_THRESHOLD:
+        return "trending_up" if htf_up else "trending_down"
+    return "ranging"
+
+
 def obv(closes, vols):
     """
     On-Balance Volume — يجمع الحجم مع اتجاه السعر، لكشف هل الحجم يدعم الحركة فعليًا
@@ -561,18 +582,24 @@ def analyze_symbol(t, interval):
 
         final_score = r["score"]
         htf_checked, htf_aligned = False, None
+        market_regime = None
         if abs(r["score"]) >= 0.5:
             htf = HTF_MAP.get(interval)
             if htf:
                 try:
                     htf_klines = fetch_klines(symbol, htf, 60)
                     htf_klines = drop_unclosed_candle(htf_klines)
+                    htf_highs = [float(k[2]) for k in htf_klines]
+                    htf_lows = [float(k[3]) for k in htf_klines]
                     htf_closes = [float(k[4]) for k in htf_klines]
                     htf_up = ema(htf_closes, 7)[-1] > ema(htf_closes, 14)[-1]
                     trend_dir = 1 if r["trend_up"] else -1
                     htf_aligned = htf_up == r["trend_up"]
                     final_score += (trend_dir * 0.5) if htf_aligned else (-trend_dir * 0.5)
                     htf_checked = True
+                    # تصنيف نظام السوق (trending_up/trending_down/ranging) على نفس شموع
+                    # الفريم الأعلى أعلاه — بدون أي طلب بيانات إضافي عن الشبكة
+                    market_regime = classify_market_regime(htf_highs, htf_lows, htf_closes, htf_up)
                 except Exception:
                     pass
 
@@ -697,6 +724,7 @@ def analyze_symbol(t, interval):
             "persistent": persistent,
             "htf_checked": htf_checked,
             "htf_aligned": htf_aligned,
+            "market_regime": market_regime,
             "ranging": r["ranging"],
             "divergence": r["divergence"],
             "near_resistance": r["near_resistance"],
@@ -1297,6 +1325,7 @@ def open_new_positions(positions, fresh_signals):
             "near_resistance": r.get("near_resistance"),
             "obv_confirm": r.get("obv_confirm"),
             "htf_aligned": r.get("htf_aligned"),
+            "market_regime": r.get("market_regime"),
             # message_id ونص رسالة الإشارة الأصلية -> تُستخدم لاحقًا لتعديل نفس الرسالة (شطب + نتيجة) عند الإغلاق
             "alert_message_id": r.get("_msg_id"),
             "alert_text": r.get("_alert_text"),
@@ -1341,6 +1370,7 @@ def open_new_early_positions(positions, fresh_early_signals):
             "near_resistance": r.get("near_resistance"),
             "obv_confirm": r.get("obv_confirm"),
             "htf_aligned": r.get("htf_aligned"),
+            "market_regime": r.get("market_regime"),
             "alert_message_id": r.get("_msg_id"),
             "alert_text": r.get("_alert_text"),
         })
@@ -1376,6 +1406,7 @@ def open_new_breakout_positions(positions, fresh_breakout_signals):
             "near_resistance": r.get("near_resistance"),
             "obv_confirm": r.get("obv_confirm"),
             "htf_aligned": r.get("htf_aligned"),
+            "market_regime": r.get("market_regime"),
             "alert_message_id": r.get("_msg_id"),
             "alert_text": r.get("_alert_text"),
         })
