@@ -13,7 +13,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, accuracy_score
 from sklearn.preprocessing import LabelEncoder
 
-CATEGORICAL_FIELDS = ["type", "early_source", "symbol", "timeframe"]
+CATEGORICAL_FIELDS = ["type", "early_source", "timeframe"]  # استُبعد symbol: تجربة أولى أظهرت هيمنته (0.417) على الأداء المُحتمل تحفظًا لعملات معينة لا تعميمًا حقيقيًا
 DIAGNOSTIC_FIELDS = [
     "rsi_state", "macd_bull", "bb_state", "vol_confirm",
     "ranging", "near_resistance", "obv_confirm", "htf_aligned",
