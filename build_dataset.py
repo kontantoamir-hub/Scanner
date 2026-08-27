@@ -33,6 +33,10 @@ EXTRA_FIELDS = [
     "timeframe",
 ]
 
+# حقول توقيت محتملة بسجل الصفقة (نستخدم أول حقل موجود لترتيب البيانات زمنيًا فعليًا،
+# بدل الاعتماد فقط على ترتيب العناصر بملف الـGist)
+TIMESTAMP_CANDIDATES = ["opened_at", "entry_time", "timestamp", "closed_at"]
+
 
 def fetch_gist_trades():
     if not GIST_TOKEN or not GIST_ID:
@@ -99,12 +103,29 @@ def build_dataframe(trades):
         for field in EXTRA_FIELDS:
             row[field] = trade.get(field)
 
+        # نحفظ أول حقل توقيت متوفر عشان نرتب الجدول زمنيًا لاحقًا (لضمان تقسيم تدريب/اختبار صحيح)
+        ts_value = None
+        for ts_field in TIMESTAMP_CANDIDATES:
+            if trade.get(ts_field):
+                ts_value = trade.get(ts_field)
+                break
+        row["_timestamp"] = ts_value
+
         row["label"] = label
         row["net_return_pct"] = net_return
         rows.append(row)
 
     print(f"تم بناء {len(rows)} صف صالح، وتجاهل {skipped} صفقة (ناقصة حقول أو بدون نتيجة واضحة)")
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+
+    # ترتيب زمني فعلي لو فيه حقل توقيت، وإلا نبقي ترتيب الملف الأصلي (بافتراض أنه من الأقدم للأحدث)
+    if "_timestamp" in df.columns and df["_timestamp"].notna().any():
+        df = df.sort_values("_timestamp", na_position="last").reset_index(drop=True)
+        print("تم ترتيب البيانات زمنيًا حسب حقل التوقيت المتوفر")
+    else:
+        print("⚠️ لا يوجد حقل توقيت بالسجلات — الترتيب الزمني يعتمد على ترتيب الملف الأصلي فقط")
+
+    return df
 
 
 def main():
