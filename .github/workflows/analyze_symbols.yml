@@ -1,0 +1,36 @@
+name: Analyze Symbol Accuracy
+
+on:
+  workflow_dispatch:
+    inputs:
+      min_trades:
+        description: "الحد الأدنى لعدد الصفقات لاعتبار العملة (دائمًا صح/خطأ)"
+        required: false
+        default: "3"
+      include_types:
+        description: "أنواع الصفقات المشمولة (مفصولة بفاصلة)"
+        required: false
+        default: "official,early,breakout"
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run symbol accuracy analysis
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          MIN_TRADES: ${{ github.event.inputs.min_trades }}
+          INCLUDE_TYPES: ${{ github.event.inputs.include_types }}
+        run: python symbol_accuracy.py
