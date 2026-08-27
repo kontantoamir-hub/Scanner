@@ -1,0 +1,36 @@
+name: Analyze Symbol Factors
+
+on:
+  workflow_dispatch:
+    inputs:
+      winning_symbols:
+        description: "عملات ناجحة دائمًا (مفصولة بفاصلة)"
+        required: false
+        default: "HEIUSDT,BONKUSDT"
+      losing_symbols:
+        description: "عملات فاشلة دائمًا (مفصولة بفاصلة)"
+        required: false
+        default: "ZROUSDT,ASTERUSDT,ETHFIUSDT,SOXLBUSDT,BMTUSDT,CRVUSDT,NILUSDT"
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run symbol factors analysis
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          WINNING_SYMBOLS: ${{ github.event.inputs.winning_symbols }}
+          LOSING_SYMBOLS: ${{ github.event.inputs.losing_symbols }}
+        run: python symbol_factors_report.py
