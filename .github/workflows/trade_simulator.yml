@@ -1,0 +1,32 @@
+name: Trade Simulator
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "عدد الأيام الماضية"
+        required: true
+        default: "10"
+      amount:
+        description: "المبلغ الثابت لكل صفقة ($)"
+        required: true
+        default: "50"
+
+jobs:
+  simulate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Run simulator
+        env:
+          GIST_RAW_URL: ${{ secrets.GIST_RAW_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python trade_simulator.py --days "${{ github.event.inputs.days }}" --amount "${{ github.event.inputs.amount }}"
