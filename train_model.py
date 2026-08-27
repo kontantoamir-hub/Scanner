@@ -47,7 +47,20 @@ def prepare_features(df):
         df["score"] = df["score"].fillna(0)
 
     feature_cols = [c for c in DIAGNOSTIC_FIELDS + CATEGORICAL_FIELDS + ["score"] if c in df.columns]
-    return df, feature_cols, encoders
+
+    # إسقاط أي ميزة بتباين صفري (قيمة واحدة ثابتة بكل الصفوف) — لا تفيد النموذج ولا تُحسب بالخطأ كمهمة
+    dropped = []
+    kept = []
+    for col in feature_cols:
+        if df[col].nunique(dropna=False) <= 1:
+            dropped.append(col)
+        else:
+            kept.append(col)
+
+    if dropped:
+        print(f"⚠️ تم إسقاط ميزات بتباين صفري (قيمة ثابتة بكل البيانات): {dropped}")
+
+    return df, kept, encoders
 
 
 def main():
@@ -74,6 +87,7 @@ def main():
         n_estimators=200,
         max_depth=5,          # عمق محدود لتفادي overfitting على عينة صغيرة
         min_samples_leaf=5,
+        class_weight="balanced",  # يعوّض عدم توازن الفئات (66.9% WIN مقابل 31.2% LOSS)
         random_state=42,
     )
     model.fit(X_train, y_train)
