@@ -50,6 +50,21 @@ def trade_return_pct(t):
     return net_pct
 
 
+def trade_return_pct_tp1(t):
+    """
+    نفس trade_return_pct، لكن للصفقات الرسمية: لو الهدف الأول (index 0) تحقق في أي وقت،
+    نحتسب الخروج عنده مباشرة (تجاهل ما حصل بعده — رجوع لـSL أو استمرار لبقية الأهداف)،
+    بدل انتظار الإغلاق الفعلي النهائي المسجّل بالبوت.
+    """
+    entry = t.get("entry")
+    tps = t.get("tps") or []
+    hit_tps = t.get("hit_tps") or []
+    if t.get("type") == "official" and entry and tps and 0 in hit_tps:
+        gross_pct = (tps[0] - entry) / entry * 100
+        return gross_pct - (2 * FEE_PCT_PER_SIDE)
+    return trade_return_pct(t)
+
+
 def simulate(trades, days, capital, max_concurrent, trade_type="all"):
     cutoff = dt.datetime.now() - dt.timedelta(days=days)
     slot_amount = capital / max_concurrent
@@ -96,7 +111,7 @@ def simulate(trades, days, capital, max_concurrent, trade_type="all"):
     wins = losses = 0
 
     for t in taken:
-        pct = trade_return_pct(t)
+        pct = trade_return_pct_tp1(t)
         if pct is None:
             continue
         profit = slot_amount * pct / 100
@@ -161,7 +176,11 @@ def format_message(days, res):
     if res["incomplete_warning"]:
         lines.append("⚠️ ملاحظة: بعض الصفقات الأقدم قد تكون انتقلت للأرشيف ولم تُحتسب هنا (السجل النشط محدود العدد).")
 
-    lines.append("(محاكاة واقعية: رأس المال مقسوم على شرائح متزامنة، والإشارات الزائدة عند امتلاء الشرائح تُتجاهل، بعد خصم رسوم تداول تقديرية 0.1% لكل جهة)")
+    note = "(محاكاة واقعية: رأس المال مقسوم على شرائح متزامنة، والإشارات الزائدة عند امتلاء الشرائح تُتجاهل، بعد خصم رسوم تداول تقديرية 0.1% لكل جهة"
+    if res["trade_type"] in ("all", "official"):
+        note += " — الصفقات الرسمية تُحسب بربح الهدف الأول فورًا إذا تحقق، بغض النظر عمّا حصل بعده"
+    note += ")"
+    lines.append(note)
     return "\n".join(lines)
 
 
