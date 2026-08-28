@@ -1,9 +1,13 @@
 """
-محاكي أرباح — يحسب كم كان الربح/الخسارة لو دخلت بمبلغ ثابت (مثلاً 50$) في كل صفقة
-أغلقها البوت خلال آخر N يوم، بالاعتماد على سجل closed_trades.json المحفوظ في الـGist.
+محاكي أرباح — يحاكي التداول الواقعي: رأس مال إجمالي مقسوم على عدد صفقات متزامنة أقصى
+(افتراضيًا 5). أي إشارة جديدة تجيك وكل الشرائح مشغولة تُتجاهل لحد ما تتحرر شريحة
+(صفقة موجودة توصل هدفها أو وقف خسارتها)، تمامًا متل واقع التداول الفعلي بمبلغ محدود.
 
-الاستخدام (نفس واجهة trade_simulator.yml):
-    python trade_simulator.py --days 10 --amount 50
+الاستخدام (نفس واجهة trade_simulator.yml — --amount هنا = رأس المال الإجمالي وليس لكل صفقة):
+    python trade_simulator.py --days 10 --amount 400
+
+عدد الصفقات المتزامنة قابل للتعديل عبر متغير بيئة اختياري TRADE_MAX_CONCURRENT
+(افتراضي 5) بدون الحاجة لتعديل ملف الـworkflow.
 """
 
 import os
@@ -20,6 +24,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 # نفس نسبة الرسوم المستخدمة سابقًا بـbacktest.py (0.1% لكل جهة = دخول وخروج)
 FEE_PCT_PER_SIDE = float(os.environ.get("TRADE_FEE_PCT", "0.1"))
+MAX_CONCURRENT = int(os.environ.get("TRADE_MAX_CONCURRENT", "5"))
 
 TYPE_LABELS = {"official": "رسمية", "early": "مبكرة", "breakout": "انفجار"}
 
@@ -45,18 +50,24 @@ def trade_return_pct(t):
     return net_pct
 
 
-def simulate(trades, days, amount):
+def simulate(trades, days, capital, max_concurrent):
     cutoff = dt.datetime.now() - dt.timedelta(days=days)
-    closed = []
+    slot_amount = capital / max_concurrent
+
+    # نأخذ الصفقات اللي فُتحت خلال الفترة المطلوبة (هذا وقت "اتخاذ القرار" الفعلي)
+    window = []
     for t in trades:
-        if not t.get("closed_at"):
+        if not t.get("opened_at") or not t.get("closed_at"):
             continue
         try:
+            opened_at = parse_dt(t["opened_at"])
             closed_at = parse_dt(t["closed_at"])
         except Exception:
             continue
-        if closed_at >= cutoff:
-            closed.append(t)
+        if opened_at >= cutoff:
+            window.append({**t, "_opened_at": opened_at, "_closed_at": closed_at})
+
+    window.sort(key=lambda t: t["_opened_at"])
 
     incomplete_warning = False
     if trades:
@@ -64,15 +75,27 @@ def simulate(trades, days, amount):
         if oldest and oldest > cutoff:
             incomplete_warning = True  # السجل النشط قد لا يغطي كامل الفترة المطلوبة (صفقات أقدم انتقلت للأرشيف)
 
+    open_slots = []  # قائمة أوقات إغلاق الصفقات المشغولة حاليًا
+    taken, skipped = [], 0
+
+    for t in window:
+        # حرّر أي شريحة انتهت صفقتها قبل لحظة فتح هذه الصفقة
+        open_slots = [c for c in open_slots if c > t["_opened_at"]]
+        if len(open_slots) < max_concurrent:
+            open_slots.append(t["_closed_at"])
+            taken.append(t)
+        else:
+            skipped += 1
+
     by_type = {}
     total_profit = 0.0
     wins = losses = 0
 
-    for t in closed:
+    for t in taken:
         pct = trade_return_pct(t)
         if pct is None:
             continue
-        profit = amount * pct / 100
+        profit = slot_amount * pct / 100
         total_profit += profit
         if pct > 0:
             wins += 1
@@ -90,30 +113,38 @@ def simulate(trades, days, amount):
 
     n = wins + losses
     win_rate = round(wins / n * 100, 1) if n else 0.0
-    invested = amount * n
 
     return {
         "n": n,
+        "skipped": skipped,
         "wins": wins,
         "losses": losses,
         "win_rate": win_rate,
-        "invested": invested,
+        "capital": capital,
+        "slot_amount": round(slot_amount, 2),
+        "max_concurrent": max_concurrent,
         "total_profit": round(total_profit, 2),
+        "final_balance": round(capital + total_profit, 2),
         "by_type": by_type,
         "incomplete_warning": incomplete_warning,
     }
 
 
-def format_message(days, amount, res):
-    lines = [f"💰 محاكاة أرباح آخر {days} يوم (بدخول {amount:.0f}$ لكل صفقة)"]
+def format_message(days, res):
+    lines = [
+        f"💰 محاكاة أرباح آخر {days} يوم — رأس مال {res['capital']:.0f}$ "
+        f"({res['max_concurrent']} صفقات متزامنة كحد أقصى، {res['slot_amount']:.0f}$ لكل شريحة)"
+    ]
     if res["n"] == 0:
-        lines.append("لا توجد صفقات مغلقة خلال هذه الفترة.")
+        lines.append("لا توجد صفقات دخلت خلال هذه الفترة (بحدود رأس المال والتزامن المحدد).")
         return "\n".join(lines)
 
     sign = "🟢" if res["total_profit"] >= 0 else "🔴"
-    lines.append(f"عدد الصفقات: {res['n']} (رابحة {res['wins']} / خاسرة {res['losses']} — نجاح {res['win_rate']}%)")
-    lines.append(f"إجمالي رأس المال المستخدم: {res['invested']:.0f}$")
+    lines.append(f"عدد الصفقات المنفذة: {res['n']} (رابحة {res['wins']} / خاسرة {res['losses']} — نجاح {res['win_rate']}%)")
+    if res["skipped"]:
+        lines.append(f"⏭️ إشارات تم تجاهلها لعدم توفر شريحة فارغة: {res['skipped']}")
     lines.append(f"{sign} صافي الربح/الخسارة: {res['total_profit']:+.2f}$")
+    lines.append(f"الرصيد: {res['capital']:.0f}$ ← {res['final_balance']:.2f}$")
 
     if res["by_type"]:
         lines.append("— حسب النوع —")
@@ -124,7 +155,7 @@ def format_message(days, amount, res):
     if res["incomplete_warning"]:
         lines.append("⚠️ ملاحظة: بعض الصفقات الأقدم قد تكون انتقلت للأرشيف ولم تُحتسب هنا (السجل النشط محدود العدد).")
 
-    lines.append("(الأرقام تفترض دخول متتالٍ بمبلغ ثابت لكل صفقة، بعد خصم رسوم تداول تقديرية 0.1% لكل جهة)")
+    lines.append("(محاكاة واقعية: رأس المال مقسوم على شرائح متزامنة، والإشارات الزائدة عند امتلاء الشرائح تُتجاهل، بعد خصم رسوم تداول تقديرية 0.1% لكل جهة)")
     return "\n".join(lines)
 
 
@@ -147,12 +178,12 @@ def send_telegram(text):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--days", type=int, default=10)
-    parser.add_argument("--amount", type=float, default=50)
+    parser.add_argument("--amount", type=float, default=400, help="رأس المال الإجمالي (وليس لكل صفقة)")
     args = parser.parse_args()
 
     trades = fetch_closed_trades()
-    res = simulate(trades, args.days, args.amount)
-    message = format_message(args.days, args.amount, res)
+    res = simulate(trades, args.days, args.amount, MAX_CONCURRENT)
+    message = format_message(args.days, res)
 
     print(message)
     send_telegram(message)
