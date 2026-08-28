@@ -7,9 +7,12 @@
 """
 
 import os
+import json
 import argparse
 import datetime as dt
-import requests
+import urllib.request
+import urllib.parse
+import urllib.error
 
 GIST_RAW_URL = os.environ.get("GIST_RAW_URL")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -24,9 +27,8 @@ TYPE_LABELS = {"official": "رسمية", "early": "مبكرة", "breakout": "ا�
 def fetch_closed_trades():
     if not GIST_RAW_URL:
         raise SystemExit("❌ GIST_RAW_URL غير موجود بالأسرار (secrets).")
-    r = requests.get(GIST_RAW_URL, timeout=15)
-    r.raise_for_status()
-    return r.json()
+    with urllib.request.urlopen(GIST_RAW_URL, timeout=15) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
 
 def parse_dt(s):
@@ -131,13 +133,13 @@ def send_telegram(text):
         print("⚠️ TELEGRAM_BOT_TOKEN أو TELEGRAM_CHAT_ID غير موجودين — سيتم الاكتفاء بالطباعة.")
         return
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
-            timeout=15,
-        )
-        if not r.ok:
-            print("فشل إرسال رسالة تيليجرام:", r.text)
+        data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": text}).encode("utf-8")
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        req = urllib.request.Request(url, data=data, method="POST")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp.read()
+    except urllib.error.HTTPError as e:
+        print("فشل إرسال رسالة تيليجرام:", e.read().decode("utf-8", "ignore"))
     except Exception as e:
         print("خطأ إرسال تيليجرام:", e)
 
