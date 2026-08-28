@@ -1,182 +1,159 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-محاكي أرباح البوت (Trade Simulator)
-------------------------------------
-يحسب: لو دخلت بمبلغ ثابت (مثلاً 50$) في كل صفقة أغلقها البوت خلال آخر N يوم،
-كم كانت النتيجة الإجمالية (ربح/خسارة)، مع سرد الصفقات الرابحة والخاسرة.
+محاكي أرباح — يحسب كم كان الربح/الخسارة لو دخلت بمبلغ ثابت (مثلاً 50$) في كل صفقة
+أغلقها البوت خلال آخر N يوم، بالاعتماد على سجل closed_trades.json المحفوظ في الـGist.
 
-البيانات تُسحب تلقائيًا من ملف closed_trades.json داخل الـ Gist بتاعك.
-
-الاستخدام:
+الاستخدام (نفس واجهة trade_simulator.yml):
     python trade_simulator.py --days 10 --amount 50
-
-الإعداد المطلوب مرة واحدة فقط:
-    عدّل GIST_RAW_URL بالأسفل ليشير إلى الرابط الخام (Raw) لملف closed_trades.json
-    في الـ Gist بتاعك. مثال على شكل الرابط:
-    https://gist.githubusercontent.com/<username>/<gist_id>/raw/closed_trades.json
-
-    ملاحظة: روابط raw.githubusercontent.com للـ Gist أحيانًا تُخزَّن مؤقتًا (cache).
-    إذا لاحظت أن البيانات قديمة، استخدم رابط الـ API بدلاً منه (انظر التعليق تحت المتغير).
 """
 
+import os
 import argparse
-import json
-import sys
-from datetime import datetime, timedelta, timezone
-from urllib.request import urlopen
-from urllib.error import URLError
+import datetime as dt
+import requests
 
-# =========================================================
-# إعداد: ضع هنا رابط الـ Gist الخام لملف closed_trades.json
-# =========================================================
-GIST_RAW_URL = "PASTE_YOUR_GIST_RAW_URL_HERE"
+GIST_RAW_URL = os.environ.get("GIST_RAW_URL")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# بديل أدق (يتجاوز الكاش): استخدم الـ Gist ID عبر GitHub API
-# GIST_API_URL = "https://api.github.com/gists/<GIST_ID>"
-# GIST_FILENAME = "closed_trades.json"
+# نفس نسبة الرسوم المستخدمة سابقًا بـbacktest.py (0.1% لكل جهة = دخول وخروج)
+FEE_PCT_PER_SIDE = float(os.environ.get("TRADE_FEE_PCT", "0.1"))
+
+TYPE_LABELS = {"official": "رسمية", "early": "مبكرة", "breakout": "انفجار"}
 
 
-def fetch_trades():
-    """يجلب قائمة الصفقات المغلقة من الـ Gist."""
-    if "PASTE_YOUR_GIST_RAW_URL_HERE" in GIST_RAW_URL:
-        print("⚠️  لم تقم بضبط GIST_RAW_URL في أعلى الملف بعد.")
-        print("افتح trade_simulator.py وضع رابط raw لملف closed_trades.json من الـ Gist بتاعك.")
-        sys.exit(1)
-    try:
-        with urlopen(GIST_RAW_URL, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except URLError as e:
-        print(f"❌ فشل الاتصال بالـ Gist: {e}")
-        sys.exit(1)
-    except json.JSONDecodeError as e:
-        print(f"❌ الملف الناتج ليس JSON صالح: {e}")
-        sys.exit(1)
-
-    # قد يكون الملف قائمة مباشرة أو dict فيه مفتاح trades
-    if isinstance(data, dict):
-        for key in ("trades", "closed_trades", "data"):
-            if key in data:
-                return data[key]
-        # لو dict لكن بدون مفتاح معروف، افترض أن القيم نفسها الصفقات
-        return list(data.values())
-    return data
+def fetch_closed_trades():
+    if not GIST_RAW_URL:
+        raise SystemExit("❌ GIST_RAW_URL غير موجود بالأسرار (secrets).")
+    r = requests.get(GIST_RAW_URL, timeout=15)
+    r.raise_for_status()
+    return r.json()
 
 
-def parse_close_time(trade):
-    """يحاول استخراج تاريخ إغلاق الصفقة من أسماء حقول مختلفة محتملة."""
-    for key in ("closed_at", "close_time", "closedAt", "close_date", "timestamp"):
-        if key in trade and trade[key]:
-            raw = trade[key]
-            try:
-                if isinstance(raw, (int, float)):
-                    return datetime.fromtimestamp(raw, tz=timezone.utc)
-                # يدعم صيغ ISO المختلفة بما فيها Z
-                return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-            except (ValueError, TypeError):
-                continue
-    return None
+def parse_dt(s):
+    return dt.datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
 
 
-def get_pnl_pct(trade):
-    """يحاول استخراج نسبة الربح/الخسارة من أسماء حقول مختلفة محتملة."""
-    for key in ("pnl_pct", "profit_pct", "pnl_percent", "change_pct", "result_pct"):
-        if key in trade and trade[key] is not None:
-            try:
-                return float(trade[key])
-            except (ValueError, TypeError):
-                continue
-    # كحل أخير: احسبها من سعر الدخول والخروج لو متوفرين
-    entry = trade.get("entry_price") or trade.get("entry")
-    exitp = trade.get("exit_price") or trade.get("close_price")
-    if entry and exitp:
+def trade_return_pct(t):
+    """العائد الصافي% لصفقة واحدة (شراء فوري فقط)، بعد خصم رسوم الدخول والخروج."""
+    entry, exit_price = t.get("entry"), t.get("exit_price")
+    if not entry or not exit_price:
+        return None
+    gross_pct = (exit_price - entry) / entry * 100
+    net_pct = gross_pct - (2 * FEE_PCT_PER_SIDE)
+    return net_pct
+
+
+def simulate(trades, days, amount):
+    cutoff = dt.datetime.now() - dt.timedelta(days=days)
+    closed = []
+    for t in trades:
+        if not t.get("closed_at"):
+            continue
         try:
-            return (float(exitp) - float(entry)) / float(entry) * 100
-        except (ValueError, TypeError, ZeroDivisionError):
-            return None
-    return None
+            closed_at = parse_dt(t["closed_at"])
+        except Exception:
+            continue
+        if closed_at >= cutoff:
+            closed.append(t)
+
+    incomplete_warning = False
+    if trades:
+        oldest = min((parse_dt(t["closed_at"]) for t in trades if t.get("closed_at")), default=None)
+        if oldest and oldest > cutoff:
+            incomplete_warning = True  # السجل النشط قد لا يغطي كامل الفترة المطلوبة (صفقات أقدم انتقلت للأرشيف)
+
+    by_type = {}
+    total_profit = 0.0
+    wins = losses = 0
+
+    for t in closed:
+        pct = trade_return_pct(t)
+        if pct is None:
+            continue
+        profit = amount * pct / 100
+        total_profit += profit
+        if pct > 0:
+            wins += 1
+        elif pct < 0:
+            losses += 1
+
+        ttype = t.get("type", "official")
+        b = by_type.setdefault(ttype, {"count": 0, "profit": 0.0, "wins": 0, "losses": 0})
+        b["count"] += 1
+        b["profit"] += profit
+        if pct > 0:
+            b["wins"] += 1
+        elif pct < 0:
+            b["losses"] += 1
+
+    n = wins + losses
+    win_rate = round(wins / n * 100, 1) if n else 0.0
+    invested = amount * n
+
+    return {
+        "n": n,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "invested": invested,
+        "total_profit": round(total_profit, 2),
+        "by_type": by_type,
+        "incomplete_warning": incomplete_warning,
+    }
 
 
-def get_symbol(trade):
-    return trade.get("symbol") or trade.get("pair") or trade.get("coin") or "غير معروف"
+def format_message(days, amount, res):
+    lines = [f"💰 محاكاة أرباح آخر {days} يوم (بدخول {amount:.0f}$ لكل صفقة)"]
+    if res["n"] == 0:
+        lines.append("لا توجد صفقات مغلقة خلال هذه الفترة.")
+        return "\n".join(lines)
+
+    sign = "🟢" if res["total_profit"] >= 0 else "🔴"
+    lines.append(f"عدد الصفقات: {res['n']} (رابحة {res['wins']} / خاسرة {res['losses']} — نجاح {res['win_rate']}%)")
+    lines.append(f"إجمالي رأس المال المستخدم: {res['invested']:.0f}$")
+    lines.append(f"{sign} صافي الربح/الخسارة: {res['total_profit']:+.2f}$")
+
+    if res["by_type"]:
+        lines.append("— حسب النوع —")
+        for ttype, b in res["by_type"].items():
+            label = TYPE_LABELS.get(ttype, ttype)
+            lines.append(f"{label}: {b['count']} صفقة | {b['profit']:+.2f}$ | نجاح {round(b['wins']/(b['wins']+b['losses'])*100,1) if (b['wins']+b['losses']) else 0}%")
+
+    if res["incomplete_warning"]:
+        lines.append("⚠️ ملاحظة: بعض الصفقات الأقدم قد تكون انتقلت للأرشيف ولم تُحتسب هنا (السجل النشط محدود العدد).")
+
+    lines.append("(الأرقام تفترض دخول متتالٍ بمبلغ ثابت لكل صفقة، بعد خصم رسوم تداول تقديرية 0.1% لكل جهة)")
+    return "\n".join(lines)
 
 
-def get_reason(trade):
-    return trade.get("close_reason") or trade.get("reason") or trade.get("status") or "-"
+def send_telegram(text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ TELEGRAM_BOT_TOKEN أو TELEGRAM_CHAT_ID غير موجودين — سيتم الاكتفاء بالطباعة.")
+        return
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            timeout=15,
+        )
+        if not r.ok:
+            print("فشل إرسال رسالة تيليجرام:", r.text)
+    except Exception as e:
+        print("خطأ إرسال تيليجرام:", e)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="محاكي أرباح البوت خلال فترة معينة")
-    parser.add_argument("--days", type=int, required=True, help="عدد الأيام الماضية للحساب (مثال: 10)")
-    parser.add_argument("--amount", type=float, required=True, help="المبلغ الثابت بالدولار لكل صفقة (مثال: 50)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--days", type=int, default=10)
+    parser.add_argument("--amount", type=float, default=50)
     args = parser.parse_args()
 
-    trades = fetch_trades()
-    if not trades:
-        print("لا توجد صفقات مغلقة في الملف.")
-        return
+    trades = fetch_closed_trades()
+    res = simulate(trades, args.days, args.amount)
+    message = format_message(args.days, args.amount, res)
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=args.days)
-
-    winners = []
-    losers = []
-    skipped = 0
-
-    for t in trades:
-        close_time = parse_close_time(t)
-        if close_time is None:
-            skipped += 1
-            continue
-        if close_time.tzinfo is None:
-            close_time = close_time.replace(tzinfo=timezone.utc)
-        if close_time < cutoff:
-            continue
-
-        pnl_pct = get_pnl_pct(t)
-        if pnl_pct is None:
-            skipped += 1
-            continue
-
-        profit_usd = args.amount * (pnl_pct / 100)
-        entry = {
-            "symbol": get_symbol(t),
-            "pnl_pct": pnl_pct,
-            "profit_usd": profit_usd,
-            "reason": get_reason(t),
-            "close_time": close_time,
-        }
-        if pnl_pct >= 0:
-            winners.append(entry)
-        else:
-            losers.append(entry)
-
-    total_trades = len(winners) + len(losers)
-    total_profit = sum(w["profit_usd"] for w in winners) + sum(l["profit_usd"] for l in losers)
-    win_rate = (len(winners) / total_trades * 100) if total_trades else 0
-    invested = total_trades * args.amount
-
-    print("=" * 50)
-    print(f"📊 نتيجة محاكاة دخول {args.amount:.2f}$ في كل صفقة خلال آخر {args.days} يوم")
-    print("=" * 50)
-
-    if winners:
-        print(f"\n✅ الصفقات الرابحة ({len(winners)}):")
-        for w in sorted(winners, key=lambda x: x["pnl_pct"], reverse=True):
-            print(f"  {w['symbol']:<12} +{w['pnl_pct']:.2f}%  →  +{w['profit_usd']:.2f}$   ({w['reason']})")
-
-    if losers:
-        print(f"\n❌ الصفقات الخاسرة ({len(losers)}):")
-        for l in sorted(losers, key=lambda x: x["pnl_pct"]):
-            print(f"  {l['symbol']:<12} {l['pnl_pct']:.2f}%  →  {l['profit_usd']:.2f}$   ({l['reason']})")
-
-    print("\n" + "-" * 50)
-    print(f"عدد الصفقات المحسوبة: {total_trades}  (تم تجاهل {skipped} بسبب بيانات ناقصة)")
-    print(f"نسبة الربح (Win Rate): {win_rate:.1f}%")
-    print(f"إجمالي رأس المال المفترض دخوله: {invested:.2f}$")
-    print(f"النتيجة الصافية: {'+' if total_profit >= 0 else ''}{total_profit:.2f}$")
-    if invested:
-        print(f"نسبة العائد على رأس المال: {(total_profit/invested*100):+.2f}%")
-    print("=" * 50)
+    print(message)
+    send_telegram(message)
 
 
 if __name__ == "__main__":
