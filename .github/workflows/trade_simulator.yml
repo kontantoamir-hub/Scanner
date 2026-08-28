@@ -8,9 +8,18 @@ on:
         required: true
         default: "10"
       amount:
-        description: "المبلغ الثابت لكل صفقة ($)"
+        description: "رأس المال الإجمالي ($)"
         required: true
-        default: "50"
+        default: "400"
+      trade_type:
+        description: "نوع الصفقات المُحتسبة"
+        required: true
+        type: choice
+        options:
+          - all
+          - official
+          - early
+        default: all
 
 jobs:
   simulate:
@@ -29,4 +38,4 @@ jobs:
           GIST_RAW_URL: ${{ secrets.GIST_RAW_URL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python trade_simulator.py --days "${{ github.event.inputs.days }}" --amount "${{ github.event.inputs.amount }}"
+        run: python trade_simulator.py --days "${{ github.event.inputs.days }}" --amount "${{ github.event.inputs.amount }}" --type "${{ github.event.inputs.trade_type }}"
