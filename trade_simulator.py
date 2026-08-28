@@ -50,14 +50,18 @@ def trade_return_pct(t):
     return net_pct
 
 
-def simulate(trades, days, capital, max_concurrent):
+def simulate(trades, days, capital, max_concurrent, trade_type="all"):
     cutoff = dt.datetime.now() - dt.timedelta(days=days)
     slot_amount = capital / max_concurrent
 
     # نأخذ الصفقات اللي فُتحت خلال الفترة المطلوبة (هذا وقت "اتخاذ القرار" الفعلي)
+    # مع فلترة النوع إذا حُدد (رسمية فقط / مبكرة فقط) — الإشارات من نوع آخر تُتجاهل بالكامل
+    # وما تنافس على الشرائح أصلًا (كأنك ما شفتها من الأساس)
     window = []
     for t in trades:
         if not t.get("opened_at") or not t.get("closed_at"):
+            continue
+        if trade_type != "all" and t.get("type", "official") != trade_type:
             continue
         try:
             opened_at = parse_dt(t["opened_at"])
@@ -123,6 +127,7 @@ def simulate(trades, days, capital, max_concurrent):
         "capital": capital,
         "slot_amount": round(slot_amount, 2),
         "max_concurrent": max_concurrent,
+        "trade_type": trade_type,
         "total_profit": round(total_profit, 2),
         "final_balance": round(capital + total_profit, 2),
         "by_type": by_type,
@@ -131,8 +136,9 @@ def simulate(trades, days, capital, max_concurrent):
 
 
 def format_message(days, res):
+    type_label = "الكل" if res["trade_type"] == "all" else TYPE_LABELS.get(res["trade_type"], res["trade_type"])
     lines = [
-        f"💰 محاكاة أرباح آخر {days} يوم — رأس مال {res['capital']:.0f}$ "
+        f"💰 محاكاة أرباح آخر {days} يوم — نوع الصفقات: {type_label} — رأس مال {res['capital']:.0f}$ "
         f"({res['max_concurrent']} صفقات متزامنة كحد أقصى، {res['slot_amount']:.0f}$ لكل شريحة)"
     ]
     if res["n"] == 0:
@@ -179,10 +185,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--days", type=int, default=10)
     parser.add_argument("--amount", type=float, default=400, help="رأس المال الإجمالي (وليس لكل صفقة)")
+    parser.add_argument("--type", type=str, default="all", choices=["all", "official", "early", "breakout"])
     args = parser.parse_args()
 
     trades = fetch_closed_trades()
-    res = simulate(trades, args.days, args.amount, MAX_CONCURRENT)
+    res = simulate(trades, args.days, args.amount, MAX_CONCURRENT, args.type)
     message = format_message(args.days, res)
 
     print(message)
