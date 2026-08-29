@@ -8,6 +8,9 @@ trade_stats.py — تقرير مستقل لإحصائيات الصفقات ال�
 - نسبة الربح ونسبة الخسارة لكل فئة
 - تصنيف حسب نوع الإشارة (رسمية / مبكرة / انفجار)، مع مجموع نسب الربح الإجمالية لكل
   الصفقات الرابحة ومجموع نسب الخسارة الإجمالية لكل الصفقات الخاسرة (رسمية ومبكرة فقط)
+- لصفقات الرسمية تحديدًا: تفصيل إضافي حسب logic_version (قديم بدون الحقل = منطق ما قبل
+  بوابتي htf_aligned/market_regime الإلزاميتين، جديد = logic_version موجود) — كي يمكن قياس
+  أثر التعديل الأخير على الرسمية بدقة دون تلوّث النتائج بخلط المنطقين معًا
 - لكل صفقة رسمية أو مبكرة: نوع المؤشر (المؤشرات) التي كانت حاضرة وقت الدخول والنتيجة
 - لكل صفقة انفجار: عوامل جودة الاختراق (دعم الاتجاه / MACD / RSI) والنتيجة
   (مؤشرات Squeeze/Accumulation/Divergence لا تُحسب لصفقات الانفجار لأنها غير محسوبة أصلاً
@@ -76,6 +79,12 @@ BASE_INDICATOR_LABELS = {
 }
 
 TYPE_LABELS = {"official": "رسمية", "early": "مبكرة", "breakout": "انفجار"}
+
+# تسمية نسخ منطق فلترة الإشارة الرسمية (تطابق OFFICIAL_LOGIC_VERSION في scanner.py)
+LOGIC_VERSION_LABELS = {
+    None: "قديم (قبل بوابتي htf_aligned/market_regime)",
+    2: "جديد (htf_aligned + market_regime إلزاميان)",
+}
 
 
 def _gist_headers():
@@ -196,6 +205,8 @@ def build_report(trades):
     # أصلاً من البوت. لكل نوع نجمع أيضًا مجموع نسب الربح لكل الصفقات الرابحة ومجموع نسب
     # الخسارة لكل الصفقات الخاسرة (win_pnl_sum / loss_pnl_sum).
     type_stats = {}
+    # --- تصنيف الرسمية فقط، إضافيًا، حسب logic_version (قديم/جديد) ---
+    logic_version_stats = {}
     for t in trades:
         outcome = classify(t)
         if outcome == "neutral":
@@ -212,6 +223,19 @@ def build_report(trades):
                 s["win_pnl_sum"] += pnl
             else:
                 s["loss_pnl_sum"] += pnl
+
+        if ttype == "official":
+            lv = t.get("logic_version")  # None = قديم، 2 = جديد (بعد بوابتي htf_aligned/market_regime)
+            ls = logic_version_stats.setdefault(
+                lv, {"total": 0, "win": 0, "loss": 0, "win_pnl_sum": 0.0, "loss_pnl_sum": 0.0}
+            )
+            ls["total"] += 1
+            ls[outcome] += 1
+            if pnl is not None:
+                if outcome == "win":
+                    ls["win_pnl_sum"] += pnl
+                else:
+                    ls["loss_pnl_sum"] += pnl
 
     # --- نجاح كل مؤشر على حدة (رسمية/مبكرة فقط) ---
     indicator_stats = {k: {"total": 0, "win": 0, "loss": 0} for k in INDICATOR_KEYS}
@@ -292,6 +316,24 @@ def build_report(trades):
         if ttype in ("official", "early"):
             line += f" | مجموع ربح الرابحة: {s['win_pnl_sum']:+.2f}% | مجموع خسارة الخاسرة: {s['loss_pnl_sum']:+.2f}%"
         lines.append(line)
+
+    # --- تفصيل الرسمية حسب logic_version (قديم/جديد) ---
+    if logic_version_stats:
+        lines.append("")
+        lines.append("— الرسمية فقط: مقارنة قديم/جديد (logic_version) —")
+        for lv in sorted(logic_version_stats.keys(), key=lambda x: (x is None, x)):
+            ls = logic_version_stats[lv]
+            if ls["total"] == 0:
+                continue
+            wr = ls["win"] / ls["total"] * 100
+            label = LOGIC_VERSION_LABELS.get(lv, f"غير معروف ({lv})")
+            lines.append(
+                f"{label}: {ls['total']} صفقة | نجاح {wr:.0f}% (رابحة {ls['win']} / خاسرة {ls['loss']}) "
+                f"| مجموع ربح الرابحة: {ls['win_pnl_sum']:+.2f}% | مجموع خسارة الخاسرة: {ls['loss_pnl_sum']:+.2f}%"
+            )
+        new_total = logic_version_stats.get(2, {}).get("total", 0)
+        if new_total < 30:
+            lines.append(f"⚠️ عدد صفقات المنطق الجديد لسه قليل ({new_total}) — المقارنة أولية فقط")
 
     lines.append("")
     lines.append("— نسبة النجاح حسب المؤشر (رسمية/مبكرة) —")
