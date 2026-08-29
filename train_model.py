@@ -9,6 +9,10 @@ train_model.py — تجريبي فقط
   بعينة صغيرة، مع الحفاظ على الترتيب الزمني بكل طية (fold)
 - إبقاء هولدأوت نهائي (آخر 20% من البيانات) كـ"اختبار تقدّمي" (forward-test) منفصل عن الـCV،
   يُقيَّم مرة واحدة فقط بعد اختيار الإعدادات، وليس جزءًا من عملية الاختيار نفسها
+- إضافة market_regime كـfeature (لو موجود بـdataset.csv) — محاولة لتفسير التذبذب الكبير
+  بالدقة بين الطيات اللي ظهر بالتجربة الأولى (احتمال أن قواعد النجاح تختلف حسب حالة السوق)
+- مقارنة صريحة بين class_weight="balanced" وبدونه بمرحلة الهولدأوت، لأن "balanced" اشتبهنا
+  إنه يخرّب precision فئة WIN النادرة (خصوصًا بالرسمية) بدل ما يفيد
 
 تنبيه: العدد الحالي من الصفقات صغير نسبيًا خصوصًا بعد الفصل حسب النوع —
 هذا فقط لأخذ فكرة أولية عن الاتجاه، وليس للاعتماد عليه بقرار فعلي.
@@ -22,7 +26,8 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, accuracy_score
 from sklearn.preprocessing import LabelEncoder
 
-CATEGORICAL_FIELDS = ["type", "early_source", "timeframe"]  # استُبعد symbol: تجربة أولى أظهرت هيمنته (0.417) على الأداء المُحتمل تحفظًا لعملات معينة لا تعميمًا حقيقيًا
+# استُبعد symbol: تجربة أولى أظهرت هيمنته (0.417) على الأداء المُحتمل تحفظًا لعملات معينة لا تعميمًا حقيقيًا
+CATEGORICAL_FIELDS = ["type", "early_source", "timeframe", "market_regime"]
 DIAGNOSTIC_FIELDS = [
     "rsi_state", "macd_bull", "bb_state", "vol_confirm",
     "ranging", "near_resistance", "obv_confirm", "htf_aligned",
@@ -74,28 +79,29 @@ def prepare_features(df, drop_type_column):
     return df, kept, encoders
 
 
-def make_model():
+def make_model(balanced):
     return RandomForestClassifier(
         n_estimators=200,
         max_depth=5,          # عمق محدود لتفادي overfitting على عينة صغيرة
         min_samples_leaf=5,
-        class_weight="balanced",  # يعوّض عدم توازن الفئات
+        class_weight="balanced" if balanced else None,
         random_state=42,
     )
 
 
-def run_time_series_cv(X, y, n_splits=5):
+def run_time_series_cv(X, y, balanced, n_splits=5):
     """Cross-validation زمني: كل طية تدرّب على الماضي وتختبر على المستقبل مباشرة بعده."""
     n_splits = min(n_splits, max(2, len(X) // 30))  # يمنع طيات صغيرة جدًا على عينات قليلة
     tscv = TimeSeriesSplit(n_splits=n_splits)
 
     accuracies = []
-    print(f"\n=== Cross-Validation زمني ({n_splits} طيات) ===")
+    label = "balanced" if balanced else "غير موزون"
+    print(f"\n=== Cross-Validation زمني ({n_splits} طيات) — class_weight={label} ===")
     for fold, (train_idx, test_idx) in enumerate(tscv.split(X), start=1):
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
         y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
 
-        model = make_model()
+        model = make_model(balanced)
         model.fit(X_train, y_train)
         y_pred = model.predict(X_test)
         acc = accuracy_score(y_test, y_pred)
@@ -106,7 +112,7 @@ def run_time_series_cv(X, y, n_splits=5):
     return accuracies
 
 
-def run_holdout_test(X, y, feature_cols):
+def run_holdout_test(X, y, feature_cols, balanced):
     """هولدأوت نهائي: آخر 20% من البيانات، يُقيَّم مرة واحدة فقط."""
     split_idx = int(len(X) * 0.8)
     X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
@@ -115,20 +121,22 @@ def run_holdout_test(X, y, feature_cols):
     if len(X_test) < 5:
         print("⚠️ بيانات الاختبار قليلة جدًا (أقل من 5 صفوف)، النتيجة مجرد إشارة أولية لا أكثر")
 
-    model = make_model()
+    model = make_model(balanced)
     model.fit(X_train, y_train)
     y_pred = model.predict(X_test)
 
-    print("\n=== هولدأوت نهائي (آخر 20% زمنيًا) ===")
+    label = "balanced" if balanced else "غير موزون"
+    print(f"\n=== هولدأوت نهائي (آخر 20% زمنيًا) — class_weight={label} ===")
     print(f"Accuracy: {accuracy_score(y_test, y_pred):.2%}")
     print(classification_report(y_test, y_pred, target_names=["LOSS", "WIN"]))
 
-    print("=== نسبة WIN بالبيانات كاملة (baseline) ===")
-    print(f"{y.mean():.2%}")
+    if not balanced:
+        print("=== نسبة WIN بالبيانات كاملة (baseline) ===")
+        print(f"{y.mean():.2%}")
 
-    print("\n=== أهمية كل ميزة (Feature Importance) ===")
-    importance = pd.Series(model.feature_importances_, index=feature_cols).sort_values(ascending=False)
-    print(importance)
+        print("\n=== أهمية كل ميزة (Feature Importance) ===")
+        importance = pd.Series(model.feature_importances_, index=feature_cols).sort_values(ascending=False)
+        print(importance)
 
 
 def run_for_subset(df, label, drop_type_column):
@@ -142,8 +150,10 @@ def run_for_subset(df, label, drop_type_column):
     X = df[feature_cols]
     y = df["label"]
 
-    run_time_series_cv(X, y)
-    run_holdout_test(X, y, feature_cols)
+    # نقارن بالطريقتين: balanced (كانت الافتراضية سابقًا) وبدون موازنة
+    for balanced in (True, False):
+        run_time_series_cv(X, y, balanced=balanced)
+        run_holdout_test(X, y, feature_cols, balanced=balanced)
 
 
 def main():
