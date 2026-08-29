@@ -1597,11 +1597,23 @@ def main():
 
     results = run_scan(tickers)
 
+    # شرطا htf_aligned وmarket_regime="trending_up" أصبحا بوابتين إلزاميتين (مو مجرد
+    # تعديل بالدرجة كما كانا سابقًا). السبب: تحليل official_success_factors.py +
+    # نموذج ML التجريبي (train_model.py) أكّدا أن هذين العاملين هما الأقوى تفسيرًا
+    # لنجاح/فشل الإشارة الرسمية (market_regime كان أهم ميزة بالنموذج بـfeature
+    # importance=0.376، وhtf_aligned=True كان حاضرًا بـ100% من الصفقات الناجحة
+    # مقابل 84% فقط من الفاشلة). الفكرة: بدل الاعتماد على تزامن المؤشرات اللحظية
+    # فقط (الذي يميل لإعطاء أعلى درجة عند القمة تحديدًا = "شراء القمة")، نستعير
+    # مبدأ الإشارة المبكرة الناجح (انتظار سياق أوسع مؤكد) كشرط دخول إلزامي للرسمية.
+    # لو تعذّر تحديد market_regime (بيانات فريم أعلى غير متاحة) نُسقط الإشارة
+    # احترازيًا بدل قبولها بدون تأكيد سياق.
     strong = [
         r for r in results
         if r["score"] >= 1.5 and r["score"] < MAX_OFFICIAL_SCORE
         and r["vol_confirm"] and r["atr_pct"] >= 0.08 and r["persistent"]
         and not r["ranging"] and not r["near_resistance"]
+        and r["htf_aligned"] is True
+        and r["market_regime"] == "trending_up"
         and meets_min_profit(r["entry"], r["tps"])
     ]
     strong_symbols = {r["symbol"] for r in strong}
@@ -1619,6 +1631,10 @@ def main():
     _also_not_ranging_res = [
         r for r in _also_vol_atr_persist if not r["ranging"] and not r["near_resistance"]
     ]
+    _also_htf_regime = [
+        r for r in _also_not_ranging_res
+        if r["htf_aligned"] is True and r["market_regime"] == "trending_up"
+    ]
     print(
         "🔍 تشخيص فلترة الرسمية: "
         f"score>=1.5: {len(_score_ok)} | "
@@ -1627,6 +1643,7 @@ def main():
         f"تحت السقف: {len(_under_cap)} | "
         f"+حجم/تقلب/استقرار: {len(_also_vol_atr_persist)} | "
         f"+ليست عرضية/بعيدة عن مقاومة: {len(_also_not_ranging_res)} | "
+        f"+htf_aligned وmarket_regime=trending_up: {len(_also_htf_regime)} | "
         f"+ربح أدنى محقق (strong نهائي): {len(strong)}"
     )
 
