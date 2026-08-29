@@ -1607,11 +1607,16 @@ def main():
     # مبدأ الإشارة المبكرة الناجح (انتظار سياق أوسع مؤكد) كشرط دخول إلزامي للرسمية.
     # لو تعذّر تحديد market_regime (بيانات فريم أعلى غير متاحة) نُسقط الإشارة
     # احترازيًا بدل قبولها بدون تأكيد سياق.
+    # شرط "not ranging" (ADX على فريم التحليل الأساسي) أُزيل من هنا لأنه أصبح تكرارًا
+    # لفكرة market_regime (ADX على الفريم الأعلى، عتبة أعلى وأكثر موثوقية بالبيانات
+    # — كان أهم ميزة إطلاقًا بنموذج ML التجريبي). إبقاء الشرطين معًا كان يقلل عدد
+    # الإشارات دون فائدة إضافية مؤكدة، بينما market_regime وحده يغطي نفس الفكرة
+    # بشكل أدق. الحقل "ranging" يبقى محسوبًا ومحفوظًا للتشخيص فقط، بدون تأثير على الفلترة.
     strong = [
         r for r in results
         if r["score"] >= 1.5 and r["score"] < MAX_OFFICIAL_SCORE
         and r["vol_confirm"] and r["atr_pct"] >= 0.08 and r["persistent"]
-        and not r["ranging"] and not r["near_resistance"]
+        and not r["near_resistance"]
         and r["htf_aligned"] is True
         and r["market_regime"] == "trending_up"
         and meets_min_profit(r["entry"], r["tps"])
@@ -1629,7 +1634,7 @@ def main():
         if r["vol_confirm"] and r["atr_pct"] >= 0.08 and r["persistent"]
     ]
     _also_not_ranging_res = [
-        r for r in _also_vol_atr_persist if not r["ranging"] and not r["near_resistance"]
+        r for r in _also_vol_atr_persist if not r["near_resistance"]
     ]
     _also_htf_regime = [
         r for r in _also_not_ranging_res
@@ -1642,7 +1647,7 @@ def main():
         f"({', '.join(r['symbol'] for r in _capped_out) or '—'}) | "
         f"تحت السقف: {len(_under_cap)} | "
         f"+حجم/تقلب/استقرار: {len(_also_vol_atr_persist)} | "
-        f"+ليست عرضية/بعيدة عن مقاومة: {len(_also_not_ranging_res)} | "
+        f"+بعيدة عن مقاومة: {len(_also_not_ranging_res)} | "
         f"+htf_aligned وmarket_regime=trending_up: {len(_also_htf_regime)} | "
         f"+ربح أدنى محقق (strong نهائي): {len(strong)}"
     )
