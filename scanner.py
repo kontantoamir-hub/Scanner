@@ -55,6 +55,13 @@ EXTENSION_ATR_THRESHOLD = float(os.environ.get("EXTENSION_ATR_THRESHOLD", "3.0")
 # فقط (extension penalty)، الآن يُرفض الإرسال نهائيًا لو تجاوزها.
 MAX_OFFICIAL_SCORE = float(os.environ.get("MAX_OFFICIAL_SCORE", "3.5"))
 
+# رقم نسخة منطق فلترة الإشارة الرسمية — يُحفظ مع كل صفقة رسمية جديدة كي يمكن لاحقًا
+# فصل أداء "قبل" و"بعد" أي تعديل على شروط strong بدقة، بدل الاعتماد على تاريخ الفتح يدويًا.
+# 1 = المنطق القديم (ranging/near_resistance كشروط رفض، بدون بوابتي htf_aligned/market_regime)
+# 2 = المنطق الحالي: htf_aligned=True وmarket_regime="trending_up" بوابتان إلزاميتان،
+#     وحُذف شرط "not ranging" (أصبح تكرارًا لـmarket_regime على فريم أعلى)
+OFFICIAL_LOGIC_VERSION = 2
+
 # ---------- إعدادات الإشارات المبكرة (انضغاط تقلب / تراكم صامت) ----------
 SQUEEZE_LOOKBACK = 20           # عدد الشموع لحساب متوسط عرض نطاق Bollinger
 SQUEEZE_RATIO_THRESHOLD = 0.6   # عرض النطاق الحالي <= هذه النسبة من المتوسط -> يُعتبر انضغاطًا
@@ -1326,7 +1333,7 @@ def open_new_positions(positions, fresh_signals):
             "obv_confirm": r.get("obv_confirm"),
             "htf_aligned": r.get("htf_aligned"),
             "market_regime": r.get("market_regime"),
-            # message_id ونص رسالة الإشارة الأصلية -> تُستخدم لاحقًا لتعديل نفس الرسالة (شطب + نتيجة) عند الإغلاق
+            "logic_version": OFFICIAL_LOGIC_VERSION,
             "alert_message_id": r.get("_msg_id"),
             "alert_text": r.get("_alert_text"),
         })
