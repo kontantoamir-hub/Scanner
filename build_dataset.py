@@ -31,6 +31,7 @@ EXTRA_FIELDS = [
     "early_source",  # accumulation / squeeze / extended / None
     "symbol",
     "timeframe",
+    "market_regime",  # trending_up / trending_down / ranging — مضاف لاختبار فرضية تغيّر السلوك حسب نظام السوق
 ]
 
 # حقول توقيت محتملة بسجل الصفقة (نستخدم أول حقل موجود لترتيب البيانات زمنيًا فعليًا،
@@ -117,6 +118,11 @@ def build_dataframe(trades):
 
     print(f"تم بناء {len(rows)} صف صالح، وتجاهل {skipped} صفقة (ناقصة حقول أو بدون نتيجة واضحة)")
     df = pd.DataFrame(rows)
+
+    if "market_regime" in df.columns:
+        missing_regime = df["market_regime"].isna().sum()
+        if missing_regime:
+            print(f"⚠️ {missing_regime} صفقة بدون market_regime محفوظ (صفقات أقدم قبل إضافة الحقل)")
 
     # ترتيب زمني فعلي لو فيه حقل توقيت، وإلا نبقي ترتيب الملف الأصلي (بافتراض أنه من الأقدم للأحدث)
     if "_timestamp" in df.columns and df["_timestamp"].notna().any():
