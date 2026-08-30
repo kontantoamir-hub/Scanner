@@ -65,11 +65,14 @@ def fetch_all_trades():
 
     all_trades = []
     archives_found = 0
+    archive_fetch_error = False
 
     # 1) السجل النشط
     all_trades.extend(_fetch_json_url(GIST_RAW_URL))
 
-    # 2) ملفات الأرشيف بالترتيب، من الأقدم (0001) صعودًا لحد أول ملف غير موجود
+    # 2) ملفات الأرشيف بالترتيب، من الأقدم (0001) صعودًا لحد أول ملف غير موجود.
+    # أي خطأ غير 404 (تعذّر شبكة، JSON تالف، إلخ) يعني احتمال وجود أرشيف لم نتمكن من
+    # قراءته فعليًا — نوقف الجلب ونعلّم الخطأ بدل الاستمرار كأن شيئًا لم يحصل.
     idx = 1
     while idx <= MAX_ARCHIVE_LOOKUP:
         url = _archive_url_for(idx)
@@ -79,11 +82,17 @@ def fetch_all_trades():
             archives_found += 1
         except urllib.error.HTTPError as e:
             if e.code == 404:
-                break  # ما فيه أرشيف بهذا الرقم — وصلنا لنهاية الأرشيف
-            raise
+                break  # ما فيه أرشيف بهذا الرقم — وصلنا لنهاية الأرشيف فعليًا
+            print(f"⚠️ خطأ HTTP غير متوقع عند جلب ملف الأرشيف رقم {idx:04d} ({e.code}) — التوقف هنا.")
+            archive_fetch_error = True
+            break
+        except Exception as e:
+            print(f"⚠️ خطأ غير متوقع عند جلب ملف الأرشيف رقم {idx:04d} ({e}) — التوقف هنا.")
+            archive_fetch_error = True
+            break
         idx += 1
 
-    return all_trades, archives_found
+    return all_trades, archives_found, archive_fetch_error
 
 
 def parse_dt(s):
@@ -115,7 +124,7 @@ def trade_return_pct_tp1(t):
     return trade_return_pct(t)
 
 
-def simulate(trades, days, capital, max_concurrent, trade_type="all"):
+def simulate(trades, days, capital, max_concurrent, trade_type="all", archive_fetch_error=False):
     cutoff = dt.datetime.now() - dt.timedelta(days=days)
     slot_amount = capital / max_concurrent
 
@@ -138,13 +147,11 @@ def simulate(trades, days, capital, max_concurrent, trade_type="all"):
 
     window.sort(key=lambda t: t["_opened_at"])
 
-    # مع دمج الأرشيف، تغطية البيانات صارت شبه مؤكدة طالما فيه أرشيف كافٍ — بس نبقي
-    # نفس التحذير احتياطًا لأي حالة نادرة (أول صفقة بكل الملفات مجتمعة أحدث من الفترة المطلوبة)
-    incomplete_warning = False
-    if trades:
-        oldest = min((parse_dt(t["closed_at"]) for t in trades if t.get("closed_at")), default=None)
-        if oldest and oldest > cutoff:
-            incomplete_warning = True
+    # التحذير الآن يُبنى فقط على خطأ فعلي حصل أثناء جلب الأرشيف (مش على مقارنة تاريخ
+    # أقدم صفقة بالـcutoff)، لأن بعد دمج كل الأرشيف المتوفر، وصول oldest لتاريخ أحدث
+    # من الفترة المطلوبة يعني غالبًا إن البوت ببساطة ما عنده صفقات أقدم من هيك — طبيعي،
+    # مش نقص بالبيانات.
+    incomplete_warning = archive_fetch_error
 
     open_slots = []  # قائمة أوقات إغلاق الصفقات المشغولة حاليًا
     taken, skipped = [], 0
@@ -229,7 +236,7 @@ def format_message(days, res, archives_found=0):
             lines.append(f"{label}: {b['count']} صفقة | {b['profit']:+.2f}$ | نجاح {round(b['wins']/(b['wins']+b['losses'])*100,1) if (b['wins']+b['losses']) else 0}%")
 
     if res["incomplete_warning"]:
-        lines.append("⚠️ ملاحظة: بعض الصفقات الأقدم قد تكون غير مشمولة (تحقق من اكتمال ملفات الأرشيف بالـGist).")
+        lines.append("⚠️ تنبيه: صار خطأ فعلي أثناء جلب أحد ملفات الأرشيف (راجع سجل التشغيل/logs) — قد لا تكون البيانات كاملة.")
 
     note = "(محاكاة واقعية: رأس المال مقسوم على شرائح متزامنة، والإشارات الزائدة عند امتلاء الشرائح تُتجاهل، بعد خصم رسوم تداول تقديرية 0.1% لكل جهة"
     if res["trade_type"] in ("all", "official"):
@@ -262,8 +269,8 @@ def main():
     parser.add_argument("--type", type=str, default="all", choices=["all", "official", "early", "breakout"])
     args = parser.parse_args()
 
-    trades, archives_found = fetch_all_trades()
-    res = simulate(trades, args.days, args.amount, MAX_CONCURRENT, args.type)
+    trades, archives_found, archive_fetch_error = fetch_all_trades()
+    res = simulate(trades, args.days, args.amount, MAX_CONCURRENT, args.type, archive_fetch_error)
     message = format_message(args.days, res, archives_found)
 
     print(message)
