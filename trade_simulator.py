@@ -3,6 +3,10 @@
 (افتراضيًا 5). أي إشارة جديدة تجيك وكل الشرائح مشغولة تُتجاهل لحد ما تتحرر شريحة
 (صفقة موجودة توصل هدفها أو وقف خسارتها)، تمامًا متل واقع التداول الفعلي بمبلغ محدود.
 
+يجمع الصفقات من السجل النشط (closed_trades.json) + كل ملفات الأرشيف المرقّمة
+(closed_trades_archive_0001.json, 0002.json, ...) بنفس الـGist، عشان فترات (--days)
+أطول من عمر السجل النشط الحالي تُحتسب بشكل كامل وصحيح بدل ما تتوقف عند حدود السجل النشط.
+
 الاستخدام (نفس واجهة trade_simulator.yml — --amount هنا = رأس المال الإجمالي وليس لكل صفقة):
     python trade_simulator.py --days 10 --amount 400
 
@@ -28,12 +32,58 @@ MAX_CONCURRENT = int(os.environ.get("TRADE_MAX_CONCURRENT", "5"))
 
 TYPE_LABELS = {"official": "رسمية", "early": "مبكرة", "breakout": "انفجار"}
 
+# نفس التسمية المستخدمة بـscanner.py (archive_overflow) لملفات الأرشيف المرقّمة
+ACTIVE_FILENAME = "closed_trades.json"
+ARCHIVE_PREFIX = "closed_trades_archive_"
+MAX_ARCHIVE_LOOKUP = 500  # سقف أمان لعدد ملفات الأرشيف المفحوصة (يفوق أي حجم واقعي متوقع)
 
-def fetch_closed_trades():
+
+def _archive_url_for(index):
+    """يبني رابط ملف أرشيف رقم index بنفس نمط GIST_RAW_URL (استبدال اسم الملف النشط فقط)."""
+    filename = f"{ARCHIVE_PREFIX}{index:04d}.json"
+    if ACTIVE_FILENAME in GIST_RAW_URL:
+        return GIST_RAW_URL.replace(ACTIVE_FILENAME, filename)
+    raise SystemExit(
+        f"❌ تعذّر بناء رابط الأرشيف تلقائيًا من GIST_RAW_URL "
+        f"(الرابط لا يحتوي اسم الملف '{ACTIVE_FILENAME}' صراحة)."
+    )
+
+
+def _fetch_json_url(url):
+    with urllib.request.urlopen(url, timeout=15) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def fetch_all_trades():
+    """
+    يجمع كل الصفقات المغلقة: السجل النشط أولاً، ثم كل ملفات الأرشيف بالترتيب
+    (0001 فصاعدًا) لحد ما يوصل لأول رقم غير موجود (404) فيتوقف — بهذا الشكل
+    فترة --days الطويلة تغطي كل الصفقات المتوفرة فعليًا، مش بس السجل النشط.
+    """
     if not GIST_RAW_URL:
         raise SystemExit("❌ GIST_RAW_URL غير موجود بالأسرار (secrets).")
-    with urllib.request.urlopen(GIST_RAW_URL, timeout=15) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+
+    all_trades = []
+    archives_found = 0
+
+    # 1) السجل النشط
+    all_trades.extend(_fetch_json_url(GIST_RAW_URL))
+
+    # 2) ملفات الأرشيف بالترتيب، من الأقدم (0001) صعودًا لحد أول ملف غير موجود
+    idx = 1
+    while idx <= MAX_ARCHIVE_LOOKUP:
+        url = _archive_url_for(idx)
+        try:
+            chunk = _fetch_json_url(url)
+            all_trades.extend(chunk)
+            archives_found += 1
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                break  # ما فيه أرشيف بهذا الرقم — وصلنا لنهاية الأرشيف
+            raise
+        idx += 1
+
+    return all_trades, archives_found
 
 
 def parse_dt(s):
@@ -88,11 +138,13 @@ def simulate(trades, days, capital, max_concurrent, trade_type="all"):
 
     window.sort(key=lambda t: t["_opened_at"])
 
+    # مع دمج الأرشيف، تغطية البيانات صارت شبه مؤكدة طالما فيه أرشيف كافٍ — بس نبقي
+    # نفس التحذير احتياطًا لأي حالة نادرة (أول صفقة بكل الملفات مجتمعة أحدث من الفترة المطلوبة)
     incomplete_warning = False
     if trades:
         oldest = min((parse_dt(t["closed_at"]) for t in trades if t.get("closed_at")), default=None)
         if oldest and oldest > cutoff:
-            incomplete_warning = True  # السجل النشط قد لا يغطي كامل الفترة المطلوبة (صفقات أقدم انتقلت للأرشيف)
+            incomplete_warning = True
 
     open_slots = []  # قائمة أوقات إغلاق الصفقات المشغولة حاليًا
     taken, skipped = [], 0
@@ -150,12 +202,15 @@ def simulate(trades, days, capital, max_concurrent, trade_type="all"):
     }
 
 
-def format_message(days, res):
+def format_message(days, res, archives_found=0):
     type_label = "الكل" if res["trade_type"] == "all" else TYPE_LABELS.get(res["trade_type"], res["trade_type"])
     lines = [
         f"💰 محاكاة أرباح آخر {days} يوم — نوع الصفقات: {type_label} — رأس مال {res['capital']:.0f}$ "
         f"({res['max_concurrent']} صفقات متزامنة كحد أقصى، {res['slot_amount']:.0f}$ لكل شريحة)"
     ]
+    if archives_found:
+        lines.append(f"📦 تم دمج {archives_found} ملف أرشيف مع السجل النشط لتغطية الفترة كاملة")
+
     if res["n"] == 0:
         lines.append("لا توجد صفقات دخلت خلال هذه الفترة (بحدود رأس المال والتزامن المحدد).")
         return "\n".join(lines)
@@ -174,7 +229,7 @@ def format_message(days, res):
             lines.append(f"{label}: {b['count']} صفقة | {b['profit']:+.2f}$ | نجاح {round(b['wins']/(b['wins']+b['losses'])*100,1) if (b['wins']+b['losses']) else 0}%")
 
     if res["incomplete_warning"]:
-        lines.append("⚠️ ملاحظة: بعض الصفقات الأقدم قد تكون انتقلت للأرشيف ولم تُحتسب هنا (السجل النشط محدود العدد).")
+        lines.append("⚠️ ملاحظة: بعض الصفقات الأقدم قد تكون غير مشمولة (تحقق من اكتمال ملفات الأرشيف بالـGist).")
 
     note = "(محاكاة واقعية: رأس المال مقسوم على شرائح متزامنة، والإشارات الزائدة عند امتلاء الشرائح تُتجاهل، بعد خصم رسوم تداول تقديرية 0.1% لكل جهة"
     if res["trade_type"] in ("all", "official"):
@@ -207,9 +262,9 @@ def main():
     parser.add_argument("--type", type=str, default="all", choices=["all", "official", "early", "breakout"])
     args = parser.parse_args()
 
-    trades = fetch_closed_trades()
+    trades, archives_found = fetch_all_trades()
     res = simulate(trades, args.days, args.amount, MAX_CONCURRENT, args.type)
-    message = format_message(args.days, res)
+    message = format_message(args.days, res, archives_found)
 
     print(message)
     send_telegram(message)
