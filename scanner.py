@@ -44,6 +44,14 @@ RESISTANCE_PIVOT_SPAN = 3       # عدد الشموع على كل جانب لا�
 RESISTANCE_PROXIMITY_PCT = 1.5  # لو السعر أقرب من هذه النسبة% لمقاومة فوقه -> تحذير
 OBV_TREND_WINDOW = 10           # عدد الشموع لقياس اتجاه OBV مقابل اتجاه السعر
 
+# ---------- إعدادات مستويات ارتداد فيبوناتشي (Fibonacci Retracement) ----------
+# حقل تشخيصي فقط حاليًا (بنفس منهج market_regime وoverextension عند إضافتهما أول مرة):
+# يُحسب ويُحفظ بكل صفقة، بدون التأثير على الدرجة أو قرار الإرسال، لحين تراكم بيانات
+# كافية لمعرفة هل التقاطع مع مستويات فيبوناتشي يحسّن دقة الإشارات فعليًا أو لا.
+FIB_LOOKBACK = 50               # عدد الشموع للبحث فيها عن أعلى قمة وأدنى قاع (swing) لحساب المستويات
+FIB_LEVELS = (0.382, 0.5, 0.618, 0.786)   # النسب الكلاسيكية المستخدمة بالارتداد
+FIB_PROXIMITY_PCT = 1.0         # لو السعر أقرب من هذه النسبة% لمستوى فيبوناتشي -> يُعتبر عنده
+
 # ---------- إعدادات فلتر الإرهاق/الامتداد الزائد (Overextension) ----------
 EXTENSION_EMA_PERIOD = 50       # المتوسط المتحرك المرجعي لقياس "المسافة المقطوعة" عن خط الأساس
 EXTENSION_ATR_THRESHOLD = float(os.environ.get("EXTENSION_ATR_THRESHOLD", "3.0"))
@@ -316,6 +324,43 @@ def nearest_resistance(highs, closes, lookback=RESISTANCE_LOOKBACK, pivot_span=R
     return min(above) if above else None
 
 
+def fibonacci_levels(highs, lows, lookback=FIB_LOOKBACK):
+    """
+    يحسب مستويات ارتداد فيبوناتشي بين أعلى قمة وأدنى قاع خلال آخر lookback شمعة.
+    يرجع قاموسًا {نسبة: سعر المستوى} (0 = القمة، 1 = القاع). لا يحدد الدالة نفسها
+    هل المستوى "دعم" أو "مقاومة" -- هذا يُقرَّر عند القراءة حسب اتجاه الترند الحالي
+    (نفس فكرة nearest_resistance اللي تُقرأ بسياقات مختلفة).
+    """
+    n = len(highs)
+    window_n = min(lookback, n)
+    start = n - window_n
+    if window_n < 2:
+        return {}
+    swing_high = max(highs[start:n])
+    swing_low = min(lows[start:n])
+    diff = swing_high - swing_low
+    if diff <= 0:
+        return {}
+    return {lvl: swing_high - diff * lvl for lvl in FIB_LEVELS}
+
+
+def nearest_fib_level(price, levels, proximity_pct=FIB_PROXIMITY_PCT):
+    """
+    يرجع (النسبة, سعر المستوى) لأقرب مستوى فيبوناتشي للسعر الحالي ضمن هامش
+    proximity_pct%، أو (None, None) لو ما في مستوى قريب بما يكفي.
+    """
+    best = None
+    for lvl, lvl_price in levels.items():
+        if lvl_price <= 0:
+            continue
+        dist_pct = abs(price - lvl_price) / lvl_price * 100
+        if dist_pct <= proximity_pct and (best is None or dist_pct < best[2]):
+            best = (lvl, lvl_price, dist_pct)
+    if best:
+        return best[0], best[1]
+    return None, None
+
+
 def momentum_strength(macd_line, signal, rsi_vals, i):
     """
     قوة الزخم: تتحقق لما يكون MACD فوق خط الإشارة وهيستوغرام الفرق بينهما يتسع
@@ -457,6 +502,12 @@ def score_at(i, ind, apply_extra_filters=True):
 
     extended = overextended(ind, i, trend_up)
 
+    # فيبوناتشي: تقاطع السعر مع مستوى ارتداد أثناء اتجاه صاعد (0.5 فأعمق) يُعتبر
+    # منطقة دعم كلاسيكية قبل استئناف الصعود -- تشخيصي فقط حاليًا، لا يؤثر على الدرجة
+    fib_map = fibonacci_levels(ind["highs"][:i + 1], ind["lows"][:i + 1])
+    fib_level, fib_level_price = nearest_fib_level(price, fib_map)
+    fib_support = fib_level is not None and fib_level >= 0.5 and trend_up
+
     if apply_extra_filters:
         if ranging:
             score *= 0.5
@@ -476,6 +527,8 @@ def score_at(i, ind, apply_extra_filters=True):
         "near_resistance": near_resistance, "resistance": resistance,
         "obv_confirm": obv_confirm,
         "extended": extended,
+        "fib_level": fib_level,
+        "fib_support": fib_support,
         # حقول أساسية إضافية للحفظ التشخيصي (rsi_state: 1 تشبع بيعي / -1 تشبع شرائي / 0 محايد،
         # bb_state: 1 عند الحد السفلي / -1 عند الحد العلوي / 0 منتصف النطاق)
         "rsi_state": rsi_state,
@@ -737,6 +790,8 @@ def analyze_symbol(t, interval):
             "near_resistance": r["near_resistance"],
             "obv_confirm": r["obv_confirm"],
             "extended": r["extended"],
+            "fib_level": r["fib_level"],
+            "fib_support": r["fib_support"],
             "rsi_state": r["rsi_state"],
             "macd_bull": r["macd_bull"],
             "bb_state": r["bb_state"],
@@ -958,6 +1013,8 @@ def format_alert(r, market_caution=False):
         badges.append("⚠️ قريب من مقاومة قوية")
     if r.get("extended"):
         badges.append("⚠️ حركة ممتدة (احتمال شراء متأخر)")
+    if r.get("fib_support"):
+        badges.append(f"دعم فيبوناتشي {r['fib_level']}")
     badge_txt = f" ({', '.join(badges)})" if badges else ""
 
     lines = [
@@ -1017,6 +1074,8 @@ def format_early_alert(r):
 
     if r.get("extended"):
         lines.append("⚠️ حركة ممتدة")
+    if r.get("fib_support"):
+        lines.append(f"دعم فيبوناتشي {r['fib_level']}")
 
     return "\n".join(lines)
 
@@ -1048,6 +1107,8 @@ def format_breakout_alert(r):
         lines.append(f"SL: {r['breakout_sl']:.6g}")
     if r.get("extended"):
         lines.append("⚠️ حركة ممتدة")
+    if r.get("fib_support"):
+        lines.append(f"دعم فيبوناتشي {r['fib_level']}")
     lines.append("💡 هذه الإشارة تدخل مع بداية الزخم — أسرع من الرسمية لكن أقل تأكيداً")
     return "\n".join(lines)
 
@@ -1333,6 +1394,8 @@ def open_new_positions(positions, fresh_signals):
             "obv_confirm": r.get("obv_confirm"),
             "htf_aligned": r.get("htf_aligned"),
             "market_regime": r.get("market_regime"),
+            "fib_level": r.get("fib_level"),
+            "fib_support": r.get("fib_support"),
             "logic_version": OFFICIAL_LOGIC_VERSION,
             "alert_message_id": r.get("_msg_id"),
             "alert_text": r.get("_alert_text"),
@@ -1378,6 +1441,8 @@ def open_new_early_positions(positions, fresh_early_signals):
             "obv_confirm": r.get("obv_confirm"),
             "htf_aligned": r.get("htf_aligned"),
             "market_regime": r.get("market_regime"),
+            "fib_level": r.get("fib_level"),
+            "fib_support": r.get("fib_support"),
             "alert_message_id": r.get("_msg_id"),
             "alert_text": r.get("_alert_text"),
         })
@@ -1414,6 +1479,8 @@ def open_new_breakout_positions(positions, fresh_breakout_signals):
             "obv_confirm": r.get("obv_confirm"),
             "htf_aligned": r.get("htf_aligned"),
             "market_regime": r.get("market_regime"),
+            "fib_level": r.get("fib_level"),
+            "fib_support": r.get("fib_support"),
             "alert_message_id": r.get("_msg_id"),
             "alert_text": r.get("_alert_text"),
         })
