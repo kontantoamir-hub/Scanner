@@ -52,6 +52,13 @@ FIB_LOOKBACK = 50               # عدد الشموع للبحث فيها عن �
 FIB_LEVELS = (0.382, 0.5, 0.618, 0.786)   # النسب الكلاسيكية المستخدمة بالارتداد
 FIB_PROXIMITY_PCT = 1.0         # لو السعر أقرب من هذه النسبة% لمستوى فيبوناتشي -> يُعتبر عنده
 
+# ---------- إعدادات مستويات امتداد فيبوناتشي (Fibonacci Extension) ----------
+# تُستخدم فقط لإعطاء هدف ثاني حقيقي للإشارة المبكرة في الحالة الوحيدة التي كانت تبقى
+# بهدف واحد (شرط واحد فقط متحقق: accumulation أو squeeze لوحده) — بدل هدف مبني فقط على
+# مضاعف ATR، نبحث عن أقرب مستوى امتداد فيبوناتشي (1.272/1.618) فوق نفس الحركة السعرية
+# الأخيرة (swing)، وإن وُجد ومنطقي (فوق TP1 ولا يتجاوز أقرب مقاومة) نضيفه كـTP2.
+FIB_EXTENSION_LEVELS = (1.272, 1.618)
+
 # ---------- إعدادات فلتر الإرهاق/الامتداد الزائد (Overextension) ----------
 EXTENSION_EMA_PERIOD = 50       # المتوسط المتحرك المرجعي لقياس "المسافة المقطوعة" عن خط الأساس
 EXTENSION_ATR_THRESHOLD = float(os.environ.get("EXTENSION_ATR_THRESHOLD", "3.0"))
@@ -342,6 +349,26 @@ def fibonacci_levels(highs, lows, lookback=FIB_LOOKBACK):
     if diff <= 0:
         return {}
     return {lvl: swing_high - diff * lvl for lvl in FIB_LEVELS}
+
+
+def fibonacci_extension_levels(highs, lows, lookback=FIB_LOOKBACK):
+    """
+    يحسب مستويات امتداد فيبوناتشي (1.272 / 1.618) فوق نفس حركة swing المستخدمة
+    بـfibonacci_levels — تُستخدم لإيجاد هدف ثاني حقيقي (مبني على نسبة سعرية معروفة
+    بالسوق) للإشارة المبكرة في حالة الشرط الواحد، بدل الاكتفاء بمضاعف ATR فقط.
+    يرجع قاموسًا {نسبة: سعر المستوى}، أو {} لو العينة غير كافية.
+    """
+    n = len(highs)
+    window_n = min(lookback, n)
+    start = n - window_n
+    if window_n < 2:
+        return {}
+    swing_high = max(highs[start:n])
+    swing_low = min(lows[start:n])
+    diff = swing_high - swing_low
+    if diff <= 0:
+        return {}
+    return {lvl: swing_low + diff * lvl for lvl in FIB_EXTENSION_LEVELS}
 
 
 def nearest_fib_level(price, levels, proximity_pct=FIB_PROXIMITY_PCT):
@@ -680,10 +707,19 @@ def analyze_symbol(t, interval):
         #     قوية" لو توفرت 3 شروط فأكثر)
         #   - squeeze حاضر بدون accumulation -> يحتاج شرطًا إضافيًا (divergence أو
         #     momentum) ليُطلق إشارة أصلاً؛ squeeze وحيدًا لا يكفي بعد الآن (لا إشارة)
+        #
+        # حقل early_factors (مضاف): قائمة كل العوامل الأربعة الفعلية الحاضرة فعليًا
+        # (squeeze/accumulation/divergence/momentum) — منفصل عن early_source (مصدر
+        # الإطلاق التاريخي المستخدم بتحليلات الأداء السابقة) لتفادي كسر استمرارية
+        # تحليل score_breakdown_by_factor.py وclassify_early_score، مع حل مشكلة أن
+        # "المصدر" المعروض كان يذكر فقط accumulation/squeeze حتى لو كان عدد الأهداف
+        # (2 أو 3) ناتجًا فعليًا عن مساهمة divergence/momentum أيضًا.
         early_entry = early_sl = None
         early_tps = []
         early_confidence = None
         early_source = None
+        early_factors = []
+        fib_extension_used = False
         momentum = momentum_strength(ind["macd"], ind["signal"], ind["rsi"], last)
         if squeeze or accumulation:
             conditions_met = sum([squeeze, accumulation, r["divergence"], momentum])
@@ -696,6 +732,15 @@ def analyze_symbol(t, interval):
                     early_source = "accumulation"
                 else:
                     early_source = "squeeze"
+                if accumulation:
+                    early_factors.append("accumulation")
+                if squeeze:
+                    early_factors.append("squeeze")
+                if r["divergence"]:
+                    early_factors.append("divergence")
+                if momentum:
+                    early_factors.append("momentum")
+
                 early_entry = ind["closes"][last]
                 atrv = atr_value(ind)
                 atr_risk = atrv * EARLY_SL_ATR_MULT
@@ -705,6 +750,20 @@ def analyze_symbol(t, interval):
                 early_tp_count = conditions_met  # عدد الأهداف = عدد الشروط المتحققة فعليًا لهاي العملة (1 إلى 4)
                 raw_tps = [early_entry + early_risk * i for i in range(1, early_tp_count + 1)]
                 resistance = r.get("resistance")
+
+                # فيبوناتشي كهدف ثاني حقيقي: فقط لو الإشارة أصلاً بشرط واحد متحقق (هدف
+                # واحد بس بالمنطق القديم) ولقينا مستوى امتداد منطقي فوق TP1 ولا يتجاوز
+                # أقرب مقاومة معروفة (لو موجودة) — وإلا تبقى الإشارة بهدف واحد كالسابق.
+                if early_tp_count == 1:
+                    ext_levels = fibonacci_extension_levels(ind["highs"][:last + 1], ind["lows"][:last + 1])
+                    ext_candidates = sorted(p for p in ext_levels.values() if p > raw_tps[0])
+                    if resistance:
+                        ext_candidates = [p for p in ext_candidates if p < resistance]
+                    if ext_candidates:
+                        raw_tps.append(ext_candidates[0])
+                        fib_extension_used = True
+                        early_factors.append("fibonacci")
+
                 if resistance:
                     # نوقف توليد الأهداف عند أول هدف يتجاوز أقرب مقاومة بدل تقليم كل هدف
                     # لنفس سقف المقاومة — التقليم القديم كان يجعل TP1 وTP2 يتساويان بالضبط
@@ -804,6 +863,7 @@ def analyze_symbol(t, interval):
             "entry": entry, "sl": sl, "tps": tps,
             "early_entry": early_entry, "early_sl": early_sl, "early_tps": early_tps,
             "early_confidence": early_confidence, "early_source": early_source,
+            "early_factors": early_factors, "fib_extension_used": fib_extension_used,
             "breakout_entry": breakout_entry, "breakout_sl": breakout_sl, "breakout_tps": breakout_tps,
         }
     except Exception as e:
@@ -971,26 +1031,26 @@ def classify_official_score(score):
         return "ضعيفة"
 
 
-def classify_early_score(source):
+def classify_early_score(source, conditions_met=None):
     """
-    يحوّل مصدر الإشارة المبكرة (early_source) إلى تصنيف نصي (ضعيفة/متوسطة/قوية).
-    مبني على المصدر لا على رقم الدرجة، لأن تحليل score_breakdown_by_factor.py أثبت
-    أن الدرجة السالبة/الموجبة لا تعني شيئًا ثابتًا بمعزل عن المصدر — فمثلاً "تراكم صامت"
-    يحافظ على نجاح مرتفع (88.9%-100%) عبر كل مستويات الدرجة تقريبًا، بعكس "انضغاط تقلب"
-    الذي تراجع أداؤه بثبات عند نفس مستويات الدرجة.
+    يحوّل قوة الإشارة المبكرة إلى تصنيف نصي (ضعيفة/متوسطة/قوية).
+    مبني على المصدر (لا على رقم الدرجة، لأن score_breakdown_by_factor.py أثبت أن الدرجة
+    السالبة/الموجبة لا تعني شيئًا ثابتًا بمعزل عن المصدر)، مُوحَّد الآن مع early_confidence
+    كي لا يظهر تناقض ("مؤكدة قوية" مع تصنيف "متوسطة" بنفس الرسالة كما كان سابقًا):
+    أي إشارة عندها 3 شروط فأكثر (نفس عتبة "مؤكدة قوية") تُصنَّف "قوية" بصرف النظر عن
+    المصدر، لأن تزامن عدة عوامل معًا مؤشر جودة إضافي بحد ذاته.
     نسب النجاح الفعلية (trade_stats.py، 300 صفقة، أوت 2026):
       تراكم صامت (accumulation)          -> قوية   (90% نجاح، 87 صفقة)
       تراكم صامت + انضغاط تقلب (مزيج)     -> قوية   (المصدر الأقوى يحدد التصنيف)
       انضغاط تقلب فقط (squeeze)          -> متوسطة (73% نجاح، 146 صفقة)
-    ملاحظة: هذان هما المصدران الوحيدان الفعليان حاليًا بـearly_source (extended مجرد
-    badge تحذيري منفصل، ليس مصدر إشارة) — الحالة الافتراضية أدناه شبكة أمان فقط.
     """
     if source in ("accumulation", "accumulation+squeeze"):
         return "قوية"
-    elif source == "squeeze":
+    if conditions_met is not None and conditions_met >= 3:
+        return "قوية"
+    if source == "squeeze":
         return "متوسطة"
-    else:
-        return "متوسطة"
+    return "متوسطة"
 
 
 def format_alert(r, market_caution=False):
@@ -1039,6 +1099,17 @@ def format_alert(r, market_caution=False):
     return "\n".join(lines)
 
 
+# تسميات كل عامل من عوامل الإشارة المبكرة (تُستخدم لبناء سطر "المصدر" كاملاً بترتيب ثابت،
+# بدل الاكتفاء بذكر accumulation/squeeze فقط كما كان سابقًا)
+EARLY_FACTOR_LABELS = {
+    "accumulation": "تراكم صامت",
+    "squeeze": "انضغاط تقلب",
+    "divergence": "انحراف صعودي",
+    "momentum": "زخم",
+    "fibonacci": "فيبوناتشي",
+}
+
+
 def format_early_alert(r):
     """
     تنبيه رادار مبكر: انضغاط تقلب و/أو تراكم صامت لعملة لم تصل بعد لإشارة شراء كاملة.
@@ -1046,22 +1117,25 @@ def format_early_alert(r):
     وتُتابَع تلقائيًا (TP/SL) ضمن نفس آلية الصفقات المفتوحة — لكنها تبقى أقل تأكيدًا
     من الإشارة الرسمية. قالب مختصر: بدون سطر المؤشرات وبدون السعر الحالي المنفصل،
     مع الإبقاء فقط على تحذير الحركة الممتدة عند انطباقه.
+
+    سطر "المصدر" يعرض الآن كل العوامل الفعلية المساهمة (accumulation/squeeze/divergence/
+    momentum/fibonacci) وليس فقط accumulation/squeeze كما كان سابقًا — لتفادي التناقض
+    بين عدد الأهداف المعروضة ومصدر واحد أو اثنين فقط مذكورين بالرسالة.
     """
     confidence = r.get("early_confidence")
     dot = "🟢" if confidence == "مؤكدة قوية" else ("🟣" if confidence == "مؤكدة" else "🔵")
     title = f"إشارة مبكرة - {confidence}" if confidence else "إشارة مبكرة"
 
-    source_labels = {
-        "accumulation": "تراكم صامت",
-        "squeeze": "انضغاط تقلب",
-        "accumulation+squeeze": "تراكم صامت + انضغاط تقلب",
-    }
-    source_label = source_labels.get(r.get("early_source"))
+    factors = r.get("early_factors") or []
+    source_label = " + ".join(EARLY_FACTOR_LABELS[f] for f in factors if f in EARLY_FACTOR_LABELS)
+
+    conditions_met = len([f for f in factors if f != "fibonacci"])
+    strength_label = classify_early_score(r.get("early_source"), conditions_met)
 
     lines = [
         f"{dot} {title}",
         r['symbol'].replace('USDT', '/USDT'),
-        f"القوة: {classify_early_score(r.get('early_source'))} ({r['score']:.1f}) | فريم: {INTERVAL}",
+        f"القوة: {strength_label} ({r['score']:.1f}) | فريم: {INTERVAL}",
     ]
     if source_label:
         lines.append(f"المصدر: {source_label}")
@@ -1423,11 +1497,14 @@ def open_new_early_positions(positions, fresh_early_signals):
             "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "type": "early",
             "confidence": r.get("early_confidence"),
-            # مصدر الإشارة الأساسي (accumulation / squeeze / accumulation+squeeze) —
-            # لتحليل لاحق سهل لأي مصدر أدق بدون الحاجة لتقاطع squeeze/accumulation يدويًا
+            # مصدر الإشارة الأساسي (accumulation / squeeze / accumulation+squeeze) — يبقى
+            # كما هو لاستمرارية تحليلات الأداء السابقة (classify_early_score/score_breakdown)
             "source": r.get("early_source"),
-            # نفس الحقول التشخيصية للإشارات المبكرة، عشان نعرف أي مزيج (squeeze/accumulation/divergence)
-            # فرّق فعليًا بين "احتمالية" ناجحة و"مؤكدة" فاشلة، بدل ما نكتفي بتصنيف الثقة العام
+            # كل العوامل الفعلية المساهمة (squeeze/accumulation/divergence/momentum/fibonacci) —
+            # حقل جديد منفصل، يسمح بمعرفة هل فيبوناتشي أو divergence/momentum ساهموا فعليًا
+            # بدون المساس باستمرارية حقل source أعلاه
+            "factors": r.get("early_factors"),
+            "fib_extension_used": r.get("fib_extension_used"),
             "squeeze": r.get("squeeze"),
             "accumulation": r.get("accumulation"),
             "divergence": r.get("divergence"),
