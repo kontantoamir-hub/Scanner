@@ -1,0 +1,38 @@
+# 📊 تقرير الإشارات المبكرة فقط — early_report.yml
+# ==================================================
+# تشغيل يدوي فقط (workflow_dispatch) من تبويب Actions. الاسم والخطوات مكتوبة
+# بوضوح "المبكرة فقط" عشان ما يلتبس مع أي workflow ثاني بنفس المستودع
+# (scan.yml / backtest.yml / analyze.yml ...).
+
+name: "📊 تقرير المبكرة فقط"
+
+on:
+  workflow_dispatch:
+    inputs:
+      min_sample_size:
+        description: "الحد الأدنى لعدد الصفقات كي تُعرض التركيبة لوحدها (وإلا تُجمع بفئة أخرى)"
+        required: false
+        default: "10"
+
+jobs:
+  early-report:
+    name: "تقرير المبكرة فقط"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "📥 استنساخ المستودع"
+        uses: actions/checkout@v4
+
+      - name: "🐍 تجهيز بايثون"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: "📦 تثبيت المتطلبات"
+        run: pip install requests
+
+      - name: "📊 تشغيل تقرير المبكرة فقط"
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          MIN_SAMPLE_SIZE: ${{ github.event.inputs.min_sample_size }}
+        run: python early_report.py
