@@ -1418,6 +1418,11 @@ def open_new_early_positions(positions, fresh_early_signals):
     """
     يفتح متابعة تلقائية (TP/SL) لإشارات مبكرة توفّرت لها أهداف تقديرية، بنفس آلية
     الصفقات الرسمية لكن بحقل type="early" يُستخدم لاحقًا لتمييز رسائل النتيجة.
+
+    حقل "silent" (2026-09-03): True فقط لصفقات ثقة "احتمالية" (مؤشر واحد لوحده) —
+    تُفتح وتُتابع (TP/SL) وتُحفظ بالسجل بنفس الدقة تمامًا مثل أي صفقة أخرى، لكن بدون
+    إرسال أي رسالة تيليجرام لها (لا الإشارة الأولى ولا نتيجة الإغلاق) — الهدف تجميع
+    بيانات أداء عنها لتحليل التقارير فقط، دون إزعاج القناة بإشارات أضعف مستوى ثقة.
     """
     for r in fresh_early_signals:
         if r.get("early_entry") is None:
@@ -1435,6 +1440,7 @@ def open_new_early_positions(positions, fresh_early_signals):
             "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "type": "early",
             "confidence": r.get("early_confidence"),
+            "silent": r.get("early_confidence") == "احتمالية",
             # مصدر الإشارة الأساسي (accumulation / squeeze / accumulation+squeeze) — يبقى
             # كما هو لاستمرارية تحليلات الأداء السابقة (classify_early_score/score_breakdown)
             "source": r.get("early_source"),
@@ -1587,14 +1593,15 @@ def check_open_positions(positions, price_map):
             continue
 
         if price <= pos["sl"]:
-            result_text = format_sl_hit(pos, price)
-            send_telegram(result_text)
-            edit_telegram_strike(pos.get("alert_message_id"), build_progress_text(pos), result_text)
+            if not pos.get("silent"):
+                result_text = format_sl_hit(pos, price)
+                send_telegram(result_text)
+                edit_telegram_strike(pos.get("alert_message_id"), build_progress_text(pos), result_text)
+                time.sleep(1)
             pos["closed_reason"] = "SL"
             pos["closed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
             pos["exit_price"] = price
             closed_now.append(pos)
-            time.sleep(1)
             continue
 
         newly_hit = [i for i, tp in enumerate(pos["tps"]) if i not in pos["hit_tps"] and price >= tp]
@@ -1603,23 +1610,25 @@ def check_open_positions(positions, price_map):
                 pos["tp_notify_ids"] = [None] * len(pos["tps"])  # توافق مع صفقات فُتحت قبل هذا التحديث
 
             for i in newly_hit:
-                tp_text = format_tp_hit(pos, i, price)
-                msg_id = send_telegram(tp_text)
-                pos["tp_notify_ids"][i] = msg_id
-                time.sleep(1)
+                if not pos.get("silent"):
+                    tp_text = format_tp_hit(pos, i, price)
+                    msg_id = send_telegram(tp_text)
+                    pos["tp_notify_ids"][i] = msg_id
+                    time.sleep(1)
 
-                # احذف إشعار الهدف السابق المستقل (إن وُجد) كي لا تتراكم إشعارات منفصلة لكل هدف
-                prev_index = i - 1
-                if prev_index >= 0 and pos["tp_notify_ids"][prev_index]:
-                    delete_telegram_message(pos["tp_notify_ids"][prev_index])
-                    pos["tp_notify_ids"][prev_index] = None
+                    # احذف إشعار الهدف السابق المستقل (إن وُجد) كي لا تتراكم إشعارات منفصلة لكل هدف
+                    prev_index = i - 1
+                    if prev_index >= 0 and pos["tp_notify_ids"][prev_index]:
+                        delete_telegram_message(pos["tp_notify_ids"][prev_index])
+                        pos["tp_notify_ids"][prev_index] = None
 
                 pos["hit_tps"].append(i)
 
-                # عدّل رسالة الإشارة الأصلية تراكميًا: كل الأهداف المتحققة حتى الآن، كل واحد بسطره الخاص
-                hit_sorted = sorted(pos["hit_tps"])
-                lines = [format_tp_line(pos, j) for j in hit_sorted]
-                edit_telegram_append(pos.get("alert_message_id"), pos.get("alert_text", ""), lines)
+                if not pos.get("silent"):
+                    # عدّل رسالة الإشارة الأصلية تراكميًا: كل الأهداف المتحققة حتى الآن، كل واحد بسطره الخاص
+                    hit_sorted = sorted(pos["hit_tps"])
+                    lines = [format_tp_line(pos, j) for j in hit_sorted]
+                    edit_telegram_append(pos.get("alert_message_id"), pos.get("alert_text", ""), lines)
 
             if pos["sl"] < pos["entry"]:
                 pos["sl"] = pos["entry"]  # نقل SL لنقطة التعادل بعد أول هدف محقق
@@ -1627,8 +1636,9 @@ def check_open_positions(positions, price_map):
         if len(pos["hit_tps"]) >= len(pos["tps"]):
             # كل الأهداف تحققت -> إغلاق نهائي: نشطب رسالة الإشارة الأصلية (بما فيها كل أسطر
             # الأهداف المتراكمة) تمامًا كما يحصل عند SL/EXPIRED، بدل تركها بدون شطب نهائي
-            all_tp_text = "🏁 تحققت جميع الأهداف"
-            edit_telegram_strike(pos.get("alert_message_id"), build_progress_text(pos), all_tp_text)
+            if not pos.get("silent"):
+                all_tp_text = "🏁 تحققت جميع الأهداف"
+                edit_telegram_strike(pos.get("alert_message_id"), build_progress_text(pos), all_tp_text)
             pos["closed_reason"] = "ALL_TP"
             pos["closed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
             pos["exit_price"] = price
@@ -1642,18 +1652,19 @@ def check_open_positions(positions, price_map):
         if hours_open >= TIME_STOP_HOURS:
             pct_change = (price - pos["entry"]) / pos["entry"] * 100
             status = "بربح" if pct_change > 0 else ("بخسارة" if pct_change < 0 else "بدون تغيير")
-            expired_text = (
-                f"⏱️ انتهت صلاحية المراقبة (سقف زمني) — متوقفة {status}\n{pos['symbol'].replace('USDT','/USDT')}\n"
-                f"الدخول: {pos['entry']:.6g} | الحالي: {price:.6g} | مدة المراقبة: {hours_open:.0f}س\n"
-                f"النسبة: {pct_change:+.2f}%"
-            )
-            send_telegram(expired_text)
-            edit_telegram_strike(pos.get("alert_message_id"), build_progress_text(pos), expired_text)
+            if not pos.get("silent"):
+                expired_text = (
+                    f"⏱️ انتهت صلاحية المراقبة (سقف زمني) — متوقفة {status}\n{pos['symbol'].replace('USDT','/USDT')}\n"
+                    f"الدخول: {pos['entry']:.6g} | الحالي: {price:.6g} | مدة المراقبة: {hours_open:.0f}س\n"
+                    f"النسبة: {pct_change:+.2f}%"
+                )
+                send_telegram(expired_text)
+                edit_telegram_strike(pos.get("alert_message_id"), build_progress_text(pos), expired_text)
+                time.sleep(1)
             pos["closed_reason"] = "EXPIRED"
             pos["closed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
             pos["exit_price"] = price
             closed_now.append(pos)
-            time.sleep(1)
             continue
 
         still_open.append(pos)
@@ -1795,6 +1806,10 @@ def main():
         time.sleep(1)  # تجنب تجاوز حد تيليجرام لعدد الرسائل بالثانية
 
     for r in fresh_early:
+        # ثقة "احتمالية" (مؤشر واحد فقط): تُفتح كصفقة متابعة صامتة بالأسفل (open_new_early_positions)
+        # ولا تُرسل بتيليجرام إطلاقًا — الهدف تجميع بيانات أداء للتقارير فقط بدون إزعاج القناة
+        if r.get("early_confidence") == "احتمالية":
+            continue
         alert_text = format_early_alert(r)
         r["_msg_id"] = send_telegram(alert_text)
         r["_alert_text"] = alert_text
