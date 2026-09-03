@@ -1422,10 +1422,11 @@ def save_all_state(alerted_symbols, btc_dominance, positions, closed_delta, gist
 # ---------------- تتبع الصفقات المفتوحة (TP / SL) ----------------
 
 def open_new_positions(positions, fresh_signals):
-    """يضيف كل إشارة شراء جديدة أُرسلت كصفقة مفتوحة قيد المتابعة. يُعدّل القائمة في المكان (in place)."""
+    """يضيف كل إشارة شراء جديدة أُرسلت كصفقة مفتوحة قيد المتابعة. يُعدّل القائمة في المكان (in place).
+    ملاحظة: تم حذف الحقول التشخيصية لتقليص حجم open_positions.json وضمان حفظه في Gist."""
     for r in fresh_signals:
         if r.get("entry") is None:
-            continue  # لا خطة دخول (تجنب شراء) -> لا داعي لتتبعها
+            continue
         positions.append({
             "symbol": r["symbol"],
             "entry": r["entry"],
@@ -1434,28 +1435,10 @@ def open_new_positions(positions, fresh_signals):
             "hit_tps": [],
             "tp_notify_ids": [None] * len(r["tps"]),
             "score": r["score"],
-            "trend_up": r["trend_up"],   # اتجاه EMA9/21 وقت فتح الصفقة، يُستخدم لاحقًا لكشف انعكاس الإشارة
+            "trend_up": r["trend_up"],
             "interval": INTERVAL,
             "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "type": "official",
-            # حقول تشخيصية: أي عوامل كانت حاضرة وقت الدخول -> تحليل لاحق لأثر كل عامل على النجاح/الفشل
-            "squeeze": r.get("squeeze"),
-            "accumulation": r.get("accumulation"),
-            "divergence": r.get("divergence"),
-            "extended": r.get("extended"),
-            # مؤشرات الدرجة الأساسية (توسيع تشخيصي) -> لمعرفة مزيج المؤشرات الأساسية وراء
-            # كل إشارة، حتى الصفقات التي لا يوجد فيها أي عامل إضافي أعلاه
-            "rsi_state": r.get("rsi_state"),
-            "macd_bull": r.get("macd_bull"),
-            "bb_state": r.get("bb_state"),
-            "vol_confirm": r.get("vol_confirm"),
-            "ranging": r.get("ranging"),
-            "near_resistance": r.get("near_resistance"),
-            "obv_confirm": r.get("obv_confirm"),
-            "htf_aligned": r.get("htf_aligned"),
-            "market_regime": r.get("market_regime"),
-            "fib_level": r.get("fib_level"),
-            "fib_support": r.get("fib_support"),
             "logic_version": OFFICIAL_LOGIC_VERSION,
             "alert_message_id": r.get("_msg_id"),
             "alert_text": r.get("_alert_text"),
@@ -1464,13 +1447,8 @@ def open_new_positions(positions, fresh_signals):
 
 def open_new_early_positions(positions, fresh_early_signals):
     """
-    يفتح متابعة تلقائية (TP/SL) لإشارات مبكرة توفّرت لها أهداف تقديرية، بنفس آلية
-    الصفقات الرسمية لكن بحقل type="early" يُستخدم لاحقًا لتمييز رسائل النتيجة.
-
-    حقل "silent" (2026-09-03): True فقط لصفقات ثقة "احتمالية" (مؤشر واحد لوحده) —
-    تُفتح وتُتابع (TP/SL) وتُحفظ بالسجل بنفس الدقة تمامًا مثل أي صفقة أخرى، لكن بدون
-    إرسال أي رسالة تيليجرام لها (لا الإشارة الأولى ولا نتيجة الإغلاق) — الهدف تجميع
-    بيانات أداء عنها لتحليل التقارير فقط، دون إزعاج القناة بإشارات أضعف مستوى ثقة.
+    يفتح متابعة تلقائية (TP/SL) لإشارات مبكرة توفّرت لها أهداف تقديرية.
+    ملاحظة: تم حذف الحقول التشخيصية لتقليص حجم open_positions.json.
     """
     for r in fresh_early_signals:
         if r.get("early_entry") is None:
@@ -1489,29 +1467,8 @@ def open_new_early_positions(positions, fresh_early_signals):
             "type": "early",
             "confidence": r.get("early_confidence"),
             "silent": r.get("early_confidence") == "احتمالية",
-            # مصدر الإشارة الأساسي (accumulation / squeeze / accumulation+squeeze) — يبقى
-            # كما هو لاستمرارية تحليلات الأداء السابقة (classify_early_score/score_breakdown)
             "source": r.get("early_source"),
-            # كل العوامل الفعلية المساهمة (squeeze/accumulation/divergence/momentum/fibonacci) —
-            # حقل جديد منفصل، يسمح بمعرفة هل فيبوناتشي أو divergence/momentum ساهموا فعليًا
-            # بدون المساس باستمرارية حقل source أعلاه
             "factors": r.get("early_factors"),
-            "fib_extension_used": r.get("fib_extension_used"),
-            "squeeze": r.get("squeeze"),
-            "accumulation": r.get("accumulation"),
-            "divergence": r.get("divergence"),
-            "extended": r.get("extended"),
-            "rsi_state": r.get("rsi_state"),
-            "macd_bull": r.get("macd_bull"),
-            "bb_state": r.get("bb_state"),
-            "vol_confirm": r.get("vol_confirm"),
-            "ranging": r.get("ranging"),
-            "near_resistance": r.get("near_resistance"),
-            "obv_confirm": r.get("obv_confirm"),
-            "htf_aligned": r.get("htf_aligned"),
-            "market_regime": r.get("market_regime"),
-            "fib_level": r.get("fib_level"),
-            "fib_support": r.get("fib_support"),
             "alert_message_id": r.get("_msg_id"),
             "alert_text": r.get("_alert_text"),
         })
@@ -1519,8 +1476,8 @@ def open_new_early_positions(positions, fresh_early_signals):
 
 def open_new_breakout_positions(positions, fresh_breakout_signals):
     """
-    يفتح متابعة تلقائية (TP/SL) لإشارات الانفجار (breakout) بنفس آلية الصفقات
-    الرسمية/المبكرة، بحقل type="breakout" يُستخدم لاحقًا لتمييز رسائل النتيجة.
+    يفتح متابعة تلقائية (TP/SL) لإشارات الانفجار (breakout).
+    ملاحظة: تم حذف الحقول التشخيصية لتقليص حجم open_positions.json.
     """
     for r in fresh_breakout_signals:
         if r.get("breakout_entry") is None:
@@ -1538,18 +1495,6 @@ def open_new_breakout_positions(positions, fresh_breakout_signals):
             "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "type": "breakout",
             "breakout_details": r.get("breakout_details"),
-            "extended": r.get("extended"),
-            "rsi_state": r.get("rsi_state"),
-            "macd_bull": r.get("macd_bull"),
-            "bb_state": r.get("bb_state"),
-            "vol_confirm": r.get("vol_confirm"),
-            "ranging": r.get("ranging"),
-            "near_resistance": r.get("near_resistance"),
-            "obv_confirm": r.get("obv_confirm"),
-            "htf_aligned": r.get("htf_aligned"),
-            "market_regime": r.get("market_regime"),
-            "fib_level": r.get("fib_level"),
-            "fib_support": r.get("fib_support"),
             "alert_message_id": r.get("_msg_id"),
             "alert_text": r.get("_alert_text"),
         })
