@@ -1143,25 +1143,37 @@ def _gist_headers():
     return {"Authorization": f"token {GIST_TOKEN}", "Accept": "application/vnd.github+json"}
 
 
+class GistFetchError(Exception):
+    """يُرفع عند فشل فعلي (شبكة/انقطاع/rate limit/...) بجلب ملفات الـ Gist.
+    مقصود بها التمييز الصريح بين 'فشل الجلب مؤقتًا' و'الملف فارغ فعلاً' —
+    قبل هذا التعديل كانت الحالتان تُرجعان {} بالضبط، فيظن البوت أن لا صفقات مفتوحة
+    أصلاً ويحفظ حالة فارغة/ناقصة فوق الحالة الحقيقية بالـGist (فقدان صامت للبيانات)."""
+    pass
+
+
 def _gist_get_all_files():
-    """يقرأ قاموس كل ملفات الـ Gist دفعة واحدة (اسم -> بيانات الملف بما فيها content)."""
+    """يقرأ قاموس كل ملفات الـ Gist دفعة واحدة (اسم -> بيانات الملف بما فيها content).
+    يُستدعى مرة واحدة فقط في بداية main() والنتيجة تُمرَّر لبقية الدوال، بدل ما تجلب
+    كل دالة (load_state/load_positions/load_closed/save_all_state) نسختها الخاصة —
+    هذا يقلل عدد طلبات GitHub API وأي فرصة لفشل جزئي بمنتصف الرن.
+    يرفع GistFetchError عند أي خطأ شبكي/HTTP فعلي (بدل إرجاع {} صامتًا)."""
     if not GIST_TOKEN or not GIST_ID:
+        print("⚠️ GIST_TOKEN أو GIST_ID غير موجودين — سيعمل البوت بذاكرة فارغة هذا التشغيل.")
         return {}
     try:
         r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=_gist_headers(), timeout=15)
         r.raise_for_status()
         return r.json().get("files", {})
     except Exception as e:
-        print(f"تعذّر قراءة ملفات Gist ({e})")
-        return {}
+        raise GistFetchError(f"تعذّر قراءة ملفات Gist: {e}") from e
 
 
-def _gist_get_file(filename):
-    """يقرأ محتوى ملف واحد داخل الـ Gist (يرجع None لو غير موجود أو حصل خطأ)."""
-    files = _gist_get_all_files()
-    if filename not in files:
+def _gist_get_file(filename, gist_files):
+    """يقرأ محتوى ملف واحد من قاموس ملفات مُجلب مسبقًا (بدون أي طلب شبكة جديد).
+    يرجع None لو الملف غير موجود فعليًا ضمن الملفات المجلوبة بنجاح."""
+    if filename not in gist_files:
         return None
-    return files[filename]["content"]
+    return gist_files[filename]["content"]
 
 
 def archive_overflow(overflow_trades, gist_files):
@@ -1221,12 +1233,9 @@ def _gist_patch_files(files_dict):
         print("خطأ حفظ الحالة في Gist:", e)
 
 
-def load_state():
-    """يحمّل ذاكرة الإشارات المرسلة وآخر قيمة BTC Dominance من Gist خاص، بدل ملف داخل المستودع."""
-    if not GIST_TOKEN or not GIST_ID:
-        print("⚠️ GIST_TOKEN أو GIST_ID غير موجودين — سيبدأ البوت بذاكرة فارغة هذا التشغيل.")
-        return set(), None
-    content = _gist_get_file(GIST_FILENAME)
+def load_state(gist_files):
+    """يحمّل ذاكرة الإشارات المرسلة وآخر قيمة BTC Dominance من قاموس ملفات مُجلب مسبقًا."""
+    content = _gist_get_file(GIST_FILENAME, gist_files)
     if not content:
         return set(), None
     try:
@@ -1237,9 +1246,9 @@ def load_state():
         return set(), None
 
 
-def load_positions():
-    """يحمّل الصفقات المفتوحة قيد المتابعة من الـ Gist."""
-    content = _gist_get_file(POSITIONS_GIST_FILE)
+def load_positions(gist_files):
+    """يحمّل الصفقات المفتوحة قيد المتابعة من قاموس ملفات مُجلب مسبقًا."""
+    content = _gist_get_file(POSITIONS_GIST_FILE, gist_files)
     if not content:
         return []
     try:
@@ -1249,8 +1258,8 @@ def load_positions():
         return []
 
 
-def load_closed():
-    content = _gist_get_file(CLOSED_GIST_FILE)
+def load_closed(gist_files):
+    content = _gist_get_file(CLOSED_GIST_FILE, gist_files)
     if not content:
         return []
     try:
@@ -1326,13 +1335,17 @@ def compute_stats(history):
     }
 
 
-def save_all_state(alerted_symbols, btc_dominance, positions, closed_delta):
+def save_all_state(alerted_symbols, btc_dominance, positions, closed_delta, gist_files):
     """
     يحفظ في نفس الطلب: حالة التنبيهات + BTC Dominance + الصفقات المفتوحة،
     ويُلحق أي صفقات أُغلقت هذا التشغيل بسجل closed_trades (مع سقف للحجم).
     كما يحسب إحصائيات أداء (stats.json) من السجل المحدَّث — تتبع فقط، بدون
     أي تأثير على منطق الفحص أو الدخول. يرجع الإحصائيات (أو None) للاستخدام
     الاختياري في إرسال تقرير دوري.
+
+    gist_files: نفس القاموس المُجلب مرة واحدة في بداية main() — بلا أي إعادة جلب هنا،
+    كي لا يتعرض الحفظ لفشل شبكي مستقل في آخر لحظة (كان هذا هو الخلل سابقًا: إعادة
+    جلب مستقلة عند وجود closed_delta كانت تفشل بصمت لـ{} وتمسح سجل الصفقات المغلقة).
     """
     files = {
         GIST_FILENAME: json.dumps(
@@ -1344,8 +1357,6 @@ def save_all_state(alerted_symbols, btc_dominance, positions, closed_delta):
 
     stats = None
     if closed_delta:
-        # نجلب كل ملفات الـ Gist دفعة واحدة (نحتاجها للسجل النشط ولملفات الأرشيف معًا)
-        gist_files = _gist_get_all_files()
         try:
             history = json.loads(gist_files.get(CLOSED_GIST_FILE, {}).get("content") or "[]")
         except Exception:
@@ -1688,11 +1699,24 @@ def fetch_btc_dominance():
 def main():
     print(f"بدء المسح — {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
+    # نجلب كل ملفات الـGist مرة واحدة بالبداية (بدل ما تجلب كل دالة نسختها الخاصة).
+    # لو فشل الجلب فعليًا (rate limit / انقطاع شبكة / timeout) — نوقف الرن بالكامل هنا
+    # فورًا، قبل أي فحص صفقات أو إرسال تنبيهات أو حفظ. هذا يمنع بالضبط الخلل السابق:
+    # فشل مؤقت كان يُترجم صامتًا لـ"صفر صفقات مفتوحة" ثم يُحفظ فوق الحالة الحقيقية.
+    # التشغيلة القادمة (خلال ~15 دقيقة حسب جدول scan.yml) تعيد المحاولة تلقائيًا،
+    # ولا شيء يُفقد بالـGist.
+    try:
+        gist_files = _gist_get_all_files()
+    except GistFetchError as e:
+        print(f"⛔ {e} — تم إيقاف هذا التشغيل بالكامل بدل الكتابة فوق الحالة الصحيحة "
+              f"بحالة فارغة/ناقصة. سيُعاد المحاولة تلقائيًا بالتشغيلة القادمة.")
+        return
+
     tickers = fetch_ticker24h()
     price_map = fetch_prices_map(tickers)
 
     # قبل أي مسح جديد: تفقّد الصفقات المفتوحة سابقًا مقابل السعر الحالي (TP / SL)
-    open_positions = load_positions()
+    open_positions = load_positions(gist_files)
     open_positions, closed_now = check_open_positions(open_positions, price_map)
 
     results = run_scan(tickers)
@@ -1775,7 +1799,7 @@ def main():
     ]
     breakout_keys = {f"{r['symbol']}:breakout" for r in breakout_eligible}
 
-    prev_alerted, prev_dominance = load_state()
+    prev_alerted, prev_dominance = load_state(gist_files)
     fresh = [r for r in strong if r["symbol"] not in prev_alerted]
     fresh_early = [r for r in early_eligible if f"{r['symbol']}:early" not in prev_alerted]
     fresh_breakout = [r for r in breakout_eligible if f"{r['symbol']}:breakout" not in prev_alerted]
@@ -1828,7 +1852,7 @@ def main():
 
     # حفظ موحّد: ذاكرة الإشارات (رسمية + مبكرة + انفجار) + BTC Dominance + الصفقات المفتوحة + أرشيف الصفقات المغلقة حديثًا
     # + إحصائيات أداء محسوبة من السجل المحدَّث (خيار 3: تتبع فقط، بدون تعديل تلقائي على منطق البوت)
-    save_all_state(strong_symbols | early_keys | breakout_keys, btc_dominance, open_positions, closed_now)
+    save_all_state(strong_symbols | early_keys | breakout_keys, btc_dominance, open_positions, closed_now, gist_files)
 
     print("انتهى المسح.")
 
