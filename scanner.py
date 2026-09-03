@@ -53,10 +53,10 @@ FIB_LEVELS = (0.382, 0.5, 0.618, 0.786)   # النسب الكلاسيكية ال
 FIB_PROXIMITY_PCT = 1.0         # لو السعر أقرب من هذه النسبة% لمستوى فيبوناتشي -> يُعتبر عنده
 
 # ---------- إعدادات مستويات امتداد فيبوناتشي (Fibonacci Extension) ----------
-# تُستخدم فقط لإعطاء هدف ثاني حقيقي للإشارة المبكرة في الحالة الوحيدة التي كانت تبقى
-# بهدف واحد (شرط واحد فقط متحقق: accumulation أو squeeze لوحده) — بدل هدف مبني فقط على
-# مضاعف ATR، نبحث عن أقرب مستوى امتداد فيبوناتشي (1.272/1.618) فوق نفس الحركة السعرية
-# الأخيرة (swing)، وإن وُجد ومنطقي (فوق TP1 ولا يتجاوز أقرب مقاومة) نضيفه كـTP2.
+# تحديث 2026-09-02: أُزيل استخدامها بالكامل من منطق الإشارة المبكرة (لم تعد تُضاف كـTP2
+# مهما كان عدد الشروط المتحققة) — الاعتماد الآن على هدف واحد فقط عند التنفيذ الفعلي، ما
+# يجعل حاجة الأهداف المتعددة غير قائمة. الدالة fibonacci_extension_levels وحقل
+# fib_extension_used بقيا بالكود لكن fib_extension_used يبقى False دائمًا الآن.
 FIB_EXTENSION_LEVELS = (1.272, 1.618)
 
 # ---------- إعدادات فلتر الإرهاق/الامتداد الزائد (Overextension) ----------
@@ -98,9 +98,9 @@ MIN_PROFIT_PCT = float(os.environ.get("MIN_PROFIT_PCT", "1.0"))
 # وقف خسارة أوسع من الإشارة الرسمية (1.5×ATR) لأن نقطة الدخول أقل دقة والتقلب حولها أعلى
 EARLY_SL_ATR_MULT = 2.0
 # عدد الأهداف يعتمد على عدد الشروط المتحققة (squeeze / accumulation / divergence / momentum: 1-4 أهداف).
-# الثقة (بعد تعديل مبني على بيانات فعلية بتاريخ 2026-08-18): accumulation حاضر -> مؤكدة
-# مباشرة (حتى لو وحيدًا)؛ squeeze حاضر بدون accumulation -> يحتاج شرطًا إضافيًا وإلا
-# لا تُطلق إشارة أصلاً؛ 3 شروط فأكثر (بأي مزيج) -> مؤكدة قوية.
+# تحديث 2026-09-02: الأربعة صاروا محفزات مستقلة تمامًا — أي واحد منهم لوحده كافٍ لإطلاق
+# إشارة (لم تعد مقتصرة على accumulation/squeeze، ولم يعد squeeze يحتاج شرطًا إضافيًا).
+# درجات الثقة: مؤشر واحد -> احتمالية؛ اثنان -> مؤكدة؛ 3 فأكثر (بأي مزيج) -> مؤكدة قوية.
 
 
 # ---------------- دوال المؤشرات الفنية ----------------
@@ -699,21 +699,22 @@ def analyze_symbol(t, interval):
         # وقف خسارة أوسع (ATR×2) لأن الدخول أقل تأكيدًا، وعدد أهداف حسب مستوى الثقة،
         # مع تقليم أي هدف يتجاوز أقرب مقاومة معروفة كي لا نضع هدفًا خلف حاجز سعري واضح.
         #
-        # وزن الثقة مبني على بيانات فعلية (score_breakdown_by_factor.py على 212 صفقة
-        # مبكرة مغلقة): accumulation لوحده أثبت نجاحًا عاليًا وثابتًا (83-100%) بغض
-        # النظر عن أي شرط إضافي، بينما squeeze لوحده (بدون accumulation) كان أضعف من
-        # عدم وجوده أصلاً عند نفس مستوى الدرجة. لذلك:
-        #   - accumulation حاضر -> "مؤكدة" مباشرة حتى لو كان الشرط الوحيد (أو "مؤكدة
-        #     قوية" لو توفرت 3 شروط فأكثر)
-        #   - squeeze حاضر بدون accumulation -> يحتاج شرطًا إضافيًا (divergence أو
-        #     momentum) ليُطلق إشارة أصلاً؛ squeeze وحيدًا لا يكفي بعد الآن (لا إشارة)
+        # تحديث 2026-09-02: الأربعة (squeeze/accumulation/divergence/momentum) صارت
+        # محفزات مستقلة تمامًا — أي واحد منها لوحده كافٍ لإطلاق إشارة (كانت مقتصرة سابقًا
+        # على accumulation/squeeze، وsqueeze كان يحتاج شرطًا إضافيًا وإلا لا تُطلق إشارة
+        # أصلاً). الهدف: معرفة أي مؤشر قوي فعليًا وأي واحد ضعيف (خصوصًا divergence
+        # وmomentum اللي ما كان عندهم بيانات كمحفز منفرد إطلاقًا من قبل) بدل افتراض
+        # ضعفهم مسبقًا بدون دليل.
         #
-        # حقل early_factors (مضاف): قائمة كل العوامل الأربعة الفعلية الحاضرة فعليًا
-        # (squeeze/accumulation/divergence/momentum) — منفصل عن early_source (مصدر
-        # الإطلاق التاريخي المستخدم بتحليلات الأداء السابقة) لتفادي كسر استمرارية
-        # تحليل score_breakdown_by_factor.py وclassify_early_score، مع حل مشكلة أن
-        # "المصدر" المعروض كان يذكر فقط accumulation/squeeze حتى لو كان عدد الأهداف
-        # (2 أو 3) ناتجًا فعليًا عن مساهمة divergence/momentum أيضًا.
+        # درجات الثقة: مؤشر واحد = "احتمالية"، اثنان = "مؤكدة"، 3 فأكثر = "مؤكدة قوية".
+        # عدد الأهداف = عدد المؤشرات المتحققة (1-4).
+        #
+        # حقل early_factors: قائمة كل العوامل الفعلية الحاضرة (squeeze/accumulation/
+        # divergence/momentum) مرتبة أبجديًا. early_source يُبنى من نفس التركيبة الدقيقة
+        # (مثل "divergence+squeeze") بدل الاختصار القديم المقتصر على accumulation/squeeze.
+        #
+        # الفيبوناتشي أُزيل بالكامل من هذا المنطق (كان يضيف TP2 فقط عند شرط واحد متحقق) —
+        # الاعتماد الآن على هدف واحد فقط عند التنفيذ الفعلي؛ fib_extension_used يبقى False دائمًا.
         early_entry = early_sl = None
         early_tps = []
         early_confidence = None
@@ -721,62 +722,49 @@ def analyze_symbol(t, interval):
         early_factors = []
         fib_extension_used = False
         momentum = momentum_strength(ind["macd"], ind["signal"], ind["rsi"], last)
-        if squeeze or accumulation:
-            conditions_met = sum([squeeze, accumulation, r["divergence"], momentum])
-            valid_early = accumulation or (squeeze and conditions_met >= 2)
-            if valid_early:
-                early_confidence = "مؤكدة قوية" if conditions_met >= 3 else "مؤكدة"
-                if accumulation and squeeze:
-                    early_source = "accumulation+squeeze"
-                elif accumulation:
-                    early_source = "accumulation"
-                else:
-                    early_source = "squeeze"
-                if accumulation:
-                    early_factors.append("accumulation")
-                if squeeze:
-                    early_factors.append("squeeze")
-                if r["divergence"]:
-                    early_factors.append("divergence")
-                if momentum:
-                    early_factors.append("momentum")
+        conditions_met = sum([squeeze, accumulation, r["divergence"], momentum])
+        if conditions_met >= 1:
+            if conditions_met >= 3:
+                early_confidence = "مؤكدة قوية"
+            elif conditions_met == 2:
+                early_confidence = "مؤكدة"
+            else:
+                early_confidence = "احتمالية"
 
-                early_entry = ind["closes"][last]
-                atrv = atr_value(ind)
-                atr_risk = atrv * EARLY_SL_ATR_MULT
-                min_risk_for_target = early_entry * (MIN_PROFIT_PCT / 100)
-                early_risk = max(atr_risk, min_risk_for_target)
-                early_sl = early_entry - early_risk
-                early_tp_count = conditions_met  # عدد الأهداف = عدد الشروط المتحققة فعليًا لهاي العملة (1 إلى 4)
-                raw_tps = [early_entry + early_risk * i for i in range(1, early_tp_count + 1)]
-                resistance = r.get("resistance")
+            if accumulation:
+                early_factors.append("accumulation")
+            if r["divergence"]:
+                early_factors.append("divergence")
+            if momentum:
+                early_factors.append("momentum")
+            if squeeze:
+                early_factors.append("squeeze")
+            early_factors.sort()
+            early_source = "+".join(early_factors)
 
-                # فيبوناتشي كهدف ثاني حقيقي: فقط لو الإشارة أصلاً بشرط واحد متحقق (هدف
-                # واحد بس بالمنطق القديم) ولقينا مستوى امتداد منطقي فوق TP1 ولا يتجاوز
-                # أقرب مقاومة معروفة (لو موجودة) — وإلا تبقى الإشارة بهدف واحد كالسابق.
-                if early_tp_count == 1:
-                    ext_levels = fibonacci_extension_levels(ind["highs"][:last + 1], ind["lows"][:last + 1])
-                    ext_candidates = sorted(p for p in ext_levels.values() if p > raw_tps[0])
-                    if resistance:
-                        ext_candidates = [p for p in ext_candidates if p < resistance]
-                    if ext_candidates:
-                        raw_tps.append(ext_candidates[0])
-                        fib_extension_used = True
-                        early_factors.append("fibonacci")
+            early_entry = ind["closes"][last]
+            atrv = atr_value(ind)
+            atr_risk = atrv * EARLY_SL_ATR_MULT
+            min_risk_for_target = early_entry * (MIN_PROFIT_PCT / 100)
+            early_risk = max(atr_risk, min_risk_for_target)
+            early_sl = early_entry - early_risk
+            early_tp_count = conditions_met  # عدد الأهداف = عدد الشروط المتحققة فعليًا لهاي العملة (1 إلى 4)
+            raw_tps = [early_entry + early_risk * i for i in range(1, early_tp_count + 1)]
+            resistance = r.get("resistance")
 
-                if resistance:
-                    # نوقف توليد الأهداف عند أول هدف يتجاوز أقرب مقاومة بدل تقليم كل هدف
-                    # لنفس سقف المقاومة — التقليم القديم كان يجعل TP1 وTP2 يتساويان بالضبط
-                    # كلما تجاوز أكثر من هدف نفس المقاومة معًا.
-                    trimmed = []
-                    for tp in raw_tps:
-                        if tp >= resistance:
-                            trimmed.append(resistance)
-                            break
-                        trimmed.append(tp)
-                    early_tps = trimmed
-                else:
-                    early_tps = raw_tps
+            if resistance:
+                # نوقف توليد الأهداف عند أول هدف يتجاوز أقرب مقاومة بدل تقليم كل هدف
+                # لنفس سقف المقاومة — التقليم القديم كان يجعل TP1 وTP2 يتساويان بالضبط
+                # كلما تجاوز أكثر من هدف نفس المقاومة معًا.
+                trimmed = []
+                for tp in raw_tps:
+                    if tp >= resistance:
+                        trimmed.append(resistance)
+                        break
+                    trimmed.append(tp)
+                early_tps = trimmed
+            else:
+                early_tps = raw_tps
 
         # إشارة انفجار (Breakout) — اختراق قمة سابقة مع تأكيد حجم، مستقلة عن الدرجة الرسمية
         breakout = breakout_detect(ind["highs"], ind["closes"], ind["vols"])
@@ -1058,30 +1046,9 @@ def format_alert(r, market_caution=False):
     dot = "🟢" if is_buy else "🔴"
     title = "إشارة شراء" if is_buy else "تجنب شراء"
 
-    badges = []
-    if r["persistent"]:
-        badges.append("مستقرة")
-    if r["htf_checked"]:
-        badges.append("متوافقة مع فريم أعلى" if r["htf_aligned"] else "تعاكس فريم أعلى")
-    if r.get("divergence"):
-        badges.append("انحراف صعودي مؤكد")
-    if r.get("obv_confirm"):
-        badges.append("حجم داعم (OBV)")
-    if r.get("ranging"):
-        badges.append("⚠️ سوق عرضي (ADX ضعيف)")
-    if r.get("near_resistance"):
-        badges.append("⚠️ قريب من مقاومة قوية")
-    if r.get("extended"):
-        badges.append("⚠️ حركة ممتدة (احتمال شراء متأخر)")
-    if r.get("fib_support"):
-        badges.append(f"دعم فيبوناتشي {r['fib_level']}")
-    badge_txt = f" ({', '.join(badges)})" if badges else ""
-
     lines = [
         f"{dot} {title}",
         r['symbol'].replace('USDT', '/USDT'),
-        f"القوة: {classify_official_score(r['score'])} ({r['score']:.1f}) | فريم: {INTERVAL}{badge_txt}",
-        f"السعر: {r['price']:.6g}",
     ]
 
     if r.get("entry") is not None:
@@ -1093,49 +1060,27 @@ def format_alert(r, market_caution=False):
         # السوق الفوري لا يدعم فتح صفقة بيع مكشوفة — فلا توجد خطة دخول لإشارات "تجنب شراء"
         lines.append("لا توجد خطة دخول (تحذير فقط)")
 
-    if market_caution:
-        lines.append("⚠️ سيطرة BTC (Dominance) تتحرك بقوة الآن — إشارات العملات البديلة أقل موثوقية مؤقتًا")
-
     return "\n".join(lines)
-
-
-# تسميات كل عامل من عوامل الإشارة المبكرة (تُستخدم لبناء سطر "المصدر" كاملاً بترتيب ثابت،
-# بدل الاكتفاء بذكر accumulation/squeeze فقط كما كان سابقًا)
-EARLY_FACTOR_LABELS = {
-    "accumulation": "تراكم صامت",
-    "squeeze": "انضغاط تقلب",
-    "divergence": "انحراف صعودي",
-    "momentum": "زخم",
-    "fibonacci": "فيبوناتشي",
-}
 
 
 def format_early_alert(r):
     """
-    تنبيه رادار مبكر: انضغاط تقلب و/أو تراكم صامت لعملة لم تصل بعد لإشارة شراء كاملة.
-    يعرض أهدافًا تقديرية (وقف خسارة أوسع من الرسمية + عدد أهداف متغير حسب مستوى الثقة)،
-    وتُتابَع تلقائيًا (TP/SL) ضمن نفس آلية الصفقات المفتوحة — لكنها تبقى أقل تأكيدًا
-    من الإشارة الرسمية. قالب مختصر: بدون سطر المؤشرات وبدون السعر الحالي المنفصل،
-    مع الإبقاء فقط على تحذير الحركة الممتدة عند انطباقه.
-
-    سطر "المصدر" يعرض الآن كل العوامل الفعلية المساهمة (accumulation/squeeze/divergence/
-    momentum/fibonacci) وليس فقط accumulation/squeeze كما كان سابقًا — لتفادي التناقض
-    بين عدد الأهداف المعروضة ومصدر واحد أو اثنين فقط مذكورين بالرسالة.
+    تنبيه رادار مبكر: أي من المؤشرات الأربعة (accumulation/squeeze/divergence/momentum)
+    لعملة لم تصل بعد لإشارة شراء كاملة. يعرض أهدافًا تقديرية (وقف خسارة أوسع من الرسمية
+    + عدد أهداف متغير حسب مستوى الثقة)، وتُتابَع تلقائيًا (TP/SL) ضمن نفس آلية الصفقات
+    المفتوحة. قالب مختصر: النوع + الرمز + المصدر (بالإنجليزية الخام، بدون ترجمة) +
+    الدخول/الأهداف/وقف الخسارة فقط.
     """
     confidence = r.get("early_confidence")
     dot = "🟢" if confidence == "مؤكدة قوية" else ("🟣" if confidence == "مؤكدة" else "🔵")
-    title = f"إشارة مبكرة - {confidence}" if confidence else "إشارة مبكرة"
+    title = f"إشارة {confidence}" if confidence else "إشارة مبكرة"
 
     factors = r.get("early_factors") or []
-    source_label = " + ".join(EARLY_FACTOR_LABELS[f] for f in factors if f in EARLY_FACTOR_LABELS)
-
-    conditions_met = len([f for f in factors if f != "fibonacci"])
-    strength_label = classify_early_score(r.get("early_source"), conditions_met)
+    source_label = "+".join(factors)
 
     lines = [
         f"{dot} {title}",
         r['symbol'].replace('USDT', '/USDT'),
-        f"القوة: {strength_label} ({r['score']:.1f}) | فريم: {INTERVAL}",
     ]
     if source_label:
         lines.append(f"المصدر: {source_label}")
@@ -1146,11 +1091,6 @@ def format_early_alert(r):
             lines.append(f"TP {i}: {tp:.6g}")
         lines.append(f"SL : {r['early_sl']:.6g}")
 
-    if r.get("extended"):
-        lines.append("⚠️ حركة ممتدة")
-    if r.get("fib_support"):
-        lines.append(f"دعم فيبوناتشي {r['fib_level']}")
-
     return "\n".join(lines)
 
 
@@ -1158,32 +1098,30 @@ def format_breakout_alert(r):
     """إشارة انفجار زخم: اختراق قمة سابقة مع تأكيد حجم — تدخل مبكرًا مع بداية الزخم."""
     b_score = r.get("breakout_score", 0)
     dot = "🟠" if b_score >= 3 else ("🟡" if b_score >= 2 else "⚪")
-    title = "إشارة انفجار زخم"
+    title = "إشارة انفجار"
     details = r.get("breakout_details", {})
-    badges = []
+    factors = []
     if details.get("trend_support"):
-        badges.append("EMA7/14 داعم")
+        factors.append("trend_support")
     if details.get("macd_bull"):
-        badges.append("MACD إيجابي")
+        factors.append("macd_bull")
     if details.get("rsi_ok"):
-        badges.append("RSI مناسب")
-    badge_txt = f" ({', '.join(badges)})" if badges else ""
+        factors.append("rsi_ok")
+    source_label = "+".join(factors)
+
     lines = [
-        f"{dot} {title}{badge_txt}",
+        f"{dot} {title}",
         r['symbol'].replace('USDT', '/USDT'),
-        f"جودة الاختراق: {b_score}/3 | فريم: {INTERVAL}",
-        f"السعر: {r['price']:.6g}",
     ]
+    if source_label:
+        lines.append(f"المصدر: {source_label}")
+
     if r.get("breakout_entry") is not None:
         lines.append(f"الدخول: {r['breakout_entry']:.6g}")
         for i, tp in enumerate(r.get("breakout_tps", []), start=1):
             lines.append(f"TP{i}: {tp:.6g}")
         lines.append(f"SL: {r['breakout_sl']:.6g}")
-    if r.get("extended"):
-        lines.append("⚠️ حركة ممتدة")
-    if r.get("fib_support"):
-        lines.append(f"دعم فيبوناتشي {r['fib_level']}")
-    lines.append("💡 هذه الإشارة تدخل مع بداية الزخم — أسرع من الرسمية لكن أقل تأكيداً")
+
     return "\n".join(lines)
 
 
@@ -1803,14 +1741,14 @@ def main():
         f"+ربح أدنى محقق (strong نهائي): {len(strong)}"
     )
 
-    # إشارات مبكرة (انضغاط تقلب / تراكم صامت) لعملات لم تصل بعد لإشارة شراء كاملة —
-    # تُميَّز بمفتاح منفصل (":early") في ذاكرة التنبيهات كي لا تتعارض مع إشارات الشراء الرسمية
-    # (رسمية أو مبكرة accumulation/squeeze/كليهما) تُصفّى هنا أيضًا بنفس شرط الحد الأدنى
-    # لنسبة الربح (MIN_PROFIT_PCT) قبل اعتبارها مؤهلة أصلاً — وليس فقط عند الإرسال —
+    # إشارات مبكرة (squeeze/accumulation/divergence/momentum — الأربعة محفزات مستقلة منذ
+    # 2026-09-02) لعملات لم تصل بعد لإشارة شراء كاملة — تُميَّز بمفتاح منفصل (":early") في
+    # ذاكرة التنبيهات كي لا تتعارض مع إشارات الشراء الرسمية. تُصفّى هنا أيضًا بنفس شرط الحد
+    # الأدنى لنسبة الربح (MIN_PROFIT_PCT) قبل اعتبارها مؤهلة أصلاً — وليس فقط عند الإرسال —
     # كي لا تُسجَّل كـ"مُنبَّه عليها" في الذاكرة وتُحرَم من الإرسال لاحقًا إن تحسّن ربحها المتوقع
     early_eligible = [
         r for r in results
-        if r["score"] < 1.5 and (r["squeeze"] or r["accumulation"])
+        if r["score"] < 1.5 and (r["squeeze"] or r["accumulation"] or r["divergence"] or r["momentum"])
         and r.get("early_confidence") is not None
         and meets_min_profit(r["early_entry"], r["early_tps"])
     ]
