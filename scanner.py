@@ -1220,17 +1220,45 @@ def archive_overflow(overflow_trades, gist_files):
 
 
 def _gist_patch_files(files_dict):
-    """يحفظ عدة ملفات دفعة واحدة داخل نفس الـ Gist (الملفات غير المذكورة تبقى كما هي)."""
+    """يحفظ عدة ملفات دفعة واحدة داخل نفس الـ Gist (الملفات غير المذكورة تبقى كما هي).
+    يُعيد المحاولة تلقائيًا عند الفشل، ويطبع حجم Payload للتشخيص."""
     if not GIST_TOKEN or not GIST_ID:
-        return
+        print("⚠️ GIST_TOKEN أو GIST_ID غير موجودين — تخطي الحفظ.")
+        return False
+
     payload = {"files": {fn: {"content": content} for fn, content in files_dict.items()}}
-    try:
-        r = requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=_gist_headers(),
-                            json=payload, timeout=15)
-        if not r.ok:
-            print("فشل حفظ الحالة في Gist:", r.text)
-    except Exception as e:
-        print("خطأ حفظ الحالة في Gist:", e)
+    payload_size = len(json.dumps(payload, ensure_ascii=False, separators=(',', ':')))
+    print(f"💾 حجم Payload للحفظ في Gist: {payload_size:,} بايت | ملفات: {list(files_dict.keys())}")
+
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            r = requests.patch(
+                f"https://api.github.com/gists/{GIST_ID}",
+                headers=_gist_headers(),
+                json=payload,
+                timeout=20
+            )
+            if r.ok:
+                print(f"✅ تم الحفظ في Gist بنجاح (محاولة {attempt})")
+                return True
+            # rate limit — انتظر أطول
+            if r.status_code == 429:
+                wait = 5 * attempt
+                print(f"⏳ Rate limit (429) — انتظار {wait} ثانية...")
+                time.sleep(wait)
+                continue
+            last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+            print(f"⚠️ فشل حفظ Gist (محاولة {attempt}): {last_err}")
+        except Exception as e:
+            last_err = str(e)
+            print(f"⚠️ خطأ شبكي بحفظ Gist (محاولة {attempt}): {last_err}")
+        if attempt < 3:
+            time.sleep(2 * attempt)
+
+    print(f"❌ فشل الحفظ في Gist نهائيًا بعد 3 محاولات: {last_err}")
+    print(f"   ⚠️ الصفقات المفتوحة لم تُحفظ — ستُفقد في التشغيلة القادمة!")
+    return False
 
 
 def load_state(gist_files):
@@ -1385,7 +1413,9 @@ def save_all_state(alerted_symbols, btc_dominance, positions, closed_delta, gist
         if stats:
             files[STATS_GIST_FILE] = json.dumps(stats, ensure_ascii=False, separators=(',', ':'))
 
-    _gist_patch_files(files)
+    saved_ok = _gist_patch_files(files)
+    if not saved_ok:
+        print("❌ لم يُحفظ شيء في Gist — الصفقات المفتوحة والسجل المغلق غير محفوظين!")
     return stats
 
 
