@@ -16,11 +16,16 @@ trade_stats.py — تقرير مستقل لإحصائيات الصفقات ال�
   (مؤشرات Squeeze/Accumulation/Divergence لا تُحسب لصفقات الانفجار لأنها غير محسوبة أصلاً
   عند فتح هذا النوع من الصفقات في scanner.py — استخدام عوامل الانفجار الخاصة بدل ذلك
   يمنع تلوّث فئة "بدون مؤشر إضافي" بصفقات الانفجار التي لا علاقة لها بها)
-- نسبة نجاح كل مؤشر على حدة (squeeze / accumulation / divergence / extended) عبر الصفقات الرسمية/المبكرة
+- نسبة نجاح كل مؤشر على حدة (squeeze / accumulation / divergence / momentum / extended) عبر
+  الصفقات الرسمية/المبكرة
 - لصفقات "بدون مؤشر إضافي" تحديدًا: تفصيل حسب المؤشرات الأساسية الثمانية التي تصنع الدرجة
   (rsi_state / macd_bull / bb_state / vol_confirm / ranging / near_resistance / obv_confirm /
   htf_aligned) — متاح فقط للصفقات المفتوحة بعد إضافة هذه الحقول لسجل الصفقة في scanner.py؛
   الصفقات الأقدم لا تحتوي هذه الحقول وتُستثنى تلقائيًا من هذا القسم فقط دون التأثير على بقية التقرير
+- قسم مخصص للمبكرة فقط (مبني على حقل "factors" المحفوظ مع كل صفقة مبكرة، وهو التركيبة
+  الفعلية الدقيقة التي أطلقت الإشارة): نسبة نجاح/فشل كل مؤشر من الأربعة لوحده (مساهمة
+  حاضرة بصرف النظر عن باقي المؤشرات)، ونسبة نجاح/فشل حسب عدد المؤشرات المتعاونة معًا
+  (1/2/3/4) — الصفقات المبكرة الأقدم من إضافة حقل factors تُستثنى تلقائيًا من هذا القسم فقط
 
 لا يُعدّل أي شيء في منطق البوت أو ملفاته — قراءة وعرض فقط (يمكن تشغيله يدويًا
 عبر workflow_dispatch أو محليًا بدون أي تأثير على عمل scanner.py).
@@ -40,16 +45,18 @@ GIST_TOKEN = os.environ.get("GIST_TOKEN")
 GIST_ID = os.environ.get("GIST_ID")
 CLOSED_GIST_FILE = "closed_trades.json"     # السجل النشط: أحدث الصفقات فقط
 ARCHIVE_PREFIX = "closed_trades_archive_"   # ملفات الأرشيف المرقّمة (تحوي كل التاريخ الأقدم)
+OPEN_POSITIONS_GIST_FILE = "open_positions.json"  # الصفقات المفتوحة قيد المتابعة حاليًا (نفس ملف scanner.py)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 # مؤشرات الصفقات الرسمية/المبكرة (تُحسب فقط لهذين النوعين في scanner.py)
-INDICATOR_KEYS = ["squeeze", "accumulation", "divergence", "extended"]
+INDICATOR_KEYS = ["squeeze", "accumulation", "divergence", "momentum", "extended"]
 INDICATOR_LABELS = {
     "squeeze": "انضغاط تقلب (Squeeze)",
     "accumulation": "تراكم صامت (Accumulation)",
     "divergence": "دايفرجنس (Divergence)",
+    "momentum": "زخم (Momentum)",
     "extended": "امتداد زائد (Overextension)",
 }
 
@@ -60,6 +67,19 @@ BREAKOUT_FACTOR_LABELS = {
     "macd_bull": "MACD إيجابي",
     "rsi_ok": "RSI في نطاق صحي",
 }
+
+# المؤشرات الأربعة المستقلة اللي تطلق الإشارة المبكرة (تطابق الأربعة بـscanner.py منذ
+# تحديث 2026-09-02) — مبنية على حقل "factors" المحفوظ مع كل صفقة مبكرة (التركيبة الفعلية
+# الدقيقة اللي أطلقت الإشارة)، بدل الاعتماد على الأعلام الخام squeeze/accumulation/divergence
+# اللي تُحسب لكل صفقة (رسمية أو مبكرة) بصرف النظر هل ساهمت بإطلاق الإشارة المبكرة أصلاً أو لا
+EARLY_FACTOR_KEYS = ["accumulation", "divergence", "momentum", "squeeze"]
+EARLY_FACTOR_LABELS = {
+    "accumulation": "تراكم صامت (Accumulation)",
+    "divergence": "دايفرجنس (Divergence)",
+    "momentum": "زخم (Momentum)",
+    "squeeze": "انضغاط تقلب (Squeeze)",
+}
+EARLY_COMBO_LABELS = {1: "مؤشر واحد", 2: "مؤشرين", 3: "3 مؤشرات", 4: "4 مؤشرات"}
 
 # المؤشرات الأساسية اللي تصنع الدرجة (score) — تُحفظ فقط في الصفقات المفتوحة بعد تحديث
 # schema الحفظ في scanner.py؛ تُستخدم لتفصيل صفقات "بدون مؤشر إضافي" تحديدًا (see below)
@@ -135,6 +155,24 @@ def load_closed_trades():
     return all_trades
 
 
+def load_open_positions():
+    """يقرأ الصفقات المفتوحة حاليًا (قيد المتابعة) من نفس الـ Gist — تُستخدم فقط لعرض
+    عددها ضمن ملخص التقرير، بدون أي تأثير على حساب أي إحصائية أخرى (المبنية بالكامل
+    على السجل المغلق فقط)."""
+    if not GIST_TOKEN or not GIST_ID:
+        return []
+    try:
+        r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=_gist_headers(), timeout=15)
+        r.raise_for_status()
+        files = r.json().get("files", {})
+        if OPEN_POSITIONS_GIST_FILE not in files:
+            return []
+        return _read_json_file(files[OPEN_POSITIONS_GIST_FILE], OPEN_POSITIONS_GIST_FILE)
+    except Exception as e:
+        print(f"⚠️ تعذّر جلب الصفقات المفتوحة حاليًا: {e}")
+        return []
+
+
 def classify(trade):
     """يحدد نتيجة الصفقة: win / loss / neutral، بناءً على سبب الإغلاق وعدد الأهداف المتحققة.
     ملاحظة: نتيجة "neutral" ما زالت تُحسب هنا للحفاظ على البيانات القديمة قابلة للقراءة،
@@ -189,9 +227,12 @@ def base_indicator_state_label(key, value):
     return "لم يُفحص"
 
 
-def build_report(trades):
+def build_report(trades, open_count=None):
     if not trades:
-        return "لا توجد صفقات مغلقة بعد في السجل.", []
+        msg = "لا توجد صفقات مغلقة بعد في السجل."
+        if open_count is not None:
+            msg += f"\n🔄 مفتوحة حاليًا: {open_count} صفقة"
+        return msg, []
 
     total = len(trades)
     wins = [t for t in trades if classify(t) == "win"]
@@ -237,7 +278,7 @@ def build_report(trades):
                 else:
                     ls["loss_pnl_sum"] += pnl
 
-    # --- نجاح كل مؤشر على حدة (رسمية/مبكرة فقط) ---
+    # --- نجاح كل مؤشر على حدة (رسمية/مبكرة، أعلام تشخيصية خام) ---
     indicator_stats = {k: {"total": 0, "win": 0, "loss": 0} for k in INDICATOR_KEYS}
     no_indicator_stats = {"total": 0, "win": 0, "loss": 0}
 
@@ -247,6 +288,14 @@ def build_report(trades):
     # --- تفصيل صفقات "بدون مؤشر إضافي" حسب المؤشرات الأساسية (state -> stats) ---
     base_indicator_stats = {k: {} for k in BASE_INDICATOR_KEYS}
     no_indicator_no_basedata = 0  # صفقات "بدون مؤشر إضافي" لكن أقدم من تحديث الحفظ (لا تحوي الحقول الثمانية)
+
+    # --- قسم مخصص للمبكرة فقط: مبني على حقل "factors" (التركيبة الفعلية اللي أطلقت الإشارة) ---
+    # (أ) نجاح كل مؤشر من الأربعة لما يكون هو الوحيد الحاضر فعليًا (بدون أي مؤشر ثانٍ معه —
+    #     يطابق مستوى ثقة "احتمالية" بالضبط)، وليس مجرد ظهوره ضمن أي تركيبة
+    early_factor_stats = {k: {"total": 0, "win": 0, "loss": 0} for k in EARLY_FACTOR_KEYS}
+    # (ب) نجاح حسب عدد المؤشرات المتعاونة معًا (1/2/3/4)
+    early_combo_stats = {n: {"total": 0, "win": 0, "loss": 0} for n in (1, 2, 3, 4)}
+    early_no_factor_data = 0  # صفقات مبكرة أقدم من إضافة حقل factors -> تُستثنى من هذا القسم فقط
 
     per_trade_lines = []
     for t in trades:
@@ -290,6 +339,20 @@ def build_report(trades):
                         s["total"] += 1
                         s[outcome] += 1
 
+            if ttype == "early":
+                early_factors = t.get("factors")
+                if not early_factors:
+                    early_no_factor_data += 1
+                else:
+                    n = len(early_factors)
+                    if n == 1 and early_factors[0] in early_factor_stats:
+                        k = early_factors[0]
+                        early_factor_stats[k]["total"] += 1
+                        early_factor_stats[k][outcome] += 1
+                    if n in early_combo_stats:
+                        early_combo_stats[n]["total"] += 1
+                        early_combo_stats[n][outcome] += 1
+
         outcome_ar = {"win": "✅ ربح", "loss": "❌ خسارة"}[outcome]
         pnl_txt = f"{pnl:+.2f}%" if pnl is not None else "—"
         dur_txt = f"{dur:.0f}س" if dur is not None else "—"
@@ -304,9 +367,11 @@ def build_report(trades):
         f"الإجمالي: {total} صفقة",
         f"✅ رابحة: {len(wins)} ({win_rate:.1f}%)",
         f"❌ خاسرة: {len(losses)} ({loss_rate:.1f}%)",
-        "",
-        "— نسبة النجاح حسب النوع —",
     ]
+    if open_count is not None:
+        lines.append(f"🔄 مفتوحة حاليًا: {open_count} صفقة")
+    lines.append("")
+    lines.append("— نسبة النجاح حسب النوع —")
     for ttype in ["official", "early", "breakout"]:
         s = type_stats.get(ttype)
         if not s or s["total"] == 0:
@@ -380,6 +445,39 @@ def build_report(trades):
                 f"التشخيصي — لا تتوفر بيانات المؤشرات الأساسية بعد، ستظهر تدريجيًا مع الصفقات الجديدة)"
             )
 
+    # --- المبكرة فقط: نسبة النجاح حسب كل مؤشر لوحده (مساهمة حاضرة ضمن أي تركيبة) ---
+    early_total_with_data = sum(s["total"] for s in early_factor_stats.values())
+    if early_total_with_data > 0 or early_no_factor_data > 0:
+        lines.append("")
+        lines.append("— المبكرة فقط: نسبة النجاح لكل مؤشر لوحده (بدون أي مؤشر ثانٍ معه) —")
+        for k in EARLY_FACTOR_KEYS:
+            s = early_factor_stats[k]
+            if s["total"] == 0:
+                continue
+            wr = s["win"] / s["total"] * 100
+            lr = s["loss"] / s["total"] * 100
+            lines.append(
+                f"{EARLY_FACTOR_LABELS[k]}: {s['total']} صفقة | نجاح {wr:.0f}% ({s['win']}) | فشل {lr:.0f}% ({s['loss']})"
+            )
+
+        lines.append("")
+        lines.append("— المبكرة فقط: نسبة النجاح حسب عدد المؤشرات المتعاونة معًا —")
+        for n in (1, 2, 3, 4):
+            s = early_combo_stats[n]
+            if s["total"] == 0:
+                continue
+            wr = s["win"] / s["total"] * 100
+            lr = s["loss"] / s["total"] * 100
+            lines.append(
+                f"{EARLY_COMBO_LABELS[n]}: {s['total']} صفقة | نجاح {wr:.0f}% ({s['win']}) | فشل {lr:.0f}% ({s['loss']})"
+            )
+
+        if early_no_factor_data > 0:
+            lines.append(
+                f"(ملاحظة: {early_no_factor_data} صفقة مبكرة أقدم من إضافة حقل factors ولا تحوي "
+                f"التركيبة الدقيقة، فاستُبعدت من قسم المبكرة أعلاه فقط دون التأثير على بقية التقرير)"
+            )
+
     breakout_total = type_stats.get("breakout", {}).get("total", 0)
     if breakout_total > 0:
         lines.append("")
@@ -409,7 +507,8 @@ def send_telegram(text):
 
 def main():
     trades = load_closed_trades()
-    summary, per_trade_lines = build_report(trades)
+    open_positions = load_open_positions()
+    summary, per_trade_lines = build_report(trades, open_count=len(open_positions))
 
     print(summary)
     print("\n— تفصيل كل صفقة —")
