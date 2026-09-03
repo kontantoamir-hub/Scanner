@@ -1,5 +1,9 @@
 name: Market Scanner
 
+concurrency:
+  group: market-scanner
+  cancel-in-progress: false
+
 on:
   schedule:
     - cron: '4,19,34,49 * * * *'   # كل 15 دقيقة تقريبًا، بإزاحة عن بداية الساعة لتقليل الزحمة
