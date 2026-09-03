@@ -1133,9 +1133,9 @@ GIST_FILENAME = "alerted_state.json"
 POSITIONS_GIST_FILE = "open_positions.json"   # الصفقات المفتوحة قيد المتابعة (نفس الـ Gist، ملف منفصل)
 CLOSED_GIST_FILE = "closed_trades.json"       # السجل "النشط": أحدث الصفقات فقط (قراءة سريعة، دائمًا صغير وآمن)
 STATS_GIST_FILE = "stats.json"                # إحصائيات أداء محسوبة دوريًا من closed_trades (خيار 3: تتبع فقط)
-ACTIVE_HISTORY_SIZE = 400                     # عدد الصفقات المحفوظة في السجل النشط قبل ترحيل الأقدم للأرشيف
+ACTIVE_HISTORY_SIZE = 150                     # عدد الصفقات المحفوظة في السجل النشط قبل ترحيل الأقدم للأرشيف
 ARCHIVE_PREFIX = "closed_trades_archive_"     # بادئة ملفات الأرشيف المرقّمة (كل ملف محدود الحجم، بلا سقف على عددها)
-ARCHIVE_CHUNK_SIZE = 400                      # حد أقصى للصفقات في كل ملف أرشيف (يبقيه دائمًا تحت حد GitHub ~1MB بأمان)
+ARCHIVE_CHUNK_SIZE = 150                      # حد أقصى للصفقات في كل ملف أرشيف (يبقيه دائمًا تحت حد GitHub ~1MB بأمان)
 DOM_SHIFT_THRESHOLD = float(os.environ.get("DOM_SHIFT_THRESHOLD", "0.3"))  # نقطة مئوية خلال دورة تشغيل واحدة
 
 
@@ -1207,14 +1207,14 @@ def archive_overflow(overflow_trades, gist_files):
     if space > 0 and remaining:
         last_content.extend(remaining[:space])
         remaining = remaining[space:]
-        files_to_write[f"{ARCHIVE_PREFIX}{idx:04d}.json"] = json.dumps(last_content, ensure_ascii=False, indent=2)
+        files_to_write[f"{ARCHIVE_PREFIX}{idx:04d}.json"] = json.dumps(last_content, ensure_ascii=False, separators=(',', ':'))
 
     # أنشئ ملفات أرشيف جديدة للباقي (بلا أي سقف على عدد الملفات)
     while remaining:
         idx += 1
         chunk = remaining[:ARCHIVE_CHUNK_SIZE]
         remaining = remaining[ARCHIVE_CHUNK_SIZE:]
-        files_to_write[f"{ARCHIVE_PREFIX}{idx:04d}.json"] = json.dumps(chunk, ensure_ascii=False, indent=2)
+        files_to_write[f"{ARCHIVE_PREFIX}{idx:04d}.json"] = json.dumps(chunk, ensure_ascii=False, separators=(',', ':'))
 
     return files_to_write
 
@@ -1350,10 +1350,17 @@ def save_all_state(alerted_symbols, btc_dominance, positions, closed_delta, gist
     files = {
         GIST_FILENAME: json.dumps(
             {"alerted": sorted(alerted_symbols), "btc_dominance_prev": btc_dominance},
-            ensure_ascii=False
+            ensure_ascii=False, separators=(',', ':')
         ),
-        POSITIONS_GIST_FILE: json.dumps(positions, ensure_ascii=False, indent=2),
     }
+
+    # لا نحفظ positions إذا لم تتغير — يقلل حجم الطلب وعدد مرات الكتابة على Gist
+    try:
+        old_positions = json.loads(_gist_get_file(POSITIONS_GIST_FILE, gist_files) or "[]")
+    except Exception:
+        old_positions = []
+    if old_positions != positions:
+        files[POSITIONS_GIST_FILE] = json.dumps(positions, ensure_ascii=False, separators=(',', ':'))
 
     stats = None
     if closed_delta:
@@ -1370,13 +1377,13 @@ def save_all_state(alerted_symbols, btc_dominance, positions, closed_delta, gist
             history = history[-ACTIVE_HISTORY_SIZE:]
             files.update(archive_overflow(overflow, gist_files))
 
-        files[CLOSED_GIST_FILE] = json.dumps(history, ensure_ascii=False, indent=2)
+        files[CLOSED_GIST_FILE] = json.dumps(history, ensure_ascii=False, separators=(',', ':'))
 
         # ملاحظة: الإحصائيات الآنية تُحسب من السجل النشط فقط (آخر ACTIVE_HISTORY_SIZE صفقة)
         # للتقرير الفوري — التحليل الشامل الكامل يحتاج قراءة السجل النشط + كل ملفات الأرشيف
         stats = compute_stats(history)
         if stats:
-            files[STATS_GIST_FILE] = json.dumps(stats, ensure_ascii=False, indent=2)
+            files[STATS_GIST_FILE] = json.dumps(stats, ensure_ascii=False, separators=(',', ':'))
 
     _gist_patch_files(files)
     return stats
@@ -1715,9 +1722,18 @@ def main():
     tickers = fetch_ticker24h()
     price_map = fetch_prices_map(tickers)
 
+    # ── تشخيص: هل price_map يغطي كل الرموز المفتوحة؟ ──
+    print(f"📊 price_map يحتوي على {len(price_map)} رمز")
+
     # قبل أي مسح جديد: تفقّد الصفقات المفتوحة سابقًا مقابل السعر الحالي (TP / SL)
     open_positions = load_positions(gist_files)
+    print(f"📋 الصفقات المفتوحة المحمّلة من Gist: {len(open_positions)}")
+    if open_positions:
+        missing = [p["symbol"] for p in open_positions if p["symbol"] not in price_map]
+        if missing:
+            print(f"⚠️ رموز مفقودة من price_map (لن يُتابع TP/SL لها): {missing}")
     open_positions, closed_now = check_open_positions(open_positions, price_map)
+    print(f"🔒 صفقات متبقية مفتوحة: {len(open_positions)} | أُغلقت الآن: {len(closed_now)}")
 
     results = run_scan(tickers)
 
