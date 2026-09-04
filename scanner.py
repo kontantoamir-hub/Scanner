@@ -12,8 +12,10 @@
 """
 
 import os
+import sys
 import json
 import time
+import traceback
 import datetime as dt
 import concurrent.futures
 import requests
@@ -535,7 +537,7 @@ def drop_unclosed_candle(klines):
 
 # ---------------- تحليل عملة واحدة ----------------
 
-def analyze_symbol(t, interval):
+def analyze_symbol(t, interval, error_list=None):
     symbol = t["symbol"]
     try:
         klines = fetch_klines(symbol, interval, SCAN_LIMIT)
@@ -695,6 +697,8 @@ def analyze_symbol(t, interval):
         }
     except Exception as e:
         print(f"[تخطي] {symbol}: {e}")
+        if error_list is not None:
+            error_list.append(symbol)
         return None
 
 
@@ -723,34 +727,60 @@ def run_scan(tickers=None):
     print(f"سيولة كافية: {len(liquid)} عملة | فحص عميق: {len(shortlist)} عملة | فريم: {INTERVAL}")
 
     results = []
+    errors = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-        futures = [pool.submit(analyze_symbol, t, INTERVAL) for t in shortlist]
+        futures = [pool.submit(analyze_symbol, t, INTERVAL, errors) for t in shortlist]
         for f in concurrent.futures.as_completed(futures):
             r = f.result()
             if r:
                 results.append(r)
+
+    # نسبة فشل مرتفعة بتحليل الرموز (وليس مجرد "لا إشارة") تلمّح لمشكلة حقيقية
+    # (Rate limit من Binance، تغيّر بصيغة البيانات، انقطاع شبكي جزئي...) وليس مجرد سوق هادئ
+    if shortlist and len(errors) / len(shortlist) >= 0.3:
+        send_admin_alert(
+            f"نسبة أخطاء تحليل مرتفعة: {len(errors)} من {len(shortlist)} عملة فشل تحليلها "
+            f"({len(errors) / len(shortlist) * 100:.0f}%).\n"
+            f"أمثلة: {', '.join(errors[:8])}"
+        )
 
     return results
 
 
 # ---------------- تيليجرام ----------------
 
-def send_telegram(text):
+def send_telegram(text, retries=2):
     """يرسل رسالة تيليجرام جديدة، ويرجع message_id الخاص فيها (أو None عند الفشل) —
-    يُستخدم لاحقًا لتعديل نفس الرسالة (شطبها + إضافة النتيجة) عند إغلاق الصفقة."""
+    يُستخدم لاحقًا لتعديل نفس الرسالة (شطبها + إضافة النتيجة) عند إغلاق الصفقة.
+    يعيد المحاولة مرة إضافية عند فشل شبكي/مؤقت قبل الاستسلام، لتقليل احتمال ضياع
+    إشعار مهم (دخول/TP/SL) بسبب عطل عابر بشبكة تيليجرام."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ TELEGRAM_TOKEN أو TELEGRAM_CHAT_ID غير موجودين — تخطي الإرسال.")
         return None
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=15)
-        if not resp.ok:
-            print("فشل إرسال تيليجرام:", resp.text)
-            return None
-        return resp.json().get("result", {}).get("message_id")
-    except Exception as e:
-        print("خطأ إرسال تيليجرام:", e)
-        return None
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=15)
+            if resp.ok:
+                return resp.json().get("result", {}).get("message_id")
+            last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            print(f"فشل إرسال تيليجرام (محاولة {attempt}):", last_err)
+        except Exception as e:
+            last_err = str(e)
+            print(f"خطأ إرسال تيليجرام (محاولة {attempt}):", last_err)
+        if attempt < retries:
+            time.sleep(2)
+    print(f"❌ فشل إرسال تيليجرام نهائيًا بعد {retries} محاولة/محاولات: {last_err}")
+    return None
+
+
+def send_admin_alert(text):
+    """تنبيه نظام/عطل — مستقل عن منطق كتم إشارات الشرط الواحد، يُستخدم فقط للإبلاغ
+    عن أعطال فعلية بالتشغيل (Gist، تحليل، انهيار غير متوقع...) بدل الاكتفاء بطباعتها
+    في لوق GitHub Actions الذي لا يُتابعه أحد يوميًا."""
+    print(f"🚨 ADMIN ALERT: {text}")
+    send_telegram(f"🚨 تنبيه نظام (Scanner)\n\n{text}")
 
 
 def _escape_html(text):
@@ -1082,19 +1112,32 @@ def load_state(gist_files):
         return set(data.get("alerted", [])), data.get("btc_dominance_prev")
     except Exception as e:
         print(f"تعذّر تحليل حالة Gist ({e}) — سيبدأ البوت بذاكرة فارغة.")
+        send_admin_alert(
+            f"تعذّر تحليل ذاكرة الإشارات المرسلة ({GIST_FILENAME}) — سيعمل البوت هذه "
+            f"التشغيلة بذاكرة فارغة، وقد يعيد إرسال تنبيهات لإشارات سبق إرسالها.\n"
+            f"التفاصيل: {e}"
+        )
         return set(), None
 
 
+class PositionsCorruptedError(Exception):
+    """يُرفع عند فشل تحليل JSON الخاص بالصفقات المفتوحة من Gist. بدل إرجاع [] بصمت (وهو ما
+    كان يعني عمليًا 'لا صفقات مفتوحة' ثم يُكتب لاحقًا فوق الصفقات الحقيقية في save_all_state),
+    نوقف التشغيلة كاملة احترازيًا — تمامًا كمنطق GistFetchError."""
+    pass
+
+
 def load_positions(gist_files):
-    """يحمّل الصفقات المفتوحة قيد المتابعة من قاموس ملفات مُجلب مسبقًا."""
+    """يحمّل الصفقات المفتوحة قيد المتابعة من قاموس ملفات مُجلب مسبقًا.
+    يرفع PositionsCorruptedError عند فشل التحليل بدل إرجاع [] بصمت، لأن ذلك قد يؤدي
+    لاحقًا لكتابة حالة فارغة فوق صفقات مفتوحة حقيقية (فقدان تتبعها نهائيًا)."""
     content = _gist_get_file(POSITIONS_GIST_FILE, gist_files)
     if not content:
         return []
     try:
         return json.loads(content)
     except Exception as e:
-        print(f"تعذّر تحليل open_positions من Gist ({e})")
-        return []
+        raise PositionsCorruptedError(f"تعذّر تحليل open_positions من Gist: {e}") from e
 
 
 def load_closed(gist_files):
@@ -1226,6 +1269,11 @@ def save_all_state(alerted_symbols, btc_dominance, positions, closed_delta, gist
     saved_ok = _gist_patch_files(files)
     if not saved_ok:
         print("❌ لم يُحفظ شيء في Gist — الصفقات المفتوحة والسجل المغلق غير محفوظين!")
+        send_admin_alert(
+            "فشل الحفظ في Gist بعد كل المحاولات — الصفقات المفتوحة والسجل المغلق "
+            "لهذه التشغيلة لم يُحفظا. قد تتكرر تنبيهات لصفقات سبق إرسالها، أو تُفقد "
+            "متابعة صفقات مفتوحة."
+        )
     return stats
 
 
@@ -1528,6 +1576,10 @@ def main():
     except GistFetchError as e:
         print(f"❌ فشل جلب ملفات Gist ({e}) — إيقاف هذه التشغيلة احترازيًا "
               f"بحالة فارغة/ناقصة. سيُعاد المحاولة تلقائيًا بالتشغيلة القادمة.")
+        send_admin_alert(
+            f"فشل جلب ملفات Gist — تم إيقاف هذه التشغيلة احترازيًا لتفادي الكتابة "
+            f"فوق الصفقات المفتوحة بحالة فارغة.\nالتفاصيل: {e}"
+        )
         return
 
     tickers = fetch_ticker24h()
@@ -1537,12 +1589,31 @@ def main():
     print(f"📊 price_map يحتوي على {len(price_map)} رمز")
 
     # قبل أي مسح جديد: تفقّد الصفقات المفتوحة سابقًا مقابل السعر الحالي (TP / SL)
-    open_positions = load_positions(gist_files)
+    try:
+        open_positions = load_positions(gist_files)
+    except PositionsCorruptedError as e:
+        print(f"❌ ملف الصفقات المفتوحة تالف بالـGist ({e}) — إيقاف هذه التشغيلة احترازيًا "
+              f"لتفادي الكتابة فوق الصفقات الحقيقية بحالة فارغة.")
+        send_admin_alert(
+            f"ملف الصفقات المفتوحة (open_positions) تالف بالـGist ولا يمكن تحليله — تم "
+            f"إيقاف هذه التشغيلة احترازيًا كي لا يُكتب فوقه بحالة فارغة (فقدان نهائي "
+            f"لتتبع الصفقات المفتوحة).\nالتفاصيل: {e}\nيلزم فحص محتوى ملف "
+            f"{POSITIONS_GIST_FILE} يدويًا بالـGist."
+        )
+        return
     print(f"📋 الصفقات المفتوحة المحمّلة من Gist: {len(open_positions)}")
     if open_positions:
         missing = [p["symbol"] for p in open_positions if p["symbol"] not in price_map]
         if missing:
             print(f"⚠️ رموز مفقودة من price_map (لن يُتابع TP/SL لها): {missing}")
+            # نسبة كبيرة من الصفقات المفتوحة بدون سعر حالي تلمّح لعطل حقيقي بجلب الأسعار
+            # (وليس مجرد رمز تم شطبه من المنصة) — تستحق تنبيهًا فوريًا بدل الاكتفاء باللوق
+            if len(missing) / len(open_positions) >= 0.2:
+                send_admin_alert(
+                    f"{len(missing)} من أصل {len(open_positions)} صفقة مفتوحة بدون سعر "
+                    f"حالي (price_map) — لن تُتابَع أهدافها/وقف خسارتها هذه التشغيلة.\n"
+                    f"أمثلة: {', '.join(missing[:10])}"
+                )
     open_positions, closed_now = check_open_positions(open_positions, price_map)
     print(f"🔒 صفقات متبقية مفتوحة: {len(open_positions)} | أُغلقت الآن: {len(closed_now)}")
 
@@ -1639,4 +1710,14 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(tb)
+        send_admin_alert(
+            f"توقف السكربت بخطأ غير متوقع أثناء التشغيل:\n"
+            f"{type(e).__name__}: {e}\n\n"
+            f"آخر جزء من تتبع الخطأ:\n{tb[-600:]}"
+        )
+        sys.exit(1)  # يبقي حالة GitHub Action فاشلة (❌) بدل أن تظهر ناجحة رغم العطل
