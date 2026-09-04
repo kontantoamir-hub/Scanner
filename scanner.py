@@ -98,8 +98,9 @@ MIN_PROFIT_PCT = float(os.environ.get("MIN_PROFIT_PCT", "1.0"))
 # وقف خسارة أوسع من الإشارة الرسمية (1.5×ATR) لأن نقطة الدخول أقل دقة والتقلب حولها أعلى
 EARLY_SL_ATR_MULT = 2.0
 # عدد الأهداف يعتمد على عدد الشروط المتحققة (squeeze / accumulation / divergence / momentum: 1-4 أهداف).
-# تحديث 2026-09-02: الأربعة صاروا محفزات مستقلة تمامًا — أي واحد منهم لوحده كافٍ لإطلاق
-# إشارة (لم تعد مقتصرة على accumulation/squeeze، ولم يعد squeeze يحتاج شرطًا إضافيًا).
+# تحديث 2026-09-04: تراجع عن تحديث 2026-09-02 (الذي جعل الأربعة محفزات مستقلة تمامًا).
+# رجعنا لمنطق: squeeze أو accumulation فقط قادران على إطلاق إشارة لوحدهما — أما divergence
+# وmomentum فلا يكفيان لوحدهما، لازم يرافقهما squeeze أو accumulation.
 # درجات الثقة: مؤشر واحد -> احتمالية؛ اثنان -> مؤكدة؛ 3 فأكثر (بأي مزيج) -> مؤكدة قوية.
 
 
@@ -699,12 +700,12 @@ def analyze_symbol(t, interval):
         # وقف خسارة أوسع (ATR×2) لأن الدخول أقل تأكيدًا، وعدد أهداف حسب مستوى الثقة،
         # مع تقليم أي هدف يتجاوز أقرب مقاومة معروفة كي لا نضع هدفًا خلف حاجز سعري واضح.
         #
-        # تحديث 2026-09-02: الأربعة (squeeze/accumulation/divergence/momentum) صارت
-        # محفزات مستقلة تمامًا — أي واحد منها لوحده كافٍ لإطلاق إشارة (كانت مقتصرة سابقًا
-        # على accumulation/squeeze، وsqueeze كان يحتاج شرطًا إضافيًا وإلا لا تُطلق إشارة
-        # أصلاً). الهدف: معرفة أي مؤشر قوي فعليًا وأي واحد ضعيف (خصوصًا divergence
-        # وmomentum اللي ما كان عندهم بيانات كمحفز منفرد إطلاقًا من قبل) بدل افتراض
-        # ضعفهم مسبقًا بدون دليل.
+        # تحديث 2026-09-04: تراجع عن تحديث 2026-09-02 الذي كان يجعل الأربعة (squeeze/
+        # accumulation/divergence/momentum) محفزات مستقلة تمامًا. رجعنا للمنطق القديم:
+        # squeeze أو accumulation فقط يكفيان لوحدهما لإطلاق إشارة (بيانات تاريخية حقيقية
+        # تدعم كلا المصدرين: accumulation 90% نجاح/87 صفقة، squeeze 73% نجاح/146 صفقة).
+        # أما divergence وmomentum فلا يكفيان لوحدهما — يجب أن يرافق أحدهما squeeze أو
+        # accumulation حتى تُطلق إشارة، لعدم توفر بيانات تدعمهما كمحفز منفرد.
         #
         # درجات الثقة: مؤشر واحد = "احتمالية"، اثنان = "مؤكدة"، 3 فأكثر = "مؤكدة قوية".
         # عدد الأهداف = عدد المؤشرات المتحققة (1-4).
@@ -723,7 +724,12 @@ def analyze_symbol(t, interval):
         fib_extension_used = False
         momentum = momentum_strength(ind["macd"], ind["signal"], ind["rsi"], last)
         conditions_met = sum([squeeze, accumulation, r["divergence"], momentum])
-        if conditions_met >= 1:
+        # استعادة المنطق القديم (قبل تحديث 2026-09-02): squeeze وaccumulation فقط قادران
+        # على إطلاق إشارة لوحدهما (بيانات تاريخية حقيقية تدعم كل منهما كمصدر منفرد:
+        # accumulation 90% نجاح/87 صفقة، squeeze 73% نجاح/146 صفقة). أما divergence
+        # وmomentum فلا يكفيان لوحدهما — يجب أن يرافق أحدهما squeeze أو accumulation
+        # حتى تُطلق إشارة (لم تتوفر بيانات تدعمهما كمحفز منفرد وقت هذا القرار).
+        if squeeze or accumulation:
             if conditions_met >= 3:
                 early_confidence = "مؤكدة قوية"
             elif conditions_met == 2:
@@ -1774,7 +1780,7 @@ def main():
     # كي لا تُسجَّل كـ"مُنبَّه عليها" في الذاكرة وتُحرَم من الإرسال لاحقًا إن تحسّن ربحها المتوقع
     early_eligible = [
         r for r in results
-        if r["score"] < 1.5 and (r["squeeze"] or r["accumulation"] or r["divergence"] or r["momentum"])
+        if r["score"] < 1.5 and (r["squeeze"] or r["accumulation"])
         and r.get("early_confidence") is not None
         and meets_min_profit(r["early_entry"], r["early_tps"])
     ]
