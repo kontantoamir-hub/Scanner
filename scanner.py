@@ -1422,9 +1422,14 @@ def check_open_positions(positions, price_map):
             still_open.append(pos)
             continue
 
+        # صفقة "صامتة" = لم يُرسل لها إشعار دخول أصلاً (إشارة مبكرة بشرط واحد فقط) —
+        # تُتابَع وتُحفظ في السجل بشكل طبيعي، لكن بدون أي إشعار تيليجرام طوال دورة حياتها
+        silent = pos.get("alert_message_id") is None and pos.get("type") == "early"
+
         if price <= pos["sl"]:
             result_text = format_sl_hit(pos, price)
-            send_telegram(result_text)
+            if not silent:
+                send_telegram(result_text)
             edit_telegram_strike(pos.get("alert_message_id"), build_progress_text(pos), result_text)
             pos["closed_reason"] = "SL"
             pos["closed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1440,9 +1445,10 @@ def check_open_positions(positions, price_map):
 
             for i in newly_hit:
                 tp_text = format_tp_hit(pos, i, price)
-                msg_id = send_telegram(tp_text)
+                msg_id = None if silent else send_telegram(tp_text)
                 pos["tp_notify_ids"][i] = msg_id
-                time.sleep(1)
+                if not silent:
+                    time.sleep(1)
 
                 # احذف إشعار الهدف السابق المستقل (إن وُجد) كي لا تتراكم إشعارات منفصلة لكل هدف
                 prev_index = i - 1
@@ -1483,7 +1489,8 @@ def check_open_positions(positions, price_map):
                 f"الدخول: {pos['entry']:.6g} | الحالي: {price:.6g} | مدة المراقبة: {hours_open:.0f}س\n"
                 f"النسبة: {pct_change:+.2f}%"
             )
-            send_telegram(expired_text)
+            if not silent:
+                send_telegram(expired_text)
             edit_telegram_strike(pos.get("alert_message_id"), build_progress_text(pos), expired_text)
             pos["closed_reason"] = "EXPIRED"
             pos["closed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
