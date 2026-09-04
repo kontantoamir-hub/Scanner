@@ -1,6 +1,6 @@
 """
-ماسح السوق — نسخة مبسطة (بدون تصنيف السوق صاعد/هابط/عرضي)
-يركز فقط على المؤشرات الفنية + شرط الربح الأدنى 1%
+ماسح السوق — نسخة مبسطة جدًا (إشارات كثيرة)
+الشروط الأساسية فقط: score >= 1.0 + ربح أول هدف >= 1%
 """
 
 import os
@@ -14,9 +14,9 @@ import requests
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 INTERVAL = os.environ.get("SCAN_INTERVAL", "1h")
-DEPTH = int(os.environ.get("SCAN_DEPTH", "150"))  # زيادة من 60 إلى 150
+DEPTH = int(os.environ.get("SCAN_DEPTH", "200"))  # زيادة إلى 200
 SCAN_LIMIT = 400
-LIQUIDITY_FLOOR = 1_000_000
+LIQUIDITY_FLOOR = 500_000  # تخفيض من 1M إلى 500K لزيادة العملات
 
 EXCLUDE_SUFFIX = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
 EXCLUDE_SYMS = {"USDCUSDT","FDUSDUSDT","TUSDUSDT","DAIUSDT","USDPUSDT",
@@ -30,20 +30,20 @@ DIVERGENCE_LOOKBACK = 20
 DIVERGENCE_PIVOT_SPAN = 3
 RESISTANCE_LOOKBACK = 50
 RESISTANCE_PIVOT_SPAN = 3
-RESISTANCE_PROXIMITY_PCT = 1.5
+RESISTANCE_PROXIMITY_PCT = 1.0  # تخفيض من 1.5 إلى 1.0 (أقل حساسية)
 OBV_TREND_WINDOW = 10
 
-# ---------- فيبوناتشي (تشخيصي فقط) ----------
+# ---------- فيبوناتشي (تشخيصي) ----------
 FIB_LOOKBACK = 50
 FIB_LEVELS = (0.382, 0.5, 0.618, 0.786)
 FIB_PROXIMITY_PCT = 1.0
 
-# ---------- فلتر الإرهاق (اختياري - يمكن تعطيله) ----------
+# ---------- فلتر الإرهاق (معطل) ----------
 EXTENSION_EMA_PERIOD = 50
-EXTENSION_ATR_THRESHOLD = float(os.environ.get("EXTENSION_ATR_THRESHOLD", "999"))  # معطل افتراضيًا
+EXTENSION_ATR_THRESHOLD = float(os.environ.get("EXTENSION_ATR_THRESHOLD", "999"))
 
-# ---------- الحد الأدنى للربح (الشرط الوحيد المتبقي) ----------
-MIN_PROFIT_PCT = float(os.environ.get("MIN_PROFIT_PCT", "1.0"))  # 1% حد أدنى
+# ---------- الحد الأدنى للربح ----------
+MIN_PROFIT_PCT = float(os.environ.get("MIN_PROFIT_PCT", "1.0"))
 
 # ---------- الإشارات المبكرة ----------
 SQUEEZE_LOOKBACK = 20
@@ -117,12 +117,10 @@ def rolling_avg(values, period):
 
 
 def adx(highs, lows, closes, period=ADX_PERIOD):
-    """ADX - يُحسب للتشخيص فقط، لا يؤثر على القرار"""
     n = len(closes)
     out = [None] * n
     if n <= period * 2:
         return out
-
     tr = [0.0] * n
     plus_dm = [0.0] * n
     minus_dm = [0.0] * n
@@ -132,11 +130,9 @@ def adx(highs, lows, closes, period=ADX_PERIOD):
         plus_dm[i] = up_move if (up_move > down_move and up_move > 0) else 0.0
         minus_dm[i] = down_move if (down_move > up_move and down_move > 0) else 0.0
         tr[i] = max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
-
     tr_sum = sum(tr[1:period + 1])
     plus_sum = sum(plus_dm[1:period + 1])
     minus_sum = sum(minus_dm[1:period + 1])
-
     dx = [None] * n
     for i in range(period + 1, n):
         tr_sum = tr_sum - (tr_sum / period) + tr[i]
@@ -145,7 +141,6 @@ def adx(highs, lows, closes, period=ADX_PERIOD):
         pdi = 100 * plus_sum / tr_sum if tr_sum else 0
         mdi = 100 * minus_sum / tr_sum if tr_sum else 0
         dx[i] = 100 * abs(pdi - mdi) / (pdi + mdi) if (pdi + mdi) else 0
-
     start = period * 2
     valid_dx = [x for x in dx[period + 1:start + 1] if x is not None]
     if not valid_dx:
@@ -325,7 +320,6 @@ def atr_value_at(ind, i, period=14):
 
 
 def overextended(ind, i, trend_up):
-    """فلتر الإرهاق - معطل افتراضيًا (999)"""
     ema50 = ind.get("ema50")
     if not ema50 or i >= len(ema50) or ema50[i] is None:
         return False
@@ -371,7 +365,6 @@ def score_at(i, ind, apply_extra_filters=True):
     vol_score = trend_dir * 0.5 if vol_confirm else 0
     score = trend_dir + rsi_state + (1 if macd_bull else -1) + bb_state + vol_score
 
-    # فلاتر إضافية (بدون تصنيف السوق)
     divergence = bullish_divergence(ind["closes"][:i + 1], ind["rsi"][:i + 1])
     resistance = nearest_resistance(ind["highs"][:i + 1], ind["closes"][:i + 1])
     near_resistance = False
@@ -393,7 +386,6 @@ def score_at(i, ind, apply_extra_filters=True):
             score -= 1
         if obv_confirm:
             score += trend_dir * 0.5
-        # تم إزالة عقوبة الإرهاق (معطل افتراضيًا)
 
     return {
         "score": score, "trend_up": trend_up, "vol_confirm": vol_confirm, "rv": rv,
@@ -429,7 +421,6 @@ def atr_value(ind, period=14):
 # ---------------- جلب البيانات ----------------
 
 def meets_min_profit(entry, tps, min_pct=MIN_PROFIT_PCT):
-    """الشرط الوحيد المتبقي: ربح أول هدف >= 1%"""
     if not entry or not tps:
         return False
     tp1_profit_pct = (tps[0] - entry) / entry * 100
@@ -503,11 +494,9 @@ def analyze_symbol(t, interval):
 
         final_score = r["score"]
 
-        # إشارات مبكرة
         squeeze = volatility_squeeze(ind["bb_upper"], ind["bb_lower"], ind["closes"])
         accumulation = silent_accumulation(ind["closes"], ind["vols"], ind["obv"])
 
-        # أهداف الإشارة المبكرة
         early_entry = early_sl = None
         early_tps = []
         early_confidence = None
@@ -556,7 +545,6 @@ def analyze_symbol(t, interval):
             else:
                 early_tps = raw_tps
 
-        # إشارة انفجار
         breakout = breakout_detect(ind["highs"], ind["closes"], ind["vols"])
         breakout_score, breakout_details = 0, {}
         breakout_entry = breakout_sl = None
@@ -589,7 +577,6 @@ def analyze_symbol(t, interval):
                 else:
                     breakout_tps = raw_tps
 
-        # خطة دخول رسمية (بدون اشتراط السوق)
         entry = sl = None
         tps = []
         if final_score >= 1:
@@ -658,7 +645,6 @@ def run_scan(tickers=None):
         and float(t["quoteVolume"]) >= LIQUIDITY_FLOOR
     ]
     
-    # ترتيب مركب: سيولة + حركة
     by_volume = sorted(liquid, key=lambda t: float(t["quoteVolume"]), reverse=True)
     by_momentum = sorted(liquid, key=lambda t: abs(float(t["priceChangePercent"])), reverse=True)
     volume_rank = {t["symbol"]: i for i, t in enumerate(by_volume)}
@@ -669,8 +655,7 @@ def run_scan(tickers=None):
     print(f"سيولة كافية: {len(liquid)} عملة | فحص عميق: {len(shortlist)} عملة | فريم: {INTERVAL}")
 
     results = []
-    # تقليل العمال لتجنب حظر API (من 6 إلى 4)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:  # 3 فقط لتجنب الحظر
         futures = [pool.submit(analyze_symbol, t, INTERVAL) for t in shortlist]
         for f in concurrent.futures.as_completed(futures):
             r = f.result()
@@ -767,7 +752,7 @@ def build_progress_text(pos):
 
 
 def format_alert(r, market_caution=False):
-    is_buy = r["score"] >= 1.5
+    is_buy = r["score"] >= 1.0  # تخفيض من 1.5 إلى 1.0
     dot = "🟢" if is_buy else "🔴"
     title = "إشارة شراء" if is_buy else "تجنب شراء"
 
@@ -1347,36 +1332,30 @@ def main():
 
     results = run_scan(tickers)
 
-    # الإشارة الرسمية: بدون اشتراط السوق، فقط الربح الأدنى 1%
+    # الإشارة الرسمية: تخفيف الفلاتر
     strong = [
         r for r in results
-        if r["score"] >= 1.5
-        and r["vol_confirm"] and r["atr_pct"] >= 0.08 and r["persistent"]
-        and not r["near_resistance"]
+        if r["score"] >= 1.0  # تخفيض من 1.5 إلى 1.0
+        and r["vol_confirm"]  # الإبقاء على تأكيد الحجم فقط
         and meets_min_profit(r["entry"], r["tps"])
     ]
     strong_symbols = {r["symbol"] for r in strong}
 
     # تشخيص
-    _score_ok = [r for r in results if r["score"] >= 1.5]
-    _also_vol_atr_persist = [
-        r for r in _score_ok
-        if r["vol_confirm"] and r["atr_pct"] >= 0.08 and r["persistent"]
-    ]
-    _also_not_res = [r for r in _also_vol_atr_persist if not r["near_resistance"]]
-    _final = [r for r in _also_not_res if meets_min_profit(r["entry"], r["tps"])]
+    _score_ok = [r for r in results if r["score"] >= 1.0]
+    _also_vol = [r for r in _score_ok if r["vol_confirm"]]
+    _final = [r for r in _also_vol if meets_min_profit(r["entry"], r["tps"])]
     print(
-        "🔍 تشخيص فلترة الرسمية (بدون تصنيف سوق): "
-        f"score>=1.5: {len(_score_ok)} | "
-        f"+حجم/تقلب/استقرار: {len(_also_vol_atr_persist)} | "
-        f"+بعيدة عن مقاومة: {len(_also_not_res)} | "
+        "🔍 تشخيص فلترة الرسمية: "
+        f"score>=1.0: {len(_score_ok)} | "
+        f"+حجم: {len(_also_vol)} | "
         f"+ربح أدنى 1% (strong نهائي): {len(_final)}"
     )
 
     # إشارات مبكرة
     early_eligible = [
         r for r in results
-        if r["score"] < 1.5 and (r["squeeze"] or r["accumulation"])
+        if r["score"] < 1.0 and (r["squeeze"] or r["accumulation"])
         and r.get("early_confidence") is not None
         and meets_min_profit(r["early_entry"], r["early_tps"])
     ]
