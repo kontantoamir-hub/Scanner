@@ -1,0 +1,37 @@
+name: Full Reset Bot
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'اكتب RESET بالضبط للتأكيد'
+        required: true
+        default: ''
+
+jobs:
+  reset:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "RESET" ];then
+            echo "❌ لم تكتب RESET بالضبط — تم إلغاء العملية."
+            exit 1
+          fi
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run full reset
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+        run: python3 full_reset_no_backup.py
