@@ -832,7 +832,7 @@ def build_progress_text(pos):
     النص الأصلي + سطر لكل هدف تحقق قبل الإغلاق (إن وُجد)، حتى ما يضيع سجل الأهداف
     المتحققة سابقًا عند الشطب النهائي.
     """
-    base = pos.get("alert_text", "")
+    base = pos.get("alert_text") or ""
     hit_sorted = sorted(pos.get("hit_tps", []))
     if not hit_sorted:
         return base
@@ -1604,9 +1604,14 @@ def main():
 
     for r in fresh_early:
         alert_text = format_early_alert(r)
-        r["_msg_id"] = send_telegram(alert_text)
         r["_alert_text"] = alert_text
-        time.sleep(1)
+        # إشارة بشرط واحد فقط ("احتمالية") تُسجَّل وتُتابَع (TP/SL) لكن بدون إرسال
+        # إشعار تيليجرام — الإرسال محصور بالإشارات ذات شرطين فأكثر ("مؤكدة"/"مؤكدة قوية")
+        if r.get("early_confidence") == "احتمالية":
+            r["_msg_id"] = None
+        else:
+            r["_msg_id"] = send_telegram(alert_text)
+            time.sleep(1)
 
     for r in fresh_breakout:
         alert_text = format_breakout_alert(r)
