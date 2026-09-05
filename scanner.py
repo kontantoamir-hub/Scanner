@@ -63,6 +63,18 @@ BREAKOUT_LOOKBACK = 10          # عدد الشموع للبحث فيها عن �
 BREAKOUT_VOL_MULT = 1.3         # الحجم الحالي يجب أن يتجاوز متوسط الحجم بهذا المضاعف
 BREAKOUT_MIN_ATR_PCT = 0.08     # أدنى نسبة تقلب (ATR%) لقبول إشارة الانفجار
 
+# ---------- إعدادات الإشارة التجريبية (Ichimoku + تأكيد حجم + دعم/مقاومة + MFI + فلتر ATR) ----------
+ICHIMOKU_TENKAN_PERIOD = 9
+ICHIMOKU_KIJUN_PERIOD = 26
+ICHIMOKU_CROSS_LOOKBACK = 3      # عدد الشموع للبحث فيها عن تقاطع تينكان/كيجون حديث (وليس قديمًا انتهى زخمه)
+MFI_PERIOD = 14
+MFI_MIN = 20                     # تحت هذا المستوى تدفق أموال ضعيف جدًا (تشبع بيعي) رغم أي تقاطع
+MFI_MAX = 75                     # فوق هذا المستوى تدفق شرائي مبالغ فيه (خطر ارتداد قريب)
+EXPERIMENTAL_VOL_MULT = 1.1      # الحجم الحالي يجب أن يتجاوز متوسطه بهذا المضاعف لتأكيد الإشارة
+EXPERIMENTAL_MIN_ATR_PCT = float(os.environ.get("EXPERIMENTAL_MIN_ATR_PCT", "0.1"))
+# أدنى نسبة تقلب (ATR%) لقبول الإشارة التجريبية -- تفادي الدخول بأسواق شبه راكدة الحركة
+EXPERIMENTAL_SL_ATR_MULT = float(os.environ.get("EXPERIMENTAL_SL_ATR_MULT", "1.5"))
+
 # ---------------- إعدادات الحد الأدنى لنسبة الربح المستهدفة ----------------
 # لا تُرسل أي إشارة (رسمية أو مبكرة) إلا لو كانت نسبة الربح المتوقعة عند أول هدف (TP1)
 # مقارنة بسعر الدخول >= هذه النسبة% — لتفادي إشارات ذات هدف قريب جدًا لا يستحق الدخول
@@ -337,6 +349,108 @@ def breakout_quality(ind, i):
     return score, details
 
 
+def ichimoku_tenkan_kijun(highs, lows, tenkan_period=ICHIMOKU_TENKAN_PERIOD, kijun_period=ICHIMOKU_KIJUN_PERIOD):
+    """
+    خطا تينكان-سين وكيجون-سين من مؤشر إيشيموكو: كل منهما متوسط (أعلى قمة + أدنى قاع) خلال
+    فترته. تقاطع تينكان فوق كيجون يُعتبر إشارة زخم صاعد أقوى من تقاطع MACD في كثير من
+    الحالات لأنه مبني مباشرة على نطاق السعر الفعلي (High/Low) لا الإغلاق فقط.
+    """
+    n = len(highs)
+    tenkan = [None] * n
+    kijun = [None] * n
+    for i in range(n):
+        if i >= tenkan_period - 1:
+            window_h = highs[i - tenkan_period + 1:i + 1]
+            window_l = lows[i - tenkan_period + 1:i + 1]
+            tenkan[i] = (max(window_h) + min(window_l)) / 2
+        if i >= kijun_period - 1:
+            window_h = highs[i - kijun_period + 1:i + 1]
+            window_l = lows[i - kijun_period + 1:i + 1]
+            kijun[i] = (max(window_h) + min(window_l)) / 2
+    return tenkan, kijun
+
+
+def tenkan_kijun_bullish_cross(tenkan, kijun, i, lookback=ICHIMOKU_CROSS_LOOKBACK):
+    """
+    يتحقق أن تينكان فوق كيجون حاليًا، وأن التقاطع الفعلي (تينكان يعبر من تحت لفوق كيجون)
+    حصل خلال آخر lookback شمعة -- وليس تقاطعًا قديمًا انتهى زخمه ولم يعد "حدثًا" فعليًا.
+    """
+    if i < 1 or tenkan[i] is None or kijun[i] is None:
+        return False
+    if tenkan[i] <= kijun[i]:
+        return False
+    start = max(1, i - lookback + 1)
+    for j in range(start, i + 1):
+        if tenkan[j - 1] is None or kijun[j - 1] is None:
+            continue
+        if tenkan[j - 1] <= kijun[j - 1] and tenkan[j] > kijun[j]:
+            return True
+    return False
+
+
+def mfi(highs, lows, closes, vols, period=MFI_PERIOD):
+    """
+    مؤشر تدفق الأموال (Money Flow Index) -- نفس فكرة RSI لكنه يزن كل حركة سعرية بحجم
+    التداول المرافق لها، فيجمع بين الزخم والحجم في مؤشر واحد أقوى تشخيصيًا من RSI المجرد.
+    """
+    n = len(closes)
+    out = [None] * n
+    if n <= period:
+        return out
+    typical = [(highs[i] + lows[i] + closes[i]) / 3 for i in range(n)]
+    raw_flow = [typical[i] * vols[i] for i in range(n)]
+    for i in range(period, n):
+        pos_flow = neg_flow = 0.0
+        for j in range(i - period + 1, i + 1):
+            if typical[j] > typical[j - 1]:
+                pos_flow += raw_flow[j]
+            elif typical[j] < typical[j - 1]:
+                neg_flow += raw_flow[j]
+        if neg_flow == 0:
+            out[i] = 100.0
+        elif pos_flow == 0:
+            out[i] = 0.0
+        else:
+            money_ratio = pos_flow / neg_flow
+            out[i] = 100 - (100 / (1 + money_ratio))
+    return out
+
+
+def mfi_bullish_flow(mfi_vals, i):
+    """
+    تدفق أموال صاعد صحي: MFI بين حد أدنى (ليس بتشبع بيعي حاد يلمّح لضعف مستمر) وحد أعلى
+    (ليس بتشبع شرائي مبالغ فيه يهدد بارتداد قريب)، ويتحرك صاعدًا فعليًا لا هابطًا.
+    """
+    if i < 1 or mfi_vals[i] is None or mfi_vals[i - 1] is None:
+        return False
+    return MFI_MIN <= mfi_vals[i] <= MFI_MAX and mfi_vals[i] > mfi_vals[i - 1]
+
+
+def experimental_detect(tenkan, kijun, i):
+    """المحفّز الأساسي للإشارة التجريبية: تقاطع تينكان/كيجون صاعد حديث."""
+    return tenkan_kijun_bullish_cross(tenkan, kijun, i)
+
+
+def experimental_quality(ind, i, vol_confirm_flag, mfi_vals):
+    """
+    تقييم جودة الإشارة التجريبية (0 إلى 3): دعم الاتجاه العام (EMA7>EMA14)، تأكيد الحجم
+    (حجم فوق المتوسط + زخم OBV متوافق مع الاتجاه معًا)، وتدفق أموال صاعد صحي (MFI).
+    """
+    details = {}
+    score = 0
+    ema7, ema14 = ind.get("ema7"), ind.get("ema14")
+    if ema7 and ema14 and i < len(ema7) and ema7[i] is not None and ema7[i] > ema14[i]:
+        score += 1
+        details["trend_support"] = True
+    if vol_confirm_flag:
+        score += 1
+        details["volume_confirm"] = True
+    if mfi_bullish_flow(mfi_vals, i):
+        score += 1
+        details["mfi_bullish"] = True
+    return score, details
+
+
 def atr_value_at(ind, i, period=14):
     """
     نفس فكرة atr_value لكن عند شمعة i محددة (وليس دائمًا آخر شمعة) — يُستخدم لقياس
@@ -377,6 +491,7 @@ def compute_indicators(klines):
     vols = [float(k[5]) for k in klines]
     macd_line, signal = macd(closes)
     bb_upper, bb_lower = bollinger(closes)
+    tenkan, kijun = ichimoku_tenkan_kijun(highs, lows)
     return {
         "closes": closes, "highs": highs, "lows": lows, "vols": vols,
         "ema7": ema(closes, 7), "ema14": ema(closes, 14),
@@ -387,6 +502,8 @@ def compute_indicators(klines):
         "vol_avg": rolling_avg(vols, 20),
         "adx": adx(highs, lows, closes),
         "obv": obv(closes, vols),
+        "tenkan": tenkan, "kijun": kijun,
+        "mfi": mfi(highs, lows, closes, vols),
     }
 
 
@@ -549,6 +666,7 @@ def analyze_symbol(t, interval, error_list=None):
         r = score_at(last, ind)
         if not r:
             return None
+        atrp = atr_percent(ind)  # نسبة ATR% محسوبة مرة واحدة، تُستخدم لفلتر الانفجار والتجريبية معًا
 
         prev_r = score_at(last - 1, ind)
         persistent = bool(prev_r) and (prev_r["score"] > 0) == (r["score"] > 0) and abs(prev_r["score"]) >= 0.5
@@ -620,7 +738,7 @@ def analyze_symbol(t, interval, error_list=None):
         breakout_tps = []
         if breakout:
             breakout_score, breakout_details = breakout_quality(ind, last)
-            if breakout_score >= 1 and r["atr_pct"] >= BREAKOUT_MIN_ATR_PCT:
+            if breakout_score >= 1 and atrp >= BREAKOUT_MIN_ATR_PCT:
                 breakout_entry = ind["closes"][last]
                 atrv = atr_value(ind)
                 breakout_sl = breakout_entry - atrv * 1.8
@@ -643,6 +761,51 @@ def analyze_symbol(t, interval, error_list=None):
                     breakout_tps = trimmed
                 else:
                     breakout_tps = raw_tps
+
+        # إشارة تجريبية (Ichimoku Tenkan/Kijun + تأكيد حجم/OBV + MFI) — مستقلة عن الإشارة
+        # الرسمية والانفجار، محفّزها تقاطع تينكان/كيجون صاعد حديث. تُرفض كليًا (لا تُطلق حتى
+        # بدرجة منخفضة) لو السعر قريب جدًا من مقاومة قوية أو لو التقلب (ATR%) ضعيف جدًا —
+        # هذان شرطا استبعاد صريحان وليسا مجرد نقطتي تقييم إضافيتين.
+        vol_avg_last = ind["vol_avg"][last]
+        vol_ok = vol_avg_last is not None and ind["vols"][last] > vol_avg_last * EXPERIMENTAL_VOL_MULT
+        obv_ok = obv_confirms_trend(ind["obv"][:last + 1], r["trend_up"])
+        experimental_vol_confirm = vol_ok and obv_ok
+
+        experimental = experimental_detect(ind["tenkan"], ind["kijun"], last)
+        experimental_score, experimental_details = 0, {}
+        experimental_entry = experimental_sl = None
+        experimental_tps = []
+        if experimental:
+            experimental_score, experimental_details = experimental_quality(
+                ind, last, experimental_vol_confirm, ind["mfi"]
+            )
+            if (
+                experimental_score >= 1
+                and atrp >= EXPERIMENTAL_MIN_ATR_PCT
+                and not r["near_resistance"]
+            ):
+                experimental_entry = ind["closes"][last]
+                atrv = atr_value(ind)
+                experimental_sl = experimental_entry - atrv * EXPERIMENTAL_SL_ATR_MULT
+                risk = experimental_entry - experimental_sl
+                if experimental_score >= 3:
+                    tp_count = 3
+                elif experimental_score >= 2:
+                    tp_count = 2
+                else:
+                    tp_count = 1
+                raw_tps = [experimental_entry + risk * i for i in range(1, tp_count + 1)]
+                resistance = r.get("resistance")
+                if resistance:
+                    trimmed = []
+                    for tp in raw_tps:
+                        if tp >= resistance:
+                            trimmed.append(resistance)
+                            break
+                        trimmed.append(tp)
+                    experimental_tps = trimmed
+                else:
+                    experimental_tps = raw_tps
 
         # خطة دخول (شراء فقط — السوق الفوري لا يدعم فتح صفقة بيع مكشوفة)، محسوبة ديناميكيًا حسب التحليل:
         # وقف الخسارة من التقلب الفعلي (ATR) للعملة، وعدد الأهداف حسب قوة درجة التوافق
@@ -672,7 +835,7 @@ def analyze_symbol(t, interval, error_list=None):
             "score": final_score,
             "trend_up": r["trend_up"],
             "vol_confirm": r["vol_confirm"],
-            "atr_pct": atr_percent(ind),
+            "atr_pct": atrp,
             "persistent": persistent,
             "htf_checked": htf_checked,
             "htf_aligned": htf_aligned,
@@ -690,6 +853,12 @@ def analyze_symbol(t, interval, error_list=None):
             "breakout": breakout,
             "breakout_score": breakout_score,
             "breakout_details": breakout_details,
+            "experimental": experimental,
+            "experimental_score": experimental_score,
+            "experimental_details": experimental_details,
+            "experimental_entry": experimental_entry,
+            "experimental_sl": experimental_sl,
+            "experimental_tps": experimental_tps,
             "entry": entry, "sl": sl, "tps": tps,
             "early_entry": early_entry, "early_sl": early_sl, "early_tps": early_tps,
             "early_confidence": early_confidence,
@@ -962,6 +1131,41 @@ def format_breakout_alert(r):
         for i, tp in enumerate(r.get("breakout_tps", []), start=1):
             lines.append(f"TP{i}: {tp:.6g}")
         lines.append(f"SL: {r['breakout_sl']:.6g}")
+
+    return "\n".join(lines)
+
+
+def format_experimental_alert(r):
+    """
+    إشارة تجريبية: تقاطع Ichimoku Tenkan/Kijun صاعد حديث + تأكيد حجم/OBV + تدفق أموال (MFI)
+    صحي، مع استبعاد كامل لو قريبة من مقاومة قوية أو التقلب ضعيف جدًا. قالب نفس أسلوب
+    إشارتي المبكرة والانفجار: المصدر بالإنجليزية الخام بدل شارات عربية.
+    """
+    e_score = r.get("experimental_score", 0)
+    dot = "🧪🟢" if e_score >= 3 else ("🧪🟡" if e_score >= 2 else "🧪⚪")
+    title = "إشارة تجريبية"
+    details = r.get("experimental_details", {})
+    factors = ["ichimoku_cross"]
+    if details.get("trend_support"):
+        factors.append("trend_support")
+    if details.get("volume_confirm"):
+        factors.append("volume_confirm")
+    if details.get("mfi_bullish"):
+        factors.append("mfi_bullish")
+    source_label = "+".join(factors)
+
+    lines = [
+        f"{dot} {title}",
+        r['symbol'].replace('USDT', '/USDT'),
+    ]
+    if source_label:
+        lines.append(f"المصدر: {source_label}")
+
+    if r.get("experimental_entry") is not None:
+        lines.append(f"الدخول: {r['experimental_entry']:.6g}")
+        for i, tp in enumerate(r.get("experimental_tps", []), start=1):
+            lines.append(f"TP{i}: {tp:.6g}")
+        lines.append(f"SL: {r['experimental_sl']:.6g}")
 
     return "\n".join(lines)
 
@@ -1385,6 +1589,34 @@ def open_new_breakout_positions(positions, fresh_breakout_signals):
         })
 
 
+def open_new_experimental_positions(positions, fresh_experimental_signals):
+    """
+    يفتح متابعة تلقائية (TP/SL) لإشارات التجريبية بنفس آلية الرسمية/المبكرة/الانفجار،
+    بحقل type="experimental" يُستخدم لاحقًا لتمييز رسائل النتيجة.
+    """
+    for r in fresh_experimental_signals:
+        if r.get("experimental_entry") is None:
+            continue
+        positions.append({
+            "symbol": r["symbol"],
+            "entry": r["experimental_entry"],
+            "sl": r["experimental_sl"],
+            "tps": r["experimental_tps"],
+            "hit_tps": [],
+            "tp_notify_ids": [None] * len(r["experimental_tps"]),
+            "score": r["experimental_score"],
+            "trend_up": r["trend_up"],
+            "interval": INTERVAL,
+            "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "type": "experimental",
+            "experimental_details": r.get("experimental_details"),
+            "near_resistance": r.get("near_resistance"),
+            "extended": r.get("extended"),
+            "alert_message_id": r.get("_msg_id"),
+            "alert_text": r.get("_alert_text"),
+        })
+
+
 TIME_STOP_HOURS = float(os.environ.get("TIME_STOP_HOURS", "96"))  # سقف زمني أقصى (شبكة أمان) قبل اعتبار الصفقة منتهية الصلاحية — افتراضيًا 4 أيام
 
 
@@ -1427,7 +1659,7 @@ def format_sl_hit(pos, price):
     sl = pos["sl"]
     pct_drop = (sl - entry) / entry * 100
     duration = format_duration(_hours_since(pos["opened_at"]))
-    type_labels = {"early": "❌ (إشارة مبكرة) ", "breakout": "❌ (إشارة انفجار) "}
+    type_labels = {"early": "❌ (إشارة مبكرة) ", "breakout": "❌ (إشارة انفجار) ", "experimental": "❌ (إشارة تجريبية) "}
     header = type_labels.get(pos.get("type"), "❌ ")
     return (
         f"{header}{pos['symbol'].replace('USDT', '/USDT')}\n"
@@ -1443,7 +1675,7 @@ def format_tp_hit(pos, tp_index, price):
     tp = pos["tps"][tp_index]
     pct_gain = (tp - entry) / entry * 100
     duration = format_duration(_hours_since(pos["opened_at"]))
-    type_labels = {"early": "✅ (إشارة مبكرة) ", "breakout": "✅ (إشارة انفجار) "}
+    type_labels = {"early": "✅ (إشارة مبكرة) ", "breakout": "✅ (إشارة انفجار) ", "experimental": "✅ (إشارة تجريبية) "}
     header = type_labels.get(pos.get("type"), "✅ ")
     tp_label = f"TP{tp_index + 1}"
     return (
@@ -1650,10 +1882,21 @@ def main():
     ]
     breakout_keys = {f"{r['symbol']}:breakout" for r in breakout_eligible}
 
+    # إشارات تجريبية (Ichimoku Tenkan/Kijun + حجم/OBV + MFI) — مستقلة، تُستبعد العملات
+    # اللي أصلاً عندها إشارة رسمية جديدة تجنبًا للتكرار
+    experimental_eligible = [
+        r for r in results
+        if r.get("experimental_entry") is not None
+        and r["symbol"] not in strong_symbols
+        and meets_min_profit(r["experimental_entry"], r["experimental_tps"])
+    ]
+    experimental_keys = {f"{r['symbol']}:experimental" for r in experimental_eligible}
+
     prev_alerted, prev_dominance = load_state(gist_files)
     fresh = [r for r in strong if r["symbol"] not in prev_alerted]
     fresh_early = [r for r in early_eligible if f"{r['symbol']}:early" not in prev_alerted]
     fresh_breakout = [r for r in breakout_eligible if f"{r['symbol']}:breakout" not in prev_alerted]
+    fresh_experimental = [r for r in experimental_eligible if f"{r['symbol']}:experimental" not in prev_alerted]
 
     # تتبّع BTC Dominance: تحذير إضافي لو تحركت بقوة منذ آخر تشغيل (إشارات العملات البديلة تصير أقل موثوقية)
     btc_dominance = None
@@ -1671,7 +1914,8 @@ def main():
         print("تعذّر جلب BTC Dominance:", e)
 
     print(f"إشارات قوية حاليًا: {len(strong)} | جديدة (لم تُرسل قبل): {len(fresh)} | "
-          f"إشارات مبكرة جديدة: {len(fresh_early)} | إشارات انفجار جديدة: {len(fresh_breakout)}")
+          f"إشارات مبكرة جديدة: {len(fresh_early)} | إشارات انفجار جديدة: {len(fresh_breakout)} | "
+          f"إشارات تجريبية جديدة: {len(fresh_experimental)}")
 
     for r in fresh:
         caution = market_caution and not r["symbol"].startswith("BTC")
@@ -1697,14 +1941,24 @@ def main():
         r["_alert_text"] = alert_text
         time.sleep(1)
 
-    # تسجيل الإشارات الجديدة كصفقات مفتوحة قيد المتابعة لاحقًا (رسمية + مبكرة + انفجار)
+    for r in fresh_experimental:
+        alert_text = format_experimental_alert(r)
+        r["_msg_id"] = send_telegram(alert_text)
+        r["_alert_text"] = alert_text
+        time.sleep(1)
+
+    # تسجيل الإشارات الجديدة كصفقات مفتوحة قيد المتابعة لاحقًا (رسمية + مبكرة + انفجار + تجريبية)
     open_new_positions(open_positions, fresh)
     open_new_early_positions(open_positions, fresh_early)
     open_new_breakout_positions(open_positions, fresh_breakout)
+    open_new_experimental_positions(open_positions, fresh_experimental)
 
-    # حفظ موحّد: ذاكرة الإشارات (رسمية + مبكرة + انفجار) + BTC Dominance + الصفقات المفتوحة + أرشيف الصفقات المغلقة حديثًا
+    # حفظ موحّد: ذاكرة الإشارات (رسمية + مبكرة + انفجار + تجريبية) + BTC Dominance + الصفقات المفتوحة + أرشيف الصفقات المغلقة حديثًا
     # + إحصائيات أداء محسوبة من السجل المحدَّث (خيار 3: تتبع فقط، بدون تعديل تلقائي على منطق البوت)
-    save_all_state(strong_symbols | early_keys | breakout_keys, btc_dominance, open_positions, closed_now, gist_files)
+    save_all_state(
+        strong_symbols | early_keys | breakout_keys | experimental_keys,
+        btc_dominance, open_positions, closed_now, gist_files
+    )
 
     print("انتهى المسح.")
 
