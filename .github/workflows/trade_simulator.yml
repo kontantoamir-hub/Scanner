@@ -19,7 +19,18 @@ on:
           - all
           - official
           - early
+          - breakout
+          - experimental
         default: all
+      tp_target:
+        description: "الهدف الذي يُحتسب الخروج عنده إذا تحقق فعليًا"
+        required: true
+        type: choice
+        options:
+          - tp1
+          - tp2
+          - tp3
+        default: tp1
 
 jobs:
   simulate:
@@ -38,4 +49,4 @@ jobs:
           GIST_RAW_URL: ${{ secrets.GIST_RAW_URL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python trade_simulator.py --days "${{ github.event.inputs.days }}" --amount "${{ github.event.inputs.amount }}" --type "${{ github.event.inputs.trade_type }}"
+        run: python trade_simulator.py --days "${{ github.event.inputs.days }}" --amount "${{ github.event.inputs.amount }}" --type "${{ github.event.inputs.trade_type }}" --tp "${{ github.event.inputs.tp_target }}"
