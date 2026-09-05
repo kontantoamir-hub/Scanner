@@ -8,9 +8,9 @@ trade_stats.py — تقرير مستقل لإحصائيات الصفقات ال�
 - نسبة الربح ونسبة الخسارة لكل فئة
 - تصنيف حسب نوع الإشارة (رسمية / مبكرة / انفجار / تجريبية)، مع مجموع نسب الربح الإجمالية
   لكل الصفقات الرابحة ومجموع نسب الخسارة الإجمالية لكل الصفقات الخاسرة (رسمية/مبكرة/تجريبية فقط)
-- لصفقات الرسمية تحديدًا: تفصيل إضافي حسب logic_version (قديم بدون الحقل = منطق ما قبل
-  بوابتي htf_aligned/market_regime الإلزاميتين، جديد = logic_version موجود) — كي يمكن قياس
-  أثر التعديل الأخير على الرسمية بدقة دون تلوّث النتائج بخلط المنطقين معًا
+- بعد الملخص العام لكل نوع، يُعرض تفصيل كل نوع إشارة بقسم منفصل تمامًا (رسمية، ثم مبكرة، ثم
+  انفجار، ثم تجريبية)، مفصول بخط طويل بين كل نوع والذي يليه — بحيث لا تختلط مؤشرات/عوامل نوع
+  بآخر أبدًا
 - لكل صفقة رسمية أو مبكرة: نوع المؤشر (المؤشرات) التي كانت حاضرة وقت الدخول والنتيجة
 - لكل صفقة انفجار: عوامل جودة الاختراق (دعم الاتجاه / MACD / RSI) والنتيجة
   (مؤشرات Squeeze/Accumulation/Divergence لا تُحسب لصفقات الانفجار لأنها غير محسوبة أصلاً
@@ -118,11 +118,15 @@ TYPE_LABELS = {
     "experimental": "تجريبية",
 }
 
-# تسمية نسخ منطق فلترة الإشارة الرسمية (تطابق OFFICIAL_LOGIC_VERSION في scanner.py)
-LOGIC_VERSION_LABELS = {
-    None: "قديم (قبل بوابتي htf_aligned/market_regime)",
-    2: "جديد (htf_aligned + market_regime إلزاميان)",
-}
+# ترتيب عرض الأنواع بكل أقسام التقرير (الملخص العلوي + التفصيل حسب النوع)
+TYPE_ORDER = ["official", "early", "breakout", "experimental"]
+
+# الأنواع التي تُحسب لها الأعلام التشخيصية الخام (squeeze/accumulation/.../extended)
+# وتفصيل "بدون مؤشر إضافي" — الانفجار والتجريبية لهما عوامل جودة خاصة بهما بدل هذا
+TYPES_WITH_RAW_INDICATORS = ("official", "early")
+
+# فاصل بصري طويل بين تفصيل كل نوع إشارة وآخر بالتقرير
+SECTION_DIVIDER = "_" * 33
 
 
 def _gist_headers():
@@ -270,8 +274,6 @@ def build_report(trades, open_count=None):
     # أصلاً من البوت. لكل نوع نجمع أيضًا مجموع نسب الربح لكل الصفقات الرابحة ومجموع نسب
     # الخسارة لكل الصفقات الخاسرة (win_pnl_sum / loss_pnl_sum).
     type_stats = {}
-    # --- تصنيف الرسمية فقط، إضافيًا، حسب logic_version (قديم/جديد) ---
-    logic_version_stats = {}
     for t in trades:
         outcome = classify(t)
         if outcome == "neutral":
@@ -289,22 +291,12 @@ def build_report(trades, open_count=None):
             else:
                 s["loss_pnl_sum"] += pnl
 
-        if ttype == "official":
-            lv = t.get("logic_version")  # None = قديم، 2 = جديد (بعد بوابتي htf_aligned/market_regime)
-            ls = logic_version_stats.setdefault(
-                lv, {"total": 0, "win": 0, "loss": 0, "win_pnl_sum": 0.0, "loss_pnl_sum": 0.0}
-            )
-            ls["total"] += 1
-            ls[outcome] += 1
-            if pnl is not None:
-                if outcome == "win":
-                    ls["win_pnl_sum"] += pnl
-                else:
-                    ls["loss_pnl_sum"] += pnl
-
-    # --- نجاح كل مؤشر على حدة (رسمية/مبكرة، أعلام تشخيصية خام) ---
-    indicator_stats = {k: {"total": 0, "win": 0, "loss": 0} for k in INDICATOR_KEYS}
-    no_indicator_stats = {"total": 0, "win": 0, "loss": 0}
+    # --- نجاح كل مؤشر على حدة (أعلام تشخيصية خام) — منفصلة لكل نوع (رسمية لوحدها، مبكرة لوحدها)
+    # كي لا تختلط تفاصيل نوع بآخر عند عرض القسم الخاص بكل نوع
+    indicator_stats_by_type = {
+        tt: {k: {"total": 0, "win": 0, "loss": 0} for k in INDICATOR_KEYS} for tt in TYPES_WITH_RAW_INDICATORS
+    }
+    no_indicator_stats_by_type = {tt: {"total": 0, "win": 0, "loss": 0} for tt in TYPES_WITH_RAW_INDICATORS}
 
     # --- نجاح كل عامل جودة انفجار على حدة ---
     breakout_factor_stats = {k: {"total": 0, "win": 0, "loss": 0} for k in BREAKOUT_FACTOR_KEYS}
@@ -312,9 +304,12 @@ def build_report(trades, open_count=None):
     # --- نجاح كل عامل جودة تجريبية على حدة ---
     experimental_factor_stats = {k: {"total": 0, "win": 0, "loss": 0} for k in EXPERIMENTAL_FACTOR_KEYS}
 
-    # --- تفصيل صفقات "بدون مؤشر إضافي" حسب المؤشرات الأساسية (state -> stats) ---
-    base_indicator_stats = {k: {} for k in BASE_INDICATOR_KEYS}
-    no_indicator_no_basedata = 0  # صفقات "بدون مؤشر إضافي" لكن أقدم من تحديث الحفظ (لا تحوي الحقول الثمانية)
+    # --- تفصيل صفقات "بدون مؤشر إضافي" حسب المؤشرات الأساسية (state -> stats) — منفصلة لكل نوع أيضًا
+    base_indicator_stats_by_type = {
+        tt: {k: {} for k in BASE_INDICATOR_KEYS} for tt in TYPES_WITH_RAW_INDICATORS
+    }
+    # صفقات "بدون مؤشر إضافي" لكن أقدم من تحديث الحفظ (لا تحوي الحقول الثمانية) — لكل نوع
+    no_indicator_no_basedata_by_type = {tt: 0 for tt in TYPES_WITH_RAW_INDICATORS}
 
     # --- قسم مخصص للمبكرة فقط: مبني على حقل "factors" (التركيبة الفعلية اللي أطلقت الإشارة) ---
     # (أ) نجاح كل مؤشر من الأربعة لما يكون هو الوحيد الحاضر فعليًا (بدون أي مؤشر ثانٍ معه —
@@ -346,27 +341,27 @@ def build_report(trades, open_count=None):
                 experimental_factor_stats[k]["total"] += 1
                 experimental_factor_stats[k][outcome] += 1
             inds_ar = "، ".join(EXPERIMENTAL_FACTOR_LABELS[k] for k in factors) if factors else "بدون عوامل مسجّلة"
-        else:
+        elif ttype in TYPES_WITH_RAW_INDICATORS:
             inds = active_indicators(t)
             if inds:
                 for k in inds:
-                    indicator_stats[k]["total"] += 1
-                    indicator_stats[k][outcome] += 1
+                    indicator_stats_by_type[ttype][k]["total"] += 1
+                    indicator_stats_by_type[ttype][k][outcome] += 1
                 inds_ar = "، ".join(INDICATOR_LABELS[k] for k in inds)
             else:
-                no_indicator_stats["total"] += 1
-                no_indicator_stats[outcome] += 1
+                no_indicator_stats_by_type[ttype]["total"] += 1
+                no_indicator_stats_by_type[ttype][outcome] += 1
                 inds_ar = "بدون مؤشر إضافي"
 
                 has_base_data = any(k in t for k in BASE_INDICATOR_KEYS)
                 if not has_base_data:
-                    no_indicator_no_basedata += 1
+                    no_indicator_no_basedata_by_type[ttype] += 1
                 else:
                     for k in BASE_INDICATOR_KEYS:
                         if k not in t:
                             continue
                         label = base_indicator_state_label(k, t.get(k))
-                        s = base_indicator_stats[k].setdefault(
+                        s = base_indicator_stats_by_type[ttype][k].setdefault(
                             label, {"total": 0, "win": 0, "loss": 0}
                         )
                         s["total"] += 1
@@ -385,6 +380,8 @@ def build_report(trades, open_count=None):
                     if n in early_combo_stats:
                         early_combo_stats[n]["total"] += 1
                         early_combo_stats[n][outcome] += 1
+        else:
+            inds_ar = "—"  # نوع غير معروف (لا يُفترض حدوثه) — بدون تفصيل إضافي
 
         outcome_ar = {"win": "✅ ربح", "loss": "❌ خسارة"}[outcome]
         pnl_txt = f"{pnl:+.2f}%" if pnl is not None else "—"
@@ -405,7 +402,7 @@ def build_report(trades, open_count=None):
         lines.append(f"🔄 مفتوحة حاليًا: {open_count} صفقة")
     lines.append("")
     lines.append("— نسبة النجاح حسب النوع —")
-    for ttype in ["official", "early", "breakout", "experimental"]:
+    for ttype in TYPE_ORDER:
         s = type_stats.get(ttype)
         if not s or s["total"] == 0:
             continue
@@ -415,123 +412,122 @@ def build_report(trades, open_count=None):
             line += f" | مجموع ربح الرابحة: {s['win_pnl_sum']:+.2f}% | مجموع خسارة الخاسرة: {s['loss_pnl_sum']:+.2f}%"
         lines.append(line)
 
-    # --- تفصيل الرسمية حسب logic_version (قديم/جديد) ---
-    if logic_version_stats:
-        lines.append("")
-        lines.append("— الرسمية فقط: مقارنة قديم/جديد (logic_version) —")
-        for lv in sorted(logic_version_stats.keys(), key=lambda x: (x is None, x)):
-            ls = logic_version_stats[lv]
-            if ls["total"] == 0:
-                continue
-            wr = ls["win"] / ls["total"] * 100
-            label = LOGIC_VERSION_LABELS.get(lv, f"غير معروف ({lv})")
-            lines.append(
-                f"{label}: {ls['total']} صفقة | نجاح {wr:.0f}% (رابحة {ls['win']} / خاسرة {ls['loss']}) "
-                f"| مجموع ربح الرابحة: {ls['win_pnl_sum']:+.2f}% | مجموع خسارة الخاسرة: {ls['loss_pnl_sum']:+.2f}%"
-            )
-        new_total = logic_version_stats.get(2, {}).get("total", 0)
-        if new_total < 30:
-            lines.append(f"⚠️ عدد صفقات المنطق الجديد لسه قليل ({new_total}) — المقارنة أولية فقط")
-
-    lines.append("")
-    lines.append("— نسبة النجاح حسب المؤشر (رسمية/مبكرة) —")
-    for k in INDICATOR_KEYS:
-        s = indicator_stats[k]
-        if s["total"] == 0:
-            continue
+    # --- تفصيل مستقل لكل نوع إشارة على حدة، مفصول بخط طويل بين كل نوع والذي يليه، بحيث لا
+    # تختلط مؤشرات/عوامل نوع بآخر إطلاقًا ---
+    types_with_data = [tt for tt in TYPE_ORDER if type_stats.get(tt, {}).get("total", 0) > 0]
+    for ttype in types_with_data:
+        s = type_stats[ttype]
+        block = []
         wr = s["win"] / s["total"] * 100
-        lines.append(f"{INDICATOR_LABELS[k]}: {s['total']} صفقة | نجاح {wr:.0f}% (رابحة {s['win']} / خاسرة {s['loss']})")
+        header = f"{TYPE_LABELS[ttype]}: {s['total']} صفقة | نجاح {wr:.0f}% (رابحة {s['win']} / خاسرة {s['loss']})"
+        if ttype in ("official", "early", "experimental"):
+            header += f" | مجموع ربح الرابحة: {s['win_pnl_sum']:+.2f}% | مجموع خسارة الخاسرة: {s['loss_pnl_sum']:+.2f}%"
+        block.append(header)
 
-    if no_indicator_stats["total"] > 0:
-        s = no_indicator_stats
-        wr = s["win"] / s["total"] * 100
-        lines.append(f"بدون مؤشر إضافي: {s['total']} صفقة | نجاح {wr:.0f}% (رابحة {s['win']} / خاسرة {s['loss']})")
-
-    # --- تفصيل صفقات "بدون مؤشر إضافي" حسب المؤشرات الأساسية ---
-    if no_indicator_stats["total"] > 0:
-        with_base_data = no_indicator_stats["total"] - no_indicator_no_basedata
-        if with_base_data > 0:
-            lines.append("")
-            lines.append(
-                f"— تفصيل 'بدون مؤشر إضافي' حسب المؤشرات الأساسية ({with_base_data} صفقة تحوي بيانات) —"
-            )
-            for k in BASE_INDICATOR_KEYS:
-                states = base_indicator_stats[k]
-                if not states:
-                    continue
-                lines.append(f"{BASE_INDICATOR_LABELS[k]}:")
-                for label, s in states.items():
-                    if s["total"] == 0:
+        if ttype in TYPES_WITH_RAW_INDICATORS:
+            ind_stats = indicator_stats_by_type[ttype]
+            nist = no_indicator_stats_by_type[ttype]
+            if any(ind_stats[k]["total"] > 0 for k in INDICATOR_KEYS) or nist["total"] > 0:
+                block.append("")
+                block.append("— نسبة النجاح حسب المؤشر —")
+                for k in INDICATOR_KEYS:
+                    st = ind_stats[k]
+                    if st["total"] == 0:
                         continue
-                    wr = s["win"] / s["total"] * 100
-                    lines.append(
-                        f"  • {label}: {s['total']} صفقة | نجاح {wr:.0f}% (رابحة {s['win']} / خاسرة {s['loss']})"
-                    )
-            if no_indicator_no_basedata > 0:
-                lines.append(
-                    f"(ملاحظة: {no_indicator_no_basedata} صفقة من 'بدون مؤشر إضافي' أقدم من تحديث "
-                    f"الحفظ التشخيصي ولا تحوي بيانات المؤشرات الأساسية، فاستُبعدت من هذا التفصيل فقط)"
-                )
-        else:
-            lines.append(
-                f"(كل صفقات 'بدون مؤشر إضافي' الـ{no_indicator_stats['total']} أقدم من تحديث الحفظ "
-                f"التشخيصي — لا تتوفر بيانات المؤشرات الأساسية بعد، ستظهر تدريجيًا مع الصفقات الجديدة)"
-            )
+                    wrk = st["win"] / st["total"] * 100
+                    block.append(f"{INDICATOR_LABELS[k]}: {st['total']} صفقة | نجاح {wrk:.0f}% (رابحة {st['win']} / خاسرة {st['loss']})")
 
-    # --- المبكرة فقط: نسبة النجاح حسب كل مؤشر لوحده (مساهمة حاضرة ضمن أي تركيبة) ---
-    early_total_with_data = sum(s["total"] for s in early_factor_stats.values())
-    if early_total_with_data > 0 or early_no_factor_data > 0:
+                if nist["total"] > 0:
+                    wrk = nist["win"] / nist["total"] * 100
+                    block.append(f"بدون مؤشر إضافي: {nist['total']} صفقة | نجاح {wrk:.0f}% (رابحة {nist['win']} / خاسرة {nist['loss']})")
+
+                    with_base_data = nist["total"] - no_indicator_no_basedata_by_type[ttype]
+                    if with_base_data > 0:
+                        block.append("")
+                        block.append(
+                            f"— تفصيل 'بدون مؤشر إضافي' حسب المؤشرات الأساسية ({with_base_data} صفقة تحوي بيانات) —"
+                        )
+                        for k in BASE_INDICATOR_KEYS:
+                            states = base_indicator_stats_by_type[ttype][k]
+                            if not states:
+                                continue
+                            block.append(f"{BASE_INDICATOR_LABELS[k]}:")
+                            for label, st2 in states.items():
+                                if st2["total"] == 0:
+                                    continue
+                                wrk2 = st2["win"] / st2["total"] * 100
+                                block.append(
+                                    f"  • {label}: {st2['total']} صفقة | نجاح {wrk2:.0f}% (رابحة {st2['win']} / خاسرة {st2['loss']})"
+                                )
+                        if no_indicator_no_basedata_by_type[ttype] > 0:
+                            block.append(
+                                f"(ملاحظة: {no_indicator_no_basedata_by_type[ttype]} صفقة من 'بدون مؤشر إضافي' أقدم "
+                                f"من تحديث الحفظ التشخيصي ولا تحوي بيانات المؤشرات الأساسية، فاستُبعدت من هذا "
+                                f"التفصيل فقط)"
+                            )
+                    else:
+                        block.append(
+                            f"(كل صفقات 'بدون مؤشر إضافي' الـ{nist['total']} أقدم من تحديث الحفظ التشخيصي — لا "
+                            f"تتوفر بيانات المؤشرات الأساسية بعد، ستظهر تدريجيًا مع الصفقات الجديدة)"
+                        )
+
+            if ttype == "early":
+                early_total_with_data = sum(st["total"] for st in early_factor_stats.values())
+                if early_total_with_data > 0 or early_no_factor_data > 0:
+                    block.append("")
+                    block.append("— نسبة النجاح لكل مؤشر لوحده (بدون أي مؤشر ثانٍ معه) —")
+                    for k in EARLY_FACTOR_KEYS:
+                        st = early_factor_stats[k]
+                        if st["total"] == 0:
+                            continue
+                        wrk = st["win"] / st["total"] * 100
+                        lrk = st["loss"] / st["total"] * 100
+                        block.append(
+                            f"{EARLY_FACTOR_LABELS[k]}: {st['total']} صفقة | نجاح {wrk:.0f}% ({st['win']}) | فشل {lrk:.0f}% ({st['loss']})"
+                        )
+
+                    block.append("")
+                    block.append("— نسبة النجاح حسب عدد المؤشرات المتعاونة معًا —")
+                    for n in (1, 2, 3, 4):
+                        st = early_combo_stats[n]
+                        if st["total"] == 0:
+                            continue
+                        wrk = st["win"] / st["total"] * 100
+                        lrk = st["loss"] / st["total"] * 100
+                        block.append(
+                            f"{EARLY_COMBO_LABELS[n]}: {st['total']} صفقة | نجاح {wrk:.0f}% ({st['win']}) | فشل {lrk:.0f}% ({st['loss']})"
+                        )
+
+                    if early_no_factor_data > 0:
+                        block.append(
+                            f"(ملاحظة: {early_no_factor_data} صفقة مبكرة أقدم من إضافة حقل factors ولا تحوي "
+                            f"التركيبة الدقيقة، فاستُبعدت من هذا التفصيل فقط دون التأثير على بقية التقرير)"
+                        )
+
+        elif ttype == "breakout":
+            block.append("")
+            block.append("— نسبة النجاح حسب عوامل جودة الانفجار —")
+            for k in BREAKOUT_FACTOR_KEYS:
+                st = breakout_factor_stats[k]
+                if st["total"] == 0:
+                    continue
+                wrk = st["win"] / st["total"] * 100
+                block.append(f"{BREAKOUT_FACTOR_LABELS[k]}: {st['total']} صفقة | نجاح {wrk:.0f}% (رابحة {st['win']} / خاسرة {st['loss']})")
+
+        elif ttype == "experimental":
+            block.append("")
+            block.append("— نسبة النجاح حسب عوامل جودة التجريبية —")
+            for k in EXPERIMENTAL_FACTOR_KEYS:
+                st = experimental_factor_stats[k]
+                if st["total"] == 0:
+                    continue
+                wrk = st["win"] / st["total"] * 100
+                block.append(f"{EXPERIMENTAL_FACTOR_LABELS[k]}: {st['total']} صفقة | نجاح {wrk:.0f}% (رابحة {st['win']} / خاسرة {st['loss']})")
+
         lines.append("")
-        lines.append("— المبكرة فقط: نسبة النجاح لكل مؤشر لوحده (بدون أي مؤشر ثانٍ معه) —")
-        for k in EARLY_FACTOR_KEYS:
-            s = early_factor_stats[k]
-            if s["total"] == 0:
-                continue
-            wr = s["win"] / s["total"] * 100
-            lr = s["loss"] / s["total"] * 100
-            lines.append(
-                f"{EARLY_FACTOR_LABELS[k]}: {s['total']} صفقة | نجاح {wr:.0f}% ({s['win']}) | فشل {lr:.0f}% ({s['loss']})"
-            )
-
+        lines.append(SECTION_DIVIDER)
         lines.append("")
-        lines.append("— المبكرة فقط: نسبة النجاح حسب عدد المؤشرات المتعاونة معًا —")
-        for n in (1, 2, 3, 4):
-            s = early_combo_stats[n]
-            if s["total"] == 0:
-                continue
-            wr = s["win"] / s["total"] * 100
-            lr = s["loss"] / s["total"] * 100
-            lines.append(
-                f"{EARLY_COMBO_LABELS[n]}: {s['total']} صفقة | نجاح {wr:.0f}% ({s['win']}) | فشل {lr:.0f}% ({s['loss']})"
-            )
-
-        if early_no_factor_data > 0:
-            lines.append(
-                f"(ملاحظة: {early_no_factor_data} صفقة مبكرة أقدم من إضافة حقل factors ولا تحوي "
-                f"التركيبة الدقيقة، فاستُبعدت من قسم المبكرة أعلاه فقط دون التأثير على بقية التقرير)"
-            )
-
-    breakout_total = type_stats.get("breakout", {}).get("total", 0)
-    if breakout_total > 0:
-        lines.append("")
-        lines.append("— نسبة النجاح حسب عوامل جودة الانفجار —")
-        for k in BREAKOUT_FACTOR_KEYS:
-            s = breakout_factor_stats[k]
-            if s["total"] == 0:
-                continue
-            wr = s["win"] / s["total"] * 100
-            lines.append(f"{BREAKOUT_FACTOR_LABELS[k]}: {s['total']} صفقة | نجاح {wr:.0f}% (رابحة {s['win']} / خاسرة {s['loss']})")
-
-    experimental_total = type_stats.get("experimental", {}).get("total", 0)
-    if experimental_total > 0:
-        lines.append("")
-        lines.append("— نسبة النجاح حسب عوامل جودة التجريبية —")
-        for k in EXPERIMENTAL_FACTOR_KEYS:
-            s = experimental_factor_stats[k]
-            if s["total"] == 0:
-                continue
-            wr = s["win"] / s["total"] * 100
-            lines.append(f"{EXPERIMENTAL_FACTOR_LABELS[k]}: {s['total']} صفقة | نجاح {wr:.0f}% (رابحة {s['win']} / خاسرة {s['loss']})")
+        lines.extend(block)
 
     return "\n".join(lines), per_trade_lines
 
