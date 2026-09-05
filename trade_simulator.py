@@ -30,7 +30,10 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 FEE_PCT_PER_SIDE = float(os.environ.get("TRADE_FEE_PCT", "0.1"))
 MAX_CONCURRENT = int(os.environ.get("TRADE_MAX_CONCURRENT", "5"))
 
-TYPE_LABELS = {"official": "رسمية", "early": "مبكرة", "breakout": "انفجار"}
+TYPE_LABELS = {"official": "رسمية", "early": "مبكرة", "breakout": "انفجار", "experimental": "تجريبية"}
+
+# ترتيب الهدف المطلوب الخروج عنده (tp1 = index 0، tp2 = index 1، tp3 = index 2)
+TP_TARGET_INDEX = {"tp1": 0, "tp2": 1, "tp3": 2}
 
 # نفس التسمية المستخدمة بـscanner.py (archive_overflow) لملفات الأرشيف المرقّمة
 ACTIVE_FILENAME = "closed_trades.json"
@@ -109,22 +112,27 @@ def trade_return_pct(t):
     return net_pct
 
 
-def trade_return_pct_tp1(t):
+def trade_return_pct_target(t, tp_index=0):
     """
-    نفس trade_return_pct، لكن للصفقات الرسمية: لو الهدف الأول (index 0) تحقق في أي وقت،
-    نحتسب الخروج عنده مباشرة (تجاهل ما حصل بعده — رجوع لـSL أو استمرار لبقية الأهداف)،
-    بدل انتظار الإغلاق الفعلي النهائي المسجّل بالبوت.
+    نفس trade_return_pct، لكن مع خيار الخروج عند هدف محدد (tp_index: 0=TP1, 1=TP2, 2=TP3)
+    بدل انتظار الإغلاق الفعلي النهائي المسجّل بالبوت — لأي نوع صفقة (رسمية/مبكرة/انفجار/تجريبية)
+    عنده حقلا tps/hit_tps. لو الهدف المطلوب تحقق فعلاً في أي وقت (index موجود بـhit_tps)،
+    نحتسب الخروج عند سعر ذلك الهدف مباشرة (تجاهل ما حصل بعده — رجوع لـSL أو استمرار لبقية
+    الأهداف). لو الصفقة ما وصلت أصلاً لهذا الهدف (تم إغلاقها بـSL/EXPIRED قبل الوصول له، أو
+    كانت أصلاً بعدد أهداف أقل من tp_index)، نرجع للعائد الفعلي المسجّل (trade_return_pct) —
+    بهذا الشكل لا نفترض تفاؤليًا وصول هدف لم يتحقق فعلاً.
     """
     entry = t.get("entry")
     tps = t.get("tps") or []
     hit_tps = t.get("hit_tps") or []
-    if t.get("type") == "official" and entry and tps and 0 in hit_tps:
-        gross_pct = (tps[0] - entry) / entry * 100
+    if entry and len(tps) > tp_index and tp_index in hit_tps:
+        gross_pct = (tps[tp_index] - entry) / entry * 100
         return gross_pct - (2 * FEE_PCT_PER_SIDE)
     return trade_return_pct(t)
 
 
-def simulate(trades, days, capital, max_concurrent, trade_type="all", archive_fetch_error=False):
+def simulate(trades, days, capital, max_concurrent, trade_type="all", archive_fetch_error=False, tp_target="tp1"):
+    tp_index = TP_TARGET_INDEX.get(tp_target, 0)
     cutoff = dt.datetime.now() - dt.timedelta(days=days)
     slot_amount = capital / max_concurrent
 
@@ -170,7 +178,7 @@ def simulate(trades, days, capital, max_concurrent, trade_type="all", archive_fe
     wins = losses = 0
 
     for t in taken:
-        pct = trade_return_pct_tp1(t)
+        pct = trade_return_pct_target(t, tp_index)
         if pct is None:
             continue
         profit = slot_amount * pct / 100
@@ -202,6 +210,7 @@ def simulate(trades, days, capital, max_concurrent, trade_type="all", archive_fe
         "slot_amount": round(slot_amount, 2),
         "max_concurrent": max_concurrent,
         "trade_type": trade_type,
+        "tp_target": tp_target,
         "total_profit": round(total_profit, 2),
         "final_balance": round(capital + total_profit, 2),
         "by_type": by_type,
@@ -211,8 +220,9 @@ def simulate(trades, days, capital, max_concurrent, trade_type="all", archive_fe
 
 def format_message(days, res, archives_found=0):
     type_label = "الكل" if res["trade_type"] == "all" else TYPE_LABELS.get(res["trade_type"], res["trade_type"])
+    tp_label = res.get("tp_target", "tp1").upper()
     lines = [
-        f"💰 محاكاة أرباح آخر {days} يوم — نوع الصفقات: {type_label} — رأس مال {res['capital']:.0f}$ "
+        f"💰 محاكاة أرباح آخر {days} يوم — نوع الصفقات: {type_label} — هدف الخروج: {tp_label} — رأس مال {res['capital']:.0f}$ "
         f"({res['max_concurrent']} صفقات متزامنة كحد أقصى، {res['slot_amount']:.0f}$ لكل شريحة)"
     ]
     if archives_found:
@@ -238,10 +248,11 @@ def format_message(days, res, archives_found=0):
     if res["incomplete_warning"]:
         lines.append("⚠️ تنبيه: صار خطأ فعلي أثناء جلب أحد ملفات الأرشيف (راجع سجل التشغيل/logs) — قد لا تكون البيانات كاملة.")
 
-    note = "(محاكاة واقعية: رأس المال مقسوم على شرائح متزامنة، والإشارات الزائدة عند امتلاء الشرائح تُتجاهل، بعد خصم رسوم تداول تقديرية 0.1% لكل جهة"
-    if res["trade_type"] in ("all", "official"):
-        note += " — الصفقات الرسمية تُحسب بربح الهدف الأول فورًا إذا تحقق، بغض النظر عمّا حصل بعده"
-    note += ")"
+    note = (
+        "(محاكاة واقعية: رأس المال مقسوم على شرائح متزامنة، والإشارات الزائدة عند امتلاء الشرائح تُتجاهل، "
+        f"بعد خصم رسوم تداول تقديرية 0.1% لكل جهة — أي صفقة وصلت فعليًا لهدف {tp_label} في أي وقت تُحسب "
+        "بربح ذلك الهدف مباشرة (بغض النظر عمّا حصل بعده)، وما لم تصله يُحتسب عائدها الفعلي المسجّل عند الإغلاق)"
+    )
     lines.append(note)
     return "\n".join(lines)
 
@@ -266,11 +277,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--days", type=int, default=10)
     parser.add_argument("--amount", type=float, default=400, help="رأس المال الإجمالي (وليس لكل صفقة)")
-    parser.add_argument("--type", type=str, default="all", choices=["all", "official", "early", "breakout"])
+    parser.add_argument("--type", type=str, default="all",
+                         choices=["all", "official", "early", "breakout", "experimental"])
+    parser.add_argument("--tp", type=str, default="tp1", choices=["tp1", "tp2", "tp3"],
+                         help="الهدف الذي يُحتسب الخروج عنده إذا تحقق فعليًا (افتراضي: tp1)")
     args = parser.parse_args()
 
     trades, archives_found, archive_fetch_error = fetch_all_trades()
-    res = simulate(trades, args.days, args.amount, MAX_CONCURRENT, args.type, archive_fetch_error)
+    res = simulate(trades, args.days, args.amount, MAX_CONCURRENT, args.type, archive_fetch_error, args.tp)
     message = format_message(args.days, res, archives_found)
 
     print(message)
