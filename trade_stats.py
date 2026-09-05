@@ -6,8 +6,8 @@ trade_stats.py — تقرير مستقل لإحصائيات الصفقات ال�
   إشارة الإغلاق المحايد ⚪ نفسها أُزيلت أصلاً من البوت — لا تُحسب أي صفقة محايدة ضمن
   أي إحصائية أدناه: لا بالملخص العام، ولا حسب النوع، ولا حسب المؤشر، ولا حسب "بدون مؤشر")
 - نسبة الربح ونسبة الخسارة لكل فئة
-- تصنيف حسب نوع الإشارة (رسمية / مبكرة / انفجار)، مع مجموع نسب الربح الإجمالية لكل
-  الصفقات الرابحة ومجموع نسب الخسارة الإجمالية لكل الصفقات الخاسرة (رسمية ومبكرة فقط)
+- تصنيف حسب نوع الإشارة (رسمية / مبكرة / انفجار / تجريبية)، مع مجموع نسب الربح الإجمالية
+  لكل الصفقات الرابحة ومجموع نسب الخسارة الإجمالية لكل الصفقات الخاسرة (رسمية/مبكرة/تجريبية فقط)
 - لصفقات الرسمية تحديدًا: تفصيل إضافي حسب logic_version (قديم بدون الحقل = منطق ما قبل
   بوابتي htf_aligned/market_regime الإلزاميتين، جديد = logic_version موجود) — كي يمكن قياس
   أثر التعديل الأخير على الرسمية بدقة دون تلوّث النتائج بخلط المنطقين معًا
@@ -16,6 +16,9 @@ trade_stats.py — تقرير مستقل لإحصائيات الصفقات ال�
   (مؤشرات Squeeze/Accumulation/Divergence لا تُحسب لصفقات الانفجار لأنها غير محسوبة أصلاً
   عند فتح هذا النوع من الصفقات في scanner.py — استخدام عوامل الانفجار الخاصة بدل ذلك
   يمنع تلوّث فئة "بدون مؤشر إضافي" بصفقات الانفجار التي لا علاقة لها بها)
+- لكل صفقة تجريبية: عوامل جودة الإشارة التجريبية (دعم الاتجاه EMA7/14 / تأكيد حجم-OBV /
+  تدفق أموال MFI صاعد) والنتيجة (نفس منطق عزل الانفجار أعلاه: لا علاقة لهذه الصفقات
+  بمؤشرات Squeeze/Accumulation/Divergence، فتُعامل بقسمها الخاص تمامًا)
 - نسبة نجاح كل مؤشر على حدة (squeeze / accumulation / divergence / momentum / extended) عبر
   الصفقات الرسمية/المبكرة
 - لصفقات "بدون مؤشر إضافي" تحديدًا: تفصيل حسب المؤشرات الأساسية الثمانية التي تصنع الدرجة
@@ -68,6 +71,16 @@ BREAKOUT_FACTOR_LABELS = {
     "rsi_ok": "RSI في نطاق صحي",
 }
 
+# عوامل جودة الإشارة التجريبية (experimental_details في scanner.py) — Ichimoku
+# Tenkan/Kijun هو المحفّز نفسه (كل صفقة تجريبية تملكه بالتعريف فلا داعي لتتبعه كعامل)،
+# والعوامل الثلاثة التالية هي فقط ما يرفع الدرجة (0-3) بعد تحقق المحفّز
+EXPERIMENTAL_FACTOR_KEYS = ["trend_support", "volume_confirm", "mfi_bullish"]
+EXPERIMENTAL_FACTOR_LABELS = {
+    "trend_support": "دعم اتجاه EMA7/14",
+    "volume_confirm": "تأكيد حجم + OBV",
+    "mfi_bullish": "تدفق أموال صاعد (MFI)",
+}
+
 # المؤشرات الأربعة المستقلة اللي تطلق الإشارة المبكرة (تطابق الأربعة بـscanner.py منذ
 # تحديث 2026-09-02) — مبنية على حقل "factors" المحفوظ مع كل صفقة مبكرة (التركيبة الفعلية
 # الدقيقة اللي أطلقت الإشارة)، بدل الاعتماد على الأعلام الخام squeeze/accumulation/divergence
@@ -98,7 +111,12 @@ BASE_INDICATOR_LABELS = {
     "htf_aligned": "توافق فريم أعلى",
 }
 
-TYPE_LABELS = {"official": "رسمية", "early": "مبكرة", "breakout": "انفجار"}
+TYPE_LABELS = {
+    "official": "رسمية",
+    "early": "مبكرة",
+    "breakout": "انفجار",
+    "experimental": "تجريبية",
+}
 
 # تسمية نسخ منطق فلترة الإشارة الرسمية (تطابق OFFICIAL_LOGIC_VERSION في scanner.py)
 LOGIC_VERSION_LABELS = {
@@ -213,6 +231,12 @@ def active_breakout_factors(trade):
     return [k for k in BREAKOUT_FACTOR_KEYS if details.get(k) is True]
 
 
+def active_experimental_factors(trade):
+    """يرجع قائمة عوامل جودة الإشارة التجريبية التي كانت True وقت فتح صفقة تجريبية."""
+    details = trade.get("experimental_details") or {}
+    return [k for k in EXPERIMENTAL_FACTOR_KEYS if details.get(k) is True]
+
+
 def base_indicator_state_label(key, value):
     """يحوّل قيمة مؤشر أساسي إلى وصف عربي قابل للعرض حسب نوع الحقل."""
     if key == "rsi_state":
@@ -241,7 +265,7 @@ def build_report(trades, open_count=None):
     win_rate = len(wins) / total * 100
     loss_rate = len(losses) / total * 100
 
-    # --- تصنيف حسب النوع (رسمية / مبكرة / انفجار) ---
+    # --- تصنيف حسب النوع (رسمية / مبكرة / انفجار / تجريبية) ---
     # صفقات "neutral" (⚪) تُستبعد بالكامل من هذا التصنيف وكل ما يليه، لأن هذه الإشارة أُزيلت
     # أصلاً من البوت. لكل نوع نجمع أيضًا مجموع نسب الربح لكل الصفقات الرابحة ومجموع نسب
     # الخسارة لكل الصفقات الخاسرة (win_pnl_sum / loss_pnl_sum).
@@ -285,6 +309,9 @@ def build_report(trades, open_count=None):
     # --- نجاح كل عامل جودة انفجار على حدة ---
     breakout_factor_stats = {k: {"total": 0, "win": 0, "loss": 0} for k in BREAKOUT_FACTOR_KEYS}
 
+    # --- نجاح كل عامل جودة تجريبية على حدة ---
+    experimental_factor_stats = {k: {"total": 0, "win": 0, "loss": 0} for k in EXPERIMENTAL_FACTOR_KEYS}
+
     # --- تفصيل صفقات "بدون مؤشر إضافي" حسب المؤشرات الأساسية (state -> stats) ---
     base_indicator_stats = {k: {} for k in BASE_INDICATOR_KEYS}
     no_indicator_no_basedata = 0  # صفقات "بدون مؤشر إضافي" لكن أقدم من تحديث الحفظ (لا تحوي الحقول الثمانية)
@@ -313,6 +340,12 @@ def build_report(trades, open_count=None):
                 breakout_factor_stats[k]["total"] += 1
                 breakout_factor_stats[k][outcome] += 1
             inds_ar = "، ".join(BREAKOUT_FACTOR_LABELS[k] for k in factors) if factors else "بدون عوامل مسجّلة"
+        elif ttype == "experimental":
+            factors = active_experimental_factors(t)
+            for k in factors:
+                experimental_factor_stats[k]["total"] += 1
+                experimental_factor_stats[k][outcome] += 1
+            inds_ar = "، ".join(EXPERIMENTAL_FACTOR_LABELS[k] for k in factors) if factors else "بدون عوامل مسجّلة"
         else:
             inds = active_indicators(t)
             if inds:
@@ -372,13 +405,13 @@ def build_report(trades, open_count=None):
         lines.append(f"🔄 مفتوحة حاليًا: {open_count} صفقة")
     lines.append("")
     lines.append("— نسبة النجاح حسب النوع —")
-    for ttype in ["official", "early", "breakout"]:
+    for ttype in ["official", "early", "breakout", "experimental"]:
         s = type_stats.get(ttype)
         if not s or s["total"] == 0:
             continue
         wr = s["win"] / s["total"] * 100
         line = f"{TYPE_LABELS[ttype]}: {s['total']} صفقة | نجاح {wr:.0f}% (رابحة {s['win']} / خاسرة {s['loss']})"
-        if ttype in ("official", "early"):
+        if ttype in ("official", "early", "experimental"):
             line += f" | مجموع ربح الرابحة: {s['win_pnl_sum']:+.2f}% | مجموع خسارة الخاسرة: {s['loss_pnl_sum']:+.2f}%"
         lines.append(line)
 
@@ -488,6 +521,17 @@ def build_report(trades, open_count=None):
                 continue
             wr = s["win"] / s["total"] * 100
             lines.append(f"{BREAKOUT_FACTOR_LABELS[k]}: {s['total']} صفقة | نجاح {wr:.0f}% (رابحة {s['win']} / خاسرة {s['loss']})")
+
+    experimental_total = type_stats.get("experimental", {}).get("total", 0)
+    if experimental_total > 0:
+        lines.append("")
+        lines.append("— نسبة النجاح حسب عوامل جودة التجريبية —")
+        for k in EXPERIMENTAL_FACTOR_KEYS:
+            s = experimental_factor_stats[k]
+            if s["total"] == 0:
+                continue
+            wr = s["win"] / s["total"] * 100
+            lines.append(f"{EXPERIMENTAL_FACTOR_LABELS[k]}: {s['total']} صفقة | نجاح {wr:.0f}% (رابحة {s['win']} / خاسرة {s['loss']})")
 
     return "\n".join(lines), per_trade_lines
 
