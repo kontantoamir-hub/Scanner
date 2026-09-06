@@ -586,24 +586,47 @@ def atr_value(ind, period=14):
 
 # ---------------- جلب البيانات من Binance ----------------
 
-def meets_min_profit(entry, tps, min_pct=MIN_PROFIT_PCT):
+# تقدير تكلفة العمولة (دخول + خروج) — يُطرح من الربح النظري قبل مقارنته بـMIN_PROFIT_PCT
+# عدّل هذا الرقم لو عمولتك الفعلية مختلفة (مثلاً تستخدم BNB لخصم العمولة أو مستوى VIP معين)
+TRADING_FEE_PCT = float(os.environ.get("TRADING_FEE_PCT", "0.2"))
+
+# حماية استهلاك حصة Binance بالدقيقة (الحد الفعلي 1200)؛ نتوقف مؤقتًا قبل الوصول له بهامش أمان
+BINANCE_WEIGHT_LIMIT = 1200
+WEIGHT_SAFETY_MARGIN = int(os.environ.get("WEIGHT_SAFETY_MARGIN", "1000"))
+
+
+def meets_min_profit(entry, tps, min_pct=MIN_PROFIT_PCT, fee_pct=TRADING_FEE_PCT):
     """
-    يتحقق أن أقرب هدف (TP1) يحقق نسبة ربح >= الحد الأدنى المطلوب (MIN_PROFIT_PCT)
-    مقارنة بسعر الدخول. يُستخدم لتصفية أي إشارة (رسمية أو مبكرة أو انفجار) قبل اعتبارها
-    مؤهلة للإرسال، بصرف النظر عن مصدرها.
+    يتحقق أن أقرب هدف (TP1) يحقق نسبة ربح صافية (بعد خصم تكلفة تقديرية للعمولة
+    دخول+خروج عبر TRADING_FEE_PCT) >= الحد الأدنى المطلوب (MIN_PROFIT_PCT)،
+    مقارنة بسعر الدخول. يُستخدم لتصفية أي إشارة (رسمية أو مبكرة أو انفجار أو تجريبية)
+    قبل اعتبارها مؤهلة للإرسال، بصرف النظر عن مصدرها.
     """
     if not entry or not tps:
         return False
     tp1_profit_pct = (tps[0] - entry) / entry * 100
-    return tp1_profit_pct >= min_pct
+    net_profit_pct = tp1_profit_pct - fee_pct
+    return net_profit_pct >= min_pct
 
 
 def _request_with_retry(url, params=None, timeout=20, retries=3, backoff=1.5):
-    """طلب HTTP مع إعادة محاولة تلقائية عند فشل الشبكة أو ضغط مؤقت من Binance (429/5xx)."""
+    """
+    طلب HTTP مع إعادة محاولة تلقائية عند فشل الشبكة أو ضغط مؤقت من Binance (429/5xx).
+    يقرأ أيضًا header الوزن المستهلك (X-MBX-USED-WEIGHT-1M) بعد كل رد ناجح، ويتوقف
+    مؤقتًا قبل الاستمرار لو اقترب من حد Binance — بدل انتظار الرفض الفعلي (429) والتعامل
+    معه كخطأ لاحقًا.
+    """
     last_err = None
     for attempt in range(retries):
         try:
             r = requests.get(url, params=params, timeout=timeout)
+
+            used_weight = int(r.headers.get("X-MBX-USED-WEIGHT-1M", 0))
+            if used_weight >= WEIGHT_SAFETY_MARGIN:
+                wait = 60
+                print(f"⚠️ اقتراب من حد Binance (وزن {used_weight}/{BINANCE_WEIGHT_LIMIT}) — انتظار {wait}ث")
+                time.sleep(wait)
+
             if r.status_code == 429 or r.status_code >= 500:
                 raise requests.exceptions.HTTPError(f"status {r.status_code}")
             r.raise_for_status()
@@ -1179,8 +1202,11 @@ POSITIONS_GIST_FILE = "open_positions.json"   # الصفقات المفتوحة 
 CLOSED_GIST_FILE = "closed_trades.json"       # السجل "النشط": أحدث الصفقات فقط (قراءة سريعة، دائمًا صغير وآمن)
 STATS_GIST_FILE = "stats.json"                # إحصائيات أداء محسوبة دوريًا من closed_trades (خيار 3: تتبع فقط)
 ACTIVE_HISTORY_SIZE = 150                     # عدد الصفقات المحفوظة في السجل النشط قبل ترحيل الأقدم للأرشيف
-ARCHIVE_PREFIX = "closed_trades_archive_"     # بادئة ملفات الأرشيف المرقّمة (كل ملف محدود الحجم، بلا سقف على عددها)
+ARCHIVE_PREFIX = "closed_trades_archive_"     # بادئة ملفات الأرشيف المرقّمة داخل كل Gist أرشيف
 ARCHIVE_CHUNK_SIZE = 150                      # حد أقصى للصفقات في كل ملف أرشيف (يبقيه دائمًا تحت حد GitHub ~1MB بأمان)
+ARCHIVE_CHAIN_FILE = "archive_gists_chain.json"   # بالـGist الرئيسي: قائمة بمعرّفات كل Gists الأرشيف عبر الوقت (الأخير = النشط للكتابة)
+MAX_ARCHIVE_FILES_BEFORE_ROTATE = 280         # هامش أمان قبل حد GitHub الفعلي (300 ملف/Gist) — عنده نفتح Gist أرشيف جديد
+ARCHIVE_INDEX_FILE = "archive_index.json"     # فهرس صغير بالGist النشط: أي Gist يغطي أي نطاق تاريخ (لتسريع قراءة الإحصائيات لاحقًا)
 DOM_SHIFT_THRESHOLD = float(os.environ.get("DOM_SHIFT_THRESHOLD", "0.3"))  # نقطة مئوية خلال دورة تشغيل واحدة
 
 
@@ -1221,23 +1247,93 @@ def _gist_get_file(filename, gist_files):
     return gist_files[filename]["content"]
 
 
-def archive_overflow(overflow_trades, gist_files):
+def _gist_get_all_files_for(gist_id):
+    """مثل _gist_get_all_files لكن لأي معرف Gist — يُستخدم لقراءة ملفات Gist الأرشيف
+    النشط لو كان مختلفًا عن الـGist الرئيسي (GIST_ID)."""
+    if not GIST_TOKEN or not gist_id:
+        return {}
+    try:
+        r = requests.get(f"https://api.github.com/gists/{gist_id}", headers=_gist_headers(), timeout=15)
+        r.raise_for_status()
+        return r.json().get("files", {})
+    except Exception as e:
+        raise GistFetchError(f"تعذّر قراءة ملفات Gist الأرشيف {gist_id}: {e}") from e
+
+
+def _create_new_gist(description="Market Scanner - أرشيف صفقات إضافي"):
+    """ينشئ Gist خاص جديد (يبدأ بملف README بسيط) ويرجع معرفه — يُستخدم عند تدوير الأرشيف."""
+    payload = {
+        "description": description,
+        "public": False,
+        "files": {"README.md": {"content": "أرشيف صفقات مغلقة لبوت مسح السوق — يُدار تلقائيًا، لا تعدّل يدويًا."}},
+    }
+    r = requests.post("https://api.github.com/gists", headers=_gist_headers(), json=payload, timeout=20)
+    r.raise_for_status()
+    return r.json()["id"]
+
+
+def get_active_archive_gist(main_gist_files):
+    """
+    يرجع (معرف Gist الأرشيف النشط حاليًا للكتابة، قائمة سلسلة الـGists، ملفاته الحالية).
+    ينشئ Gist أرشيف جديد تلقائيًا لما عدد ملفات الأرشيف بالنشط الحالي يقارب حد GitHub
+    الفعلي (300 ملف/Gist) — هذا يمنع فشل الحفظ الصامت بعد تراكم عدد كبير جدًا من
+    الصفقات المغلقة على المدى الطويل (كل Gist أرشيف قديم يبقى مقروءًا للأبد، فقط
+    التوسع الجديد ينتقل لـGist لاحق).
+    """
+    try:
+        chain_raw = _gist_get_file(ARCHIVE_CHAIN_FILE, main_gist_files)
+        chain = json.loads(chain_raw) if chain_raw else []
+    except Exception:
+        chain = []
+
+    if not chain:
+        new_id = _create_new_gist()
+        return new_id, [new_id], {}
+
+    active_id = chain[-1]
+    active_files = main_gist_files if active_id == GIST_ID else _gist_get_all_files_for(active_id)
+
+    archive_count = sum(1 for fn in active_files if fn.startswith(ARCHIVE_PREFIX))
+    if archive_count >= MAX_ARCHIVE_FILES_BEFORE_ROTATE:
+        new_id = _create_new_gist()
+        chain.append(new_id)
+        return new_id, chain, {}
+
+    return active_id, chain, active_files
+
+
+def archive_overflow(overflow_trades, main_gist_files):
     """
     يوزّع الصفقات القديمة الفائضة (التي خرجت من السجل النشط) على ملفات أرشيف مرقّمة
-    (closed_trades_archive_0001.json, 0002.json, ...)، كل ملف محدود بـARCHIVE_CHUNK_SIZE
-    صفقة كحد أقصى — هذا يضمن نموًا غير محدود إجمالاً (يمكن الوصول لملايين الصفقات عبر
-    آلاف الملفات الصغيرة) بلا أن يصطدم أي ملف منفرد بحد GitHub لحجم المحتوى (~1MB) الذي
-    يسبب بتر البيانات بصمت.
-    """
-    if not overflow_trades:
-        return {}
+    (closed_trades_archive_0001.json, 0002.json, ...) داخل Gist أرشيف نشط، كل ملف
+    محدود بـARCHIVE_CHUNK_SIZE صفقة كحد أقصى (يبقيه تحت حد GitHub ~1MB بأمان). لما
+    عدد الملفات بالGist النشط يقارب 280، يُفتح Gist أرشيف جديد تلقائيًا (get_active_archive_gist)
+    بدل تجاوز حد GitHub الفعلي (300 ملف/Gist) الذي يوقف الحفظ نهائيًا.
 
-    archive_names = sorted(fn for fn in gist_files if fn.startswith(ARCHIVE_PREFIX))
+    يرجع: (معرف Gist الأرشيف المستهدف, قاموس الملفات المطلوب كتابتها فيه,
+           قاموس ملفات إضافية للـGist الرئيسي [سلسلة الـGists + الفهرس] إن تغيّرت).
+    """
+    main_updates = {}
+    if not overflow_trades:
+        return None, {}, main_updates
+
+    target_gist_id, chain, archive_files = get_active_archive_gist(main_gist_files)
+
+    # لو الـGist تغيّر أو أُنشئ لأول مرة، حدّث سلسلة الـGists بالGist الرئيسي
+    try:
+        old_chain_raw = _gist_get_file(ARCHIVE_CHAIN_FILE, main_gist_files)
+        old_chain = json.loads(old_chain_raw) if old_chain_raw else []
+    except Exception:
+        old_chain = []
+    if chain != old_chain:
+        main_updates[ARCHIVE_CHAIN_FILE] = json.dumps(chain, ensure_ascii=False)
+
+    archive_names = sorted(fn for fn in archive_files if fn.startswith(ARCHIVE_PREFIX))
     if archive_names:
         last_name = archive_names[-1]
         idx = int(last_name[len(ARCHIVE_PREFIX):].replace(".json", ""))
         try:
-            last_content = json.loads(gist_files[last_name].get("content") or "[]")
+            last_content = json.loads(archive_files[last_name].get("content") or "[]")
         except Exception:
             last_content = []
     else:
@@ -1254,32 +1350,48 @@ def archive_overflow(overflow_trades, gist_files):
         remaining = remaining[space:]
         files_to_write[f"{ARCHIVE_PREFIX}{idx:04d}.json"] = json.dumps(last_content, ensure_ascii=False, separators=(',', ':'))
 
-    # أنشئ ملفات أرشيف جديدة للباقي (بلا أي سقف على عدد الملفات)
+    # أنشئ ملفات أرشيف جديدة للباقي ضمن نفس الـGist النشط (حتى لو قارب الحد، نكمل
+    # هذي الدورة ونؤجل التدوير الفعلي للدورة القادمة تفاديًا لتعقيد إضافي هنا)
     while remaining:
         idx += 1
         chunk = remaining[:ARCHIVE_CHUNK_SIZE]
         remaining = remaining[ARCHIVE_CHUNK_SIZE:]
         files_to_write[f"{ARCHIVE_PREFIX}{idx:04d}.json"] = json.dumps(chunk, ensure_ascii=False, separators=(',', ':'))
 
-    return files_to_write
+    # تحديث فهرس صغير بالGist الرئيسي: أي Gist يحتوي حاليًا آخر نطاق أرشيف مكتوب
+    try:
+        index_raw = _gist_get_file(ARCHIVE_INDEX_FILE, main_gist_files)
+        index = json.loads(index_raw) if index_raw else {}
+    except Exception:
+        index = {}
+    index[target_gist_id] = {
+        "last_updated": __import__("datetime").datetime.utcnow().isoformat(),
+        "archive_files_count": len(archive_names) + len(files_to_write) - (1 if space > 0 and overflow_trades else 0),
+    }
+    main_updates[ARCHIVE_INDEX_FILE] = json.dumps(index, ensure_ascii=False)
+
+    return target_gist_id, files_to_write, main_updates
 
 
-def _gist_patch_files(files_dict):
-    """يحفظ عدة ملفات دفعة واحدة داخل نفس الـ Gist (الملفات غير المذكورة تبقى كما هي).
-    يُعيد المحاولة تلقائيًا عند الفشل، ويطبع حجم Payload للتشخيص."""
-    if not GIST_TOKEN or not GIST_ID:
-        print("⚠️ GIST_TOKEN أو GIST_ID غير موجودين — تخطي الحفظ.")
+def _gist_patch_files(files_dict, gist_id=None):
+    """يحفظ عدة ملفات دفعة واحدة داخل Gist معيّن (افتراضيًا الـGist الرئيسي GIST_ID،
+    أو أي Gist أرشيف آخر لو مُرِّر gist_id صراحة — يُستخدم عند تدوير الأرشيف).
+    الملفات غير المذكورة تبقى كما هي. يُعيد المحاولة تلقائيًا عند الفشل، ويطبع حجم
+    Payload للتشخيص."""
+    target_id = gist_id or GIST_ID
+    if not GIST_TOKEN or not target_id:
+        print("⚠️ GIST_TOKEN أو معرف الـGist غير موجودين — تخطي الحفظ.")
         return False
 
     payload = {"files": {fn: {"content": content} for fn, content in files_dict.items()}}
     payload_size = len(json.dumps(payload, ensure_ascii=False, separators=(',', ':')))
-    print(f"💾 حجم Payload للحفظ في Gist: {payload_size:,} بايت | ملفات: {list(files_dict.keys())}")
+    print(f"💾 حجم Payload للحفظ في Gist {target_id}: {payload_size:,} بايت | ملفات: {list(files_dict.keys())}")
 
     last_err = None
     for attempt in range(1, 4):
         try:
             r = requests.patch(
-                f"https://api.github.com/gists/{GIST_ID}",
+                f"https://api.github.com/gists/{target_id}",
                 headers=_gist_headers(),
                 json=payload,
                 timeout=20
@@ -1460,7 +1572,15 @@ def save_all_state(alerted_symbols, btc_dominance, positions, closed_delta, gist
         if len(history) > ACTIVE_HISTORY_SIZE:
             overflow = history[:-ACTIVE_HISTORY_SIZE]
             history = history[-ACTIVE_HISTORY_SIZE:]
-            files.update(archive_overflow(overflow, gist_files))
+            archive_gist_id, archive_files, main_updates = archive_overflow(overflow, gist_files)
+            files.update(main_updates)  # سلسلة الـGists + الفهرس، تُحفظ بالGist الرئيسي
+            if archive_gist_id and archive_files:
+                if archive_gist_id == GIST_ID:
+                    files.update(archive_files)  # نفس الـGist الرئيسي، تُدمج بحفظة واحدة
+                else:
+                    archived_ok = _gist_patch_files(archive_files, gist_id=archive_gist_id)
+                    if not archived_ok:
+                        print(f"❌ فشل حفظ ملفات الأرشيف بـGist منفصل ({archive_gist_id})")
 
         files[CLOSED_GIST_FILE] = json.dumps(history, ensure_ascii=False, separators=(',', ':'))
 
@@ -1500,6 +1620,7 @@ def open_new_positions(positions, fresh_signals):
             "interval": INTERVAL,
             "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "type": "official",
+            "concurrent_signals": r.get("concurrent_signals", []),
             # حقول تشخيصية: أي عوامل كانت حاضرة وقت الدخول -> تحليل لاحق لأثر كل عامل على النجاح/الفشل
             # (تُبقيها trade_stats.py قابلة للتصنيف حسب المؤشر بعد الإغلاق)
             "squeeze": r.get("squeeze"),
@@ -1542,6 +1663,7 @@ def open_new_early_positions(positions, fresh_early_signals):
             "interval": INTERVAL,
             "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "type": "early",
+            "concurrent_signals": r.get("concurrent_signals", []),
             "confidence": r.get("early_confidence"),
             # نفس الحقول التشخيصية للإشارات المبكرة، عشان نعرف أي مزيج (squeeze/accumulation/divergence)
             # فرّق فعليًا بين "احتمالية" ناجحة و"مؤكدة" فاشلة، بدل ما نكتفي بتصنيف الثقة العام
@@ -1582,6 +1704,7 @@ def open_new_breakout_positions(positions, fresh_breakout_signals):
             "interval": INTERVAL,
             "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "type": "breakout",
+            "concurrent_signals": r.get("concurrent_signals", []),
             "breakout_details": r.get("breakout_details"),
             "extended": r.get("extended"),
             "alert_message_id": r.get("_msg_id"),
@@ -1609,6 +1732,7 @@ def open_new_experimental_positions(positions, fresh_experimental_signals):
             "interval": INTERVAL,
             "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "type": "experimental",
+            "concurrent_signals": r.get("concurrent_signals", []),
             "experimental_details": r.get("experimental_details"),
             "near_resistance": r.get("near_resistance"),
             "extended": r.get("extended"),
@@ -1891,6 +2015,35 @@ def main():
         and meets_min_profit(r["experimental_entry"], r["experimental_tps"])
     ]
     experimental_keys = {f"{r['symbol']}:experimental" for r in experimental_eligible}
+
+    # مجموعات الرموز حسب النوع (بصرف النظر عن سبق التنبيه) — تُستخدم فقط لتوثيق أي
+    # أنواع أخرى ظهرت لنفس العملة بنفس دورة الفحص (concurrent_signals)، بلا أي استبعاد
+    # فعلي بينها؛ الأنواع الأربعة تبقى مستقلة تمامًا كما هي، هذا توثيق تشخيصي بحت
+    # لتحليل لاحق (trade_stats.py) يجاوب: "أي نوع يفوز فعليًا لما يتزامن مع غيره؟"
+    early_symbols = {r["symbol"] for r in early_eligible}
+    breakout_symbols = {r["symbol"] for r in breakout_eligible}
+    experimental_symbols = {r["symbol"] for r in experimental_eligible}
+
+    def _concurrent_signals_for(symbol, exclude_type):
+        others = []
+        if symbol in strong_symbols and exclude_type != "official":
+            others.append("official")
+        if symbol in early_symbols and exclude_type != "early":
+            others.append("early")
+        if symbol in breakout_symbols and exclude_type != "breakout":
+            others.append("breakout")
+        if symbol in experimental_symbols and exclude_type != "experimental":
+            others.append("experimental")
+        return others
+
+    for r in strong:
+        r["concurrent_signals"] = _concurrent_signals_for(r["symbol"], "official")
+    for r in early_eligible:
+        r["concurrent_signals"] = _concurrent_signals_for(r["symbol"], "early")
+    for r in breakout_eligible:
+        r["concurrent_signals"] = _concurrent_signals_for(r["symbol"], "breakout")
+    for r in experimental_eligible:
+        r["concurrent_signals"] = _concurrent_signals_for(r["symbol"], "experimental")
 
     prev_alerted, prev_dominance = load_state(gist_files)
     fresh = [r for r in strong if r["symbol"] not in prev_alerted]
