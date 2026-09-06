@@ -86,6 +86,26 @@ EARLY_SL_ATR_MULT = 2.0
 # عدد الأهداف والثقة يعتمدان مباشرة على عدد الشروط المتحققة (squeeze / accumulation / divergence / momentum):
 # شرط واحد = احتمالية (هدف واحد)، شرطان = مؤكدة (هدفان)، 3 فأكثر = مؤكدة قوية (3-4 أهداف)
 
+# ---------------- إعدادات تحسينات إضافية (2026-09-07) ----------------
+# الحد الأدنى لنسبة العائد إلى المخاطرة (Reward:Risk) — يُرفض أي إشارة (أي نوع) لو TP1
+# لا يحقق هذه النسبة مقارنة بالمسافة بين الدخول ووقف الخسارة، حتى لو حقق MIN_PROFIT_PCT
+MIN_RR_RATIO = float(os.environ.get("MIN_RR_RATIO", "1.5"))
+
+# وزن "الزخم المتفق عليه" (EMA trend + MACD) في نظام score — كانا يُحسبان كعاملين منفصلين
+# رغم ارتباطهما الوثيق (كلاهما يقيس نفس ظاهرة الزخم تقريبًا)، فيُعطى الزخم وزنًا مضاعفًا
+# بدون قصد. الآن لو اتفقا يُعطيان وزنًا واحدًا مجمّعًا (1.5 بدل 2)، ولو اختلفا فالنتيجة صفر كالسابق.
+MOMENTUM_AGREE_WEIGHT = float(os.environ.get("MOMENTUM_AGREE_WEIGHT", "1.5"))
+
+# نسبة "الوسادة" فوق نقطة الدخول عند نقل وقف الخسارة للتعادل (Breakeven) بعد لمس أول هدف —
+# بدل نقله لنقطة الدخول تمامًا (قد يُخرج الصفقة بسرعة من رجّة سعرية بسيطة قبل استكمال الحركة
+# نحو الأهداف التالية)، يُنقل لمسافة صغيرة فوق الدخول كنسبة من المخاطرة الأصلية للصفقة
+BREAKEVEN_BUFFER_RATIO = float(os.environ.get("BREAKEVEN_BUFFER_RATIO", "0.2"))
+
+# نطاق حيادي حول الصفر (%) لتصنيف نتيجة الصفقة النهائية "بدون تغيير حقيقي" بدل ربح/خسارة
+# صريحين — يُستخدم في compute_stats لتفادي تصنيف صفقة لمست TP1 ثم رجعت لنقطة قريبة من
+# الصفر كـ"فوز" (المشكلة التي حُدِّدت بالمراجعة الخارجية للكود)
+BREAKEVEN_BAND_PCT = float(os.environ.get("BREAKEVEN_BAND_PCT", "0.1"))
+
 
 # ---------------- دوال المؤشرات الفنية ----------------
 
@@ -144,16 +164,20 @@ def rolling_avg(values, period):
     return out
 
 
-def adx(highs, lows, closes, period=ADX_PERIOD):
+def compute_adx_di(highs, lows, closes, period=ADX_PERIOD):
     """
-    مؤشر قوة الاتجاه (ADX) — يميّز السوق المتجه بوضوح عن السوق العرضي المتذبذب.
-    قيمة أقل من ~20 تعني غالبًا سوقًا بلا اتجاه واضح، حيث تكثر الإشارات الكاذبة.
-    يرجع قائمة بنفس طول closes، بقيم None قبل اكتمال فترة الحساب.
+    مؤشر قوة الاتجاه (ADX) مع خطي الاتجاه +DI/-DI. ADX يقيس قوة الاتجاه فقط (بصرف النظر
+    عن اتجاهه)، بينما +DI/-DI يحددان اتجاهه الفعلي: +DI > -DI يعني ضغط شرائي مسيطر،
+    والعكس يعني ضغط بيعي مسيطر — يُستخدمان معًا لتأكيد أن اتجاه EMA السريع (trend_up)
+    مدعوم فعليًا باتجاه الزخم الأعمق، لا مجرد تقاطع سطحي لمتوسطين.
+    يرجع (adx_list, plus_di_list, minus_di_list) بنفس طول closes، بقيم None قبل اكتمال الفترة.
     """
     n = len(closes)
-    out = [None] * n
+    adx_out = [None] * n
+    pdi_out = [None] * n
+    mdi_out = [None] * n
     if n <= period * 2:
-        return out
+        return adx_out, pdi_out, mdi_out
 
     tr = [0.0] * n
     plus_dm = [0.0] * n
@@ -176,18 +200,25 @@ def adx(highs, lows, closes, period=ADX_PERIOD):
         minus_sum = minus_sum - (minus_sum / period) + minus_dm[i]
         pdi = 100 * plus_sum / tr_sum if tr_sum else 0
         mdi = 100 * minus_sum / tr_sum if tr_sum else 0
+        pdi_out[i] = pdi
+        mdi_out[i] = mdi
         dx[i] = 100 * abs(pdi - mdi) / (pdi + mdi) if (pdi + mdi) else 0
 
     start = period * 2
     valid_dx = [x for x in dx[period + 1:start + 1] if x is not None]
     if not valid_dx:
-        return out
-    out[start] = sum(valid_dx) / len(valid_dx)
+        return adx_out, pdi_out, mdi_out
+    adx_out[start] = sum(valid_dx) / len(valid_dx)
     for i in range(start + 1, n):
-        if out[i - 1] is None or dx[i] is None:
+        if adx_out[i - 1] is None or dx[i] is None:
             continue
-        out[i] = (out[i - 1] * (period - 1) + dx[i]) / period
-    return out
+        adx_out[i] = (adx_out[i - 1] * (period - 1) + dx[i]) / period
+    return adx_out, pdi_out, mdi_out
+
+
+def adx(highs, lows, closes, period=ADX_PERIOD):
+    """توافقية مع الاستدعاءات القديمة: يرجع قائمة ADX فقط بدون +DI/-DI."""
+    return compute_adx_di(highs, lows, closes, period)[0]
 
 
 def obv(closes, vols):
@@ -279,8 +310,12 @@ def bullish_divergence(closes, rsi_vals, lookback=DIVERGENCE_LOOKBACK, pivot_spa
     return price_lower_low and rsi_higher_low
 
 
-def nearest_resistance(highs, closes, lookback=RESISTANCE_LOOKBACK, pivot_span=RESISTANCE_PIVOT_SPAN):
-    """يرجع أقرب مستوى مقاومة (قمة سعرية سابقة) فوق السعر الحالي، أو None لو لا توجد."""
+def resistance_levels(highs, closes, lookback=RESISTANCE_LOOKBACK, pivot_span=RESISTANCE_PIVOT_SPAN, max_levels=3):
+    """
+    يرجع حتى max_levels من مستويات المقاومة (قمم سعرية سابقة) فوق السعر الحالي، مرتبة
+    تصاعديًا (الأقرب أولاً) — بدل الاكتفاء بأقرب واحدة فقط. يفيد لاحقًا في تحليل
+    Reward/Risk الحقيقي عبر عدة حواجز سعرية، وليس فقط أقرب حاجز.
+    """
     n = len(highs)
     window_n = min(lookback, n)
     start = n - window_n
@@ -290,8 +325,14 @@ def nearest_resistance(highs, closes, lookback=RESISTANCE_LOOKBACK, pivot_span=R
         window = highs[i - pivot_span:i + pivot_span + 1]
         if highs[i] == max(window):
             pivots.append(highs[i])
-    above = [p for p in pivots if p > price]
-    return min(above) if above else None
+    above = sorted(set(p for p in pivots if p > price))
+    return above[:max_levels]
+
+
+def nearest_resistance(highs, closes, lookback=RESISTANCE_LOOKBACK, pivot_span=RESISTANCE_PIVOT_SPAN):
+    """يرجع أقرب مستوى مقاومة (قمة سعرية سابقة) فوق السعر الحالي، أو None لو لا توجد."""
+    levels = resistance_levels(highs, closes, lookback, pivot_span, max_levels=1)
+    return levels[0] if levels else None
 
 
 def momentum_strength(macd_line, signal, rsi_vals, i):
@@ -492,6 +533,7 @@ def compute_indicators(klines):
     macd_line, signal = macd(closes)
     bb_upper, bb_lower = bollinger(closes)
     tenkan, kijun = ichimoku_tenkan_kijun(highs, lows)
+    adx_vals, plus_di_vals, minus_di_vals = compute_adx_di(highs, lows, closes)
     return {
         "closes": closes, "highs": highs, "lows": lows, "vols": vols,
         "ema7": ema(closes, 7), "ema14": ema(closes, 14),
@@ -500,7 +542,7 @@ def compute_indicators(klines):
         "macd": macd_line, "signal": signal,
         "bb_upper": bb_upper, "bb_lower": bb_lower,
         "vol_avg": rolling_avg(vols, 20),
-        "adx": adx(highs, lows, closes),
+        "adx": adx_vals, "plus_di": plus_di_vals, "minus_di": minus_di_vals,
         "obv": obv(closes, vols),
         "tenkan": tenkan, "kijun": kijun,
         "mfi": mfi(highs, lows, closes, vols),
@@ -519,7 +561,16 @@ def score_at(i, ind, apply_extra_filters=True):
     vol_confirm = ind["vols"][i] > ind["vol_avg"][i] * 1.1
     trend_dir = 1 if trend_up else -1
     vol_score = trend_dir * 0.5 if vol_confirm else 0
-    score = trend_dir + rsi_state + (1 if macd_bull else -1) + bb_state + vol_score
+
+    # --- الزخم (EMA trend + MACD) كعامل واحد مجمّع بدل عاملين منفصلين ---
+    # EMA7>EMA14 وMACD bullish يقيسان نفس ظاهرة الزخم تقريبًا (مترابطان)، فجمعهما كعاملين
+    # منفصلين كان يعطي نفس المعلومة وزنًا مضاعفًا حين يتفقان (double counting). الآن: لو
+    # اتفقا -> وزن واحد مجمّع (MOMENTUM_AGREE_WEIGHT، افتراضيًا 1.5 بدل 2)، ولو اختلفا -> صفر
+    # (تمامًا كالسلوك السابق، فلا تغيير هناك).
+    momentum_agree = trend_up == macd_bull
+    momentum_component = (trend_dir * MOMENTUM_AGREE_WEIGHT) if momentum_agree else 0
+
+    score = momentum_component + rsi_state + bb_state + vol_score
 
     # --- فلاتر إضافية لتحسين جودة الإشارة (ADX / انحراف / مقاومة / OBV / إرهاق) ---
     # تُحسب دائمًا للعرض التشخيصي، لكن تُطبَّق على الدرجة فقط لو apply_extra_filters=True
@@ -527,6 +578,15 @@ def score_at(i, ind, apply_extra_filters=True):
 
     adx_val = ind["adx"][i] if i < len(ind["adx"]) else None
     ranging = adx_val is not None and adx_val < ADX_THRESHOLD
+
+    # اتجاه +DI/-DI: ADX وحده يقيس قوة الاتجاه فقط بصرف النظر عن جهته؛ +DI/-DI يؤكدان
+    # (أو ينفيان) أن الاتجاه الفعلي المسيطر يتوافق فعلاً مع اتجاه EMA السريع (trend_up)
+    plus_di = ind.get("plus_di", [None] * len(ind["closes"]))[i] if i < len(ind.get("plus_di", [])) else None
+    minus_di = ind.get("minus_di", [None] * len(ind["closes"]))[i] if i < len(ind.get("minus_di", [])) else None
+    if plus_di is not None and minus_di is not None:
+        di_confirm = (plus_di > minus_di) if trend_up else (minus_di > plus_di)
+    else:
+        di_confirm = None
 
     divergence = bullish_divergence(ind["closes"][:i + 1], ind["rsi"][:i + 1])
 
@@ -543,6 +603,10 @@ def score_at(i, ind, apply_extra_filters=True):
     if apply_extra_filters:
         if ranging:
             score *= 0.5
+        elif di_confirm is False:
+            # السوق فعليًا متجه (ADX ليس عرضيًا) لكن +DI/-DI يناقضان اتجاه EMA السريع —
+            # عقوبة جزئية (وليست كاملة كالسوق العرضي) لأن الإشارة أقل موثوقية من ظاهرها
+            score *= 0.7
         if divergence:
             score += 1
         if near_resistance:
@@ -555,10 +619,12 @@ def score_at(i, ind, apply_extra_filters=True):
     return {
         "score": score, "trend_up": trend_up, "vol_confirm": vol_confirm, "rv": rv,
         "adx_val": adx_val, "ranging": ranging,
+        "plus_di": plus_di, "minus_di": minus_di, "di_confirm": di_confirm,
         "divergence": divergence,
         "near_resistance": near_resistance, "resistance": resistance,
         "obv_confirm": obv_confirm,
         "extended": extended,
+        "momentum_agree": momentum_agree,
         # حقول أساسية إضافية للحفظ التشخيصي (rsi_state: 1 تشبع بيعي / -1 تشبع شرائي / 0 محايد،
         # bb_state: 1 عند الحد السفلي / -1 عند الحد العلوي / 0 منتصف النطاق)
         "rsi_state": rsi_state,
@@ -607,6 +673,23 @@ def meets_min_profit(entry, tps, min_pct=MIN_PROFIT_PCT, fee_pct=TRADING_FEE_PCT
     tp1_profit_pct = (tps[0] - entry) / entry * 100
     net_profit_pct = tp1_profit_pct - fee_pct
     return net_profit_pct >= min_pct
+
+
+def meets_min_rr(entry, sl, tps, min_rr=MIN_RR_RATIO):
+    """
+    يتحقق أن نسبة العائد إلى المخاطرة (Reward:Risk) عند أول هدف (TP1) مقارنة بمسافة
+    وقف الخسارة >= الحد الأدنى المطلوب. MIN_PROFIT_PCT وحده لا يكفي: صفقة بمخاطرة 2%
+    وهدف 1.2% تجتاز MIN_PROFIT_PCT بسهولة رغم أنها صفقة سيئة إحصائيًا (R:R < 1).
+    """
+    if not entry or not sl or not tps:
+        return False
+    risk = entry - sl
+    if risk <= 0:
+        return False
+    reward = tps[0] - entry
+    if reward <= 0:
+        return False
+    return (reward / risk) >= min_rr
 
 
 def _request_with_retry(url, params=None, timeout=20, retries=3, backoff=1.5):
@@ -700,14 +783,36 @@ def analyze_symbol(t, interval, error_list=None):
             htf = HTF_MAP.get(interval)
             if htf:
                 try:
-                    htf_klines = fetch_klines(symbol, htf, 60)
+                    # تأكيد أقوى من مجرد EMA7>EMA14: نتحقق من هيكل EMA20/EMA50 + ميل EMA50
+                    # + موقع السعر منها + ADX>عتبة (اتجاه فعلي قوي وليس تقاطعًا سطحيًا)
+                    htf_klines = fetch_klines(symbol, htf, 100)
                     htf_klines = drop_unclosed_candle(htf_klines)
                     htf_closes = [float(k[4]) for k in htf_klines]
-                    htf_up = ema(htf_closes, 7)[-1] > ema(htf_closes, 14)[-1]
-                    trend_dir = 1 if r["trend_up"] else -1
-                    htf_aligned = htf_up == r["trend_up"]
-                    final_score += (trend_dir * 0.5) if htf_aligned else (-trend_dir * 0.5)
-                    htf_checked = True
+                    htf_highs = [float(k[2]) for k in htf_klines]
+                    htf_lows = [float(k[3]) for k in htf_klines]
+                    if len(htf_closes) >= 56:
+                        htf_ema20 = ema(htf_closes, 20)
+                        htf_ema50 = ema(htf_closes, 50)
+                        htf_adx_vals = adx(htf_highs, htf_lows, htf_closes)
+                        htf_adx_last = htf_adx_vals[-1]
+                        htf_adx_ok = htf_adx_last is not None and htf_adx_last > ADX_THRESHOLD
+                        htf_ema50_rising = htf_ema50[-1] > htf_ema50[-6]
+                        htf_bullish_strict = (
+                            htf_ema20[-1] > htf_ema50[-1]
+                            and htf_ema50_rising
+                            and htf_closes[-1] > htf_ema50[-1]
+                            and htf_adx_ok
+                        )
+                        htf_bearish_strict = (
+                            htf_ema20[-1] < htf_ema50[-1]
+                            and not htf_ema50_rising
+                            and htf_closes[-1] < htf_ema50[-1]
+                            and htf_adx_ok
+                        )
+                        trend_dir = 1 if r["trend_up"] else -1
+                        htf_aligned = htf_bullish_strict if r["trend_up"] else htf_bearish_strict
+                        final_score += (trend_dir * 0.5) if htf_aligned else (-trend_dir * 0.5)
+                        htf_checked = True
                 except Exception:
                     pass
 
@@ -849,7 +954,21 @@ def analyze_symbol(t, interval, error_list=None):
             else:
                 tp_count = 1
 
-            tps = [entry + risk * i for i in range(1, tp_count + 1)]
+            raw_tps = [entry + risk * i for i in range(1, tp_count + 1)]
+            # تقليم الأهداف عند أول هدف يتجاوز أقرب مقاومة معروفة — نفس المنطق المطبَّق
+            # أصلاً على المبكرة/الانفجار/التجريبية، كان غائبًا عن الرسمية سابقًا (ثغرة:
+            # كانت أهداف الرسمية تُبنى على ATR فقط بصرف النظر عن هيكل السوق)
+            resistance = r.get("resistance")
+            if resistance:
+                trimmed = []
+                for tp in raw_tps:
+                    if tp >= resistance:
+                        trimmed.append(resistance)
+                        break
+                    trimmed.append(tp)
+                tps = trimmed
+            else:
+                tps = raw_tps
 
         return {
             "symbol": symbol,
@@ -863,8 +982,11 @@ def analyze_symbol(t, interval, error_list=None):
             "htf_checked": htf_checked,
             "htf_aligned": htf_aligned,
             "ranging": r["ranging"],
+            "di_confirm": r["di_confirm"],
+            "momentum_agree": r["momentum_agree"],
             "divergence": r["divergence"],
             "near_resistance": r["near_resistance"],
+            "resistance_levels": resistance_levels(ind["highs"][:last + 1], ind["closes"][:last + 1]),
             "obv_confirm": r["obv_confirm"],
             "extended": r["extended"],
             "rsi_state": r["rsi_state"],
@@ -1466,38 +1588,107 @@ def load_closed(gist_files):
         return []
 
 
+def _score_bucket(score):
+    """يصنّف الدرجة إلى نطاق مطابق لعتبات القرار الفعلية بالبوت (بدل تقريب عدد صحيح بسيط)."""
+    if score is None:
+        return "?"
+    s = abs(score)
+    if s >= 3.5:
+        return "3.5+"
+    if s >= 2.5:
+        return "2.5-3.49"
+    if s >= 1.5:
+        return "1.5-2.49"
+    return "<1.5"
+
+
+def _new_bucket():
+    return {"total": 0, "win": 0, "loss": 0, "neutral": 0, "pnl_sum": 0.0, "pnl_list": []}
+
+
+def _bump_bucket(bucket, outcome, net_pnl_pct):
+    bucket["total"] += 1
+    bucket[outcome] += 1
+    if net_pnl_pct is not None:
+        bucket["pnl_sum"] += net_pnl_pct
+        bucket["pnl_list"].append(net_pnl_pct)
+
+
+def _finalize_bucket(bucket):
+    """يحوّل bucket الخام (مجاميع) لملخص جاهز للعرض: نسبة نجاح + متوسط صافي، بدون قائمة pnl الخام."""
+    total = bucket["total"]
+    pnl_list = bucket.pop("pnl_list")
+    bucket["win_rate_pct"] = round(bucket["win"] / total * 100, 1) if total else None
+    bucket["avg_pnl_pct"] = round(bucket["pnl_sum"] / len(pnl_list), 2) if pnl_list else None
+    bucket.pop("pnl_sum")
+    return bucket
+
+
 def compute_stats(history):
     """
-    يحسب إحصائيات أداء بحتة من سجل الصفقات المغلقة (خيار 3: تتبع فقط، بدون أي
-    تعديل تلقائي على منطق الفحص/الدخول/الأوزان). لا يُستخدم الناتج هنا لتغيير
-    أي قرار في البوت — فقط للعرض والمراقبة اليدوية.
+    يحسب إحصائيات أداء من سجل الصفقات المغلقة (خيار 3: تتبع فقط، بدون أي تعديل تلقائي
+    على منطق الفحص/الدخول/الأوزان). لا يُستخدم الناتج هنا لتغيير أي قرار في البوت —
+    فقط للعرض والمراقبة اليدوية.
+
+    تحديث 2026-09-07: تصنيف الفوز/الخسارة أصبح مبنيًا على الربح/الخسارة الفعلي النهائي
+    (net_pnl_pct بعد خصم عمولة تقديرية) بدل الاعتماد على "هل لمست أي TP" — صفقة لمست
+    TP1 ثم رجعت وأغلقت قريبًا من الصفر لم تعد تُحسب "فوز" مضلِّل. أُضيفت أيضًا: Profit
+    Factor, Expectancy, Average R, Max Drawdown (تقريبي)، نسبة تحقق كل TP على حدة،
+    وتحليل حسب كل عامل تشخيصي (squeeze/accumulation/divergence/extended/obv_confirm/
+    htf_aligned/di_confirm/momentum_agree/vol_confirm/breakout و experimental details).
     """
     if not history:
         return None
 
     total = len(history)
+    pnl_list, durations, r_list = [], [], []
     wins = losses = neutral = 0
-    pnl_list, durations = [], []
-    by_type, by_score, by_reason = {}, {}, {}
+    by_type, by_score, by_reason, by_factor = {}, {}, {}, {}
+    tp_hit = {}   # "tp1".."tp4" -> {"hit": n, "total": n}
+    equity_curve_points = []  # (closed_at, net_pnl_pct) لحساب Max Drawdown التقريبي
+
+    FACTOR_KEYS = [
+        "squeeze", "accumulation", "divergence", "extended", "obv_confirm",
+        "htf_aligned", "di_confirm", "momentum_agree", "vol_confirm", "ranging",
+    ]
 
     for t in history:
         reason = t.get("closed_reason", "UNKNOWN")
         by_reason[reason] = by_reason.get(reason, 0) + 1
 
-        hit = len(t.get("hit_tps") or [])
         entry, exit_price = t.get("entry"), t.get("exit_price")
+        net_pnl_pct = None
         if entry and exit_price:
-            pnl_list.append((exit_price - entry) / entry * 100)
+            raw_pct = (exit_price - entry) / entry * 100
+            net_pnl_pct = raw_pct - TRADING_FEE_PCT
+            pnl_list.append(net_pnl_pct)
+            equity_curve_points.append((t.get("closed_at", ""), net_pnl_pct))
 
-        if reason == "ALL_TP" or hit > 0:
-            wins += 1
+        # تصنيف الفوز/الخسارة الآن على أساس الربح/الخسارة الصافي الفعلي، لا "هل لمست TP"
+        if net_pnl_pct is None:
+            outcome = "neutral"
+        elif net_pnl_pct > BREAKEVEN_BAND_PCT:
             outcome = "win"
-        elif reason == "SL" and hit == 0:
-            losses += 1
+        elif net_pnl_pct < -BREAKEVEN_BAND_PCT:
             outcome = "loss"
         else:
-            neutral += 1
             outcome = "neutral"
+        if outcome == "win":
+            wins += 1
+        elif outcome == "loss":
+            losses += 1
+        else:
+            neutral += 1
+
+        # Average R: الربح/الخسارة الصافي كمضاعف من المخاطرة الأصلية للصفقة (لو معروفة)
+        initial_risk = t.get("initial_risk")
+        sl = t.get("sl")
+        if not initial_risk and entry and sl:
+            initial_risk = entry - sl  # توافقية مع صفقات قديمة بلا حقل initial_risk
+        if initial_risk and entry and net_pnl_pct is not None:
+            risk_pct = initial_risk / entry * 100
+            if risk_pct > 0:
+                r_list.append(net_pnl_pct / risk_pct)
 
         try:
             t0 = dt.datetime.strptime(t["opened_at"], "%Y-%m-%d %H:%M:%S")
@@ -1507,16 +1698,66 @@ def compute_stats(history):
             pass
 
         ttype = t.get("type", "official")
-        b1 = by_type.setdefault(ttype, {"total": 0, "win": 0, "loss": 0, "neutral": 0})
-        b1["total"] += 1
-        b1[outcome] += 1
+        b1 = by_type.setdefault(ttype, _new_bucket())
+        _bump_bucket(b1, outcome, net_pnl_pct)
 
-        score = t.get("score")
-        if score is not None:
-            key = str(int(score)) if isinstance(score, (int, float)) else "?"
-            b2 = by_score.setdefault(key, {"total": 0, "win": 0, "loss": 0, "neutral": 0})
-            b2["total"] += 1
-            b2[outcome] += 1
+        score_key = _score_bucket(t.get("score"))
+        b2 = by_score.setdefault(score_key, _new_bucket())
+        _bump_bucket(b2, outcome, net_pnl_pct)
+
+        # نسبة تحقق كل TP على حدة: المقام = عدد الصفقات التي كان لديها هذا الهدف أصلاً
+        tps_defined = t.get("tps") or []
+        hit_tps = set(t.get("hit_tps") or [])
+        for idx in range(len(tps_defined)):
+            key = f"tp{idx + 1}"
+            entry_bucket = tp_hit.setdefault(key, {"hit": 0, "total": 0})
+            entry_bucket["total"] += 1
+            if idx in hit_tps:
+                entry_bucket["hit"] += 1
+
+        # تحليل حسب كل عامل تشخيصي بولياني (True/False فقط -- None يُستبعد من هذا العامل)
+        for fkey in FACTOR_KEYS:
+            fval = t.get(fkey)
+            if fval is None:
+                continue
+            fbucket = by_factor.setdefault(fkey, {"true": _new_bucket(), "false": _new_bucket()})
+            _bump_bucket(fbucket["true" if fval else "false"], outcome, net_pnl_pct)
+
+        # تفاصيل جودة الانفجار/التجريبية (dict من مفاتيح بولية) -- تُعامل كعوامل إضافية
+        for details_field, prefix in (("breakout_details", "breakout"), ("experimental_details", "experimental")):
+            details = t.get(details_field) or {}
+            for dkey, dval in details.items():
+                fkey = f"{prefix}_{dkey}"
+                fbucket = by_factor.setdefault(fkey, {"true": _new_bucket(), "false": _new_bucket()})
+                _bump_bucket(fbucket["true" if dval else "false"], outcome, net_pnl_pct)
+
+    # Profit Factor + Expectancy (مبنيان على نفس قائمة pnl الصافية)
+    gains = sum(p for p in pnl_list if p > 0)
+    losses_sum = sum(-p for p in pnl_list if p < 0)
+    profit_factor = round(gains / losses_sum, 2) if losses_sum > 0 else (None if gains == 0 else float("inf"))
+    expectancy_pct = round(sum(pnl_list) / len(pnl_list), 2) if pnl_list else None
+    avg_r = round(sum(r_list) / len(r_list), 2) if r_list else None
+
+    # Max Drawdown تقريبي: منحنى تراكمي مبسّط بافتراض حجم مركز متساوٍ لكل صفقة، مرتّب
+    # زمنيًا حسب وقت الإغلاق -- تقريب توضيحي وليس محاكاة رأس مال حقيقية (trade_simulator.py
+    # هو الأداة الأدق لذلك، فهو يحاكي رأس مال فعلي وشرائح متزامنة)
+    equity_curve_points.sort(key=lambda x: x[0])
+    running, peak, max_dd = 0.0, 0.0, 0.0
+    for _, pnl in equity_curve_points:
+        running += pnl
+        peak = max(peak, running)
+        max_dd = max(max_dd, peak - running)
+
+    by_type = {k: _finalize_bucket(v) for k, v in by_type.items()}
+    by_score = {k: _finalize_bucket(v) for k, v in by_score.items()}
+    by_factor = {
+        k: {"true": _finalize_bucket(v["true"]), "false": _finalize_bucket(v["false"])}
+        for k, v in by_factor.items()
+    }
+    tp_hit_rates = {
+        k: {**v, "hit_rate_pct": round(v["hit"] / v["total"] * 100, 1) if v["total"] else None}
+        for k, v in tp_hit.items()
+    }
 
     return {
         "total": total,
@@ -1526,6 +1767,14 @@ def compute_stats(history):
         "win_rate_pct": round(wins / total * 100, 1),
         "avg_pnl_pct": round(sum(pnl_list) / len(pnl_list), 2) if pnl_list else None,
         "avg_duration_hours": round(sum(durations) / len(durations), 1) if durations else None,
+        # --- مقاييس جديدة (2026-09-07) ---
+        "profit_factor": profit_factor,
+        "expectancy_pct": expectancy_pct,
+        "avg_r": avg_r,
+        "max_drawdown_pct_approx": round(max_dd, 2),
+        "tp_hit_rates": tp_hit_rates,
+        "by_factor": by_factor,
+        # --- كما كانت (بنفس أسماء المفاتيح، لكن outcome الآن مبني على net pnl فعلي) ---
         "by_type": by_type,
         "by_score": by_score,
         "by_reason": by_reason,
@@ -1619,6 +1868,8 @@ def open_new_positions(positions, fresh_signals):
             "trend_up": r["trend_up"],   # اتجاه EMA9/21 وقت فتح الصفقة، يُستخدم لاحقًا لكشف انعكاس الإشارة
             "interval": INTERVAL,
             "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "monitor_interval": MONITOR_INTERVAL,
+            "initial_risk": r["entry"] - r["sl"],  # المخاطرة الأصلية (وحدة سعر) -- تُستخدم لاحقًا بحساب Breakeven/R
             "type": "official",
             "concurrent_signals": r.get("concurrent_signals", []),
             # حقول تشخيصية: أي عوامل كانت حاضرة وقت الدخول -> تحليل لاحق لأثر كل عامل على النجاح/الفشل
@@ -1662,6 +1913,8 @@ def open_new_early_positions(positions, fresh_early_signals):
             "trend_up": r["trend_up"],
             "interval": INTERVAL,
             "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "monitor_interval": MONITOR_INTERVAL,
+            "initial_risk": r["early_entry"] - r["early_sl"],
             "type": "early",
             "concurrent_signals": r.get("concurrent_signals", []),
             "confidence": r.get("early_confidence"),
@@ -1703,6 +1956,8 @@ def open_new_breakout_positions(positions, fresh_breakout_signals):
             "trend_up": r["trend_up"],
             "interval": INTERVAL,
             "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "monitor_interval": MONITOR_INTERVAL,
+            "initial_risk": r["breakout_entry"] - r["breakout_sl"],
             "type": "breakout",
             "concurrent_signals": r.get("concurrent_signals", []),
             "breakout_details": r.get("breakout_details"),
@@ -1731,6 +1986,8 @@ def open_new_experimental_positions(positions, fresh_experimental_signals):
             "trend_up": r["trend_up"],
             "interval": INTERVAL,
             "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "monitor_interval": MONITOR_INTERVAL,
+            "initial_risk": r["experimental_entry"] - r["experimental_sl"],
             "type": "experimental",
             "concurrent_signals": r.get("concurrent_signals", []),
             "experimental_details": r.get("experimental_details"),
@@ -1742,6 +1999,12 @@ def open_new_experimental_positions(positions, fresh_experimental_signals):
 
 
 TIME_STOP_HOURS = float(os.environ.get("TIME_STOP_HOURS", "96"))  # سقف زمني أقصى (شبكة أمان) قبل اعتبار الصفقة منتهية الصلاحية — افتراضيًا 4 أيام
+# شموع مراقبة أدق من شمعة الإشارة: نستخدم High/Low للشموع المغلقة لتفادي فقدان TP/SL
+# بين تشغيلتين متباعدتين. عند تعارض TP وSL داخل الشمعة نفسها نعتمد SL أولًا بشكل محافظ
+# لأن OHLC لا يخبرنا بترتيب الحركة داخل الشمعة.
+MONITOR_INTERVAL = os.environ.get("MONITOR_INTERVAL", "5m")
+MONITOR_KLINE_LIMIT = int(os.environ.get("MONITOR_KLINE_LIMIT", "1000"))
+MONITOR_MAX_PAGES = int(os.environ.get("MONITOR_MAX_PAGES", "3"))
 
 
 def _hours_since(opened_at_str):
@@ -1811,85 +2074,221 @@ def format_tp_hit(pos, tp_index, price):
     )
 
 
-def check_open_positions(positions, price_map):
+def _parse_opened_epoch_ms(opened_at_str):
+    try:
+        t = time.strptime(opened_at_str, "%Y-%m-%d %H:%M:%S")
+        return int(time.mktime(t) * 1000)
+    except Exception:
+        return None
+
+
+def fetch_monitor_candles(symbol, start_ms, end_ms=None):
+    """يجلب شموع المراقبة المغلقة منذ فتح الصفقة، مع pagination عند الحاجة.
+
+    الهدف هو عدم الاعتماد على السعر الحالي فقط: إذا وصل السعر إلى TP/SL ثم عاد
+    قبل تشغيل السكربت التالي، نستطيع اكتشاف الحدث من High/Low للشموع السابقة.
     """
-    يقارن الصفقات المفتوحة بالسعر الحالي، يرسل إشعار تيليجرام عند تحقق هدف أو ضرب وقف خسارة،
-    وينقل SL لنقطة الدخول (Breakeven) بمجرد لمس أول هدف. الإغلاق بسبب انعكاس الاتجاه (EMA)
-    أو انتهاء السقف الزمني يبقى فعّالاً لإدارة المخاطر، لكن بدون إرسال إشعار تيليجرام له.
-    يرجع (الصفقات المتبقية مفتوحة، الصفقات التي أُغلقت الآن).
+    if start_ms is None:
+        return []
+    if end_ms is None:
+        end_ms = int(time.time() * 1000)
+
+    all_klines = []
+    cursor_end = end_ms
+    for _ in range(max(1, MONITOR_MAX_PAGES)):
+        r = _request_with_retry(
+            f"{BASE_URL}/klines",
+            params={
+                "symbol": symbol,
+                "interval": MONITOR_INTERVAL,
+                "limit": MONITOR_KLINE_LIMIT,
+                "endTime": cursor_end,
+            },
+        )
+        batch = r.json() or []
+        if not batch:
+            break
+        # Binance تعيد الأقدم -> الأحدث داخل الدفعة.
+        all_klines = batch + all_klines
+        oldest_open = int(batch[0][0])
+        if oldest_open <= start_ms or len(batch) < MONITOR_KLINE_LIMIT:
+            break
+        cursor_end = oldest_open - 1
+
+    # فقط الشموع التي بدأت بعد لحظة فتح الصفقة، والشموع المغلقة فعليًا.
+    now_ms = int(time.time() * 1000)
+    out = []
+    seen = set()
+    for k in sorted(all_klines, key=lambda x: int(x[0])):
+        open_ms, close_ms = int(k[0]), int(k[6])
+        if open_ms < start_ms or close_ms > now_ms:
+            continue
+        if open_ms in seen:
+            continue
+        seen.add(open_ms)
+        out.append(k)
+    return out
+
+
+def _monitor_candle_map(positions):
+    """يجلب شموع المراقبة مرة واحدة لكل رمز، لا مرة لكل صفقة."""
+    grouped = {}
+    for pos in positions:
+        opened_ms = _parse_opened_epoch_ms(pos.get("opened_at"))
+        if opened_ms is None:
+            continue
+        cursor_ms = pos.get("monitor_cursor_ms")
+        try:
+            start_ms = max(opened_ms, int(cursor_ms) + 1) if cursor_ms is not None else opened_ms
+        except (TypeError, ValueError):
+            start_ms = opened_ms
+        sym = pos.get("symbol")
+        if not sym:
+            continue
+        if sym not in grouped or start_ms < grouped[sym]:
+            grouped[sym] = start_ms
+
+    result = {}
+    for sym, start_ms in grouped.items():
+        try:
+            result[sym] = fetch_monitor_candles(sym, start_ms)
+        except Exception as e:
+            print(f"⚠️ تعذر جلب شموع المراقبة لـ {sym}: {e}")
+            result[sym] = []
+    return result
+
+
+def check_open_positions(positions, price_map, monitor_map=None):
+    """يتابع TP/SL باستخدام High/Low للشموع المغلقة بدل السعر الحالي فقط.
+
+    القاعدة المحافظة للشمعة الواحدة:
+    - إذا لامس High الهدف ولامس Low وقف الخسارة في الشمعة نفسها قبل حسم الترتيب،
+      نعتبر SL هو الحدث الأول؛ هذا يمنع منح نتائج متفائلة من بيانات OHLC التي لا
+      تحتوي على ترتيب الحركة داخل الشمعة.
+    - بعد تحقق TP1 ينتقل SL إلى Breakeven + buffer، ويُطبّق هذا الوقف من الشمعة التالية
+      لأن ترتيب الحركة داخل شمعة TP1 غير معروف.
     """
     still_open, closed_now = [], []
+    monitor_map = monitor_map or {}
 
     for pos in positions:
-        price = price_map.get(pos["symbol"])
+        symbol = pos["symbol"]
+        price = price_map.get(symbol)
+        candles = monitor_map.get(symbol) or []
+
+        # آخر إغلاق متاح من شموع المراقبة أفضل كـ fallback إذا فشل ticker24h.
+        if price is None and candles:
+            try:
+                price = float(candles[-1][4])
+            except Exception:
+                price = None
         if price is None:
             still_open.append(pos)
             continue
 
-        # صفقة "صامتة" = لم يُرسل لها إشعار دخول أصلاً (إشارة مبكرة بشرط واحد فقط) —
-        # تُتابَع وتُحفظ في السجل بشكل طبيعي، لكن بدون أي إشعار تيليجرام طوال دورة حياتها
         silent = pos.get("alert_message_id") is None and pos.get("type") == "early"
+        hit_set = set(pos.get("hit_tps") or [])
+        pos.setdefault("hit_tps", [])
+        pos.setdefault("tp_notify_ids", [None] * len(pos.get("tps") or []))
 
-        if price <= pos["sl"]:
-            result_text = format_sl_hit(pos, price)
-            if not silent:
-                send_telegram(result_text)
-            edit_telegram_strike(pos.get("alert_message_id"), build_progress_text(pos), result_text)
-            pos["closed_reason"] = "SL"
-            pos["closed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            pos["exit_price"] = price
-            closed_now.append(pos)
-            time.sleep(1)
-            continue
+        # نراقب الشموع منذ آخر حالة محفوظة قدر الإمكان. الصفقات القديمة جدًا قد
+        # تتجاوز عدد صفحات Binance المتاح؛ عندها نستخدم السعر الحالي فقط كشبكة أمان.
+        events = []
+        opened_ms = _parse_opened_epoch_ms(pos.get("opened_at")) or 0
+        try:
+            cursor_ms = int(pos.get("monitor_cursor_ms", opened_ms))
+        except (TypeError, ValueError):
+            cursor_ms = opened_ms
+        for k in candles:
+            try:
+                candle_open_ms = int(k[0])
+                if candle_open_ms <= cursor_ms:
+                    continue
+                events.append((candle_open_ms, float(k[2]), float(k[3]), float(k[4])))
+            except Exception:
+                continue
 
-        newly_hit = [i for i, tp in enumerate(pos["tps"]) if i not in pos["hit_tps"] and price >= tp]
-        if newly_hit:
-            if "tp_notify_ids" not in pos or len(pos["tp_notify_ids"]) != len(pos["tps"]):
-                pos["tp_notify_ids"] = [None] * len(pos["tps"])  # توافق مع صفقات فُتحت قبل هذا التحديث
-
-            for i in newly_hit:
-                tp_text = format_tp_hit(pos, i, price)
-                msg_id = None if silent else send_telegram(tp_text)
-                pos["tp_notify_ids"][i] = msg_id
+        closed = False
+        for candle_open_ms, high, low, candle_close in events:
+            # 1) الوقف الحالي أولًا. إذا اجتمع SL وTP في نفس الشمعة نأخذ SL أولًا.
+            if low <= pos["sl"]:
+                exit_price = pos["sl"]
+                result_text = format_sl_hit(pos, exit_price)
                 if not silent:
-                    time.sleep(1)
+                    send_telegram(result_text)
+                edit_telegram_strike(pos.get("alert_message_id"), build_progress_text(pos), result_text)
+                pos["closed_reason"] = "SL"
+                pos["closed_at"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(candle_open_ms / 1000))
+                pos["exit_price"] = exit_price
+                pos["monitor_exit_interval"] = MONITOR_INTERVAL
+                pos["monitor_exit_candle_open_ms"] = candle_open_ms
+                closed_now.append(pos)
+                closed = True
+                break
 
-                # احذف إشعار الهدف السابق المستقل (إن وُجد) كي لا تتراكم إشعارات منفصلة لكل هدف
-                prev_index = i - 1
-                if prev_index >= 0 and pos["tp_notify_ids"][prev_index]:
-                    delete_telegram_message(pos["tp_notify_ids"][prev_index])
-                    pos["tp_notify_ids"][prev_index] = None
+            # 2) الأهداف التي لامسها High. إذا تحقق أكثر من هدف في نفس الشمعة
+            # نسجلها كلها، لأننا نعلم أن High وصل إليها بالترتيب العددي.
+            newly_hit = [i for i, tp in enumerate(pos["tps"]) if i not in hit_set and high >= tp]
+            if newly_hit:
+                for i in newly_hit:
+                    tp_price = pos["tps"][i]
+                    tp_text = format_tp_hit(pos, i, tp_price)
+                    msg_id = None if silent else send_telegram(tp_text)
+                    if i >= len(pos["tp_notify_ids"]):
+                        pos["tp_notify_ids"].extend([None] * (i + 1 - len(pos["tp_notify_ids"])))
+                    pos["tp_notify_ids"][i] = msg_id
+                    if not silent:
+                        time.sleep(1)
 
-                pos["hit_tps"].append(i)
+                    prev_index = i - 1
+                    if prev_index >= 0 and pos["tp_notify_ids"][prev_index]:
+                        delete_telegram_message(pos["tp_notify_ids"][prev_index])
+                        pos["tp_notify_ids"][prev_index] = None
 
-                # عدّل رسالة الإشارة الأصلية تراكميًا: كل الأهداف المتحققة حتى الآن، كل واحد بسطره الخاص
-                hit_sorted = sorted(pos["hit_tps"])
-                lines = [format_tp_line(pos, j) for j in hit_sorted]
-                edit_telegram_append(pos.get("alert_message_id"), pos.get("alert_text", ""), lines)
+                    pos["hit_tps"].append(i)
+                    hit_set.add(i)
+                    hit_sorted = sorted(pos["hit_tps"])
+                    lines = [format_tp_line(pos, j) for j in hit_sorted]
+                    edit_telegram_append(pos.get("alert_message_id"), pos.get("alert_text", ""), lines)
 
-            if pos["sl"] < pos["entry"]:
-                pos["sl"] = pos["entry"]  # نقل SL لنقطة التعادل بعد أول هدف محقق
+                if 0 in hit_set and pos["sl"] < pos["entry"]:
+                    buffer = pos.get("initial_risk", 0) * BREAKEVEN_BUFFER_RATIO
+                    pos["sl"] = pos["entry"] + max(buffer, 0)
+                    pos["breakeven_activated"] = True
+                    pos["breakeven_activated_at"] = time.strftime(
+                        "%Y-%m-%d %H:%M:%S", time.localtime(candle_open_ms / 1000)
+                    )
 
-        if len(pos["hit_tps"]) >= len(pos["tps"]):
-            # كل الأهداف تحققت -> إغلاق نهائي: نشطب رسالة الإشارة الأصلية (بما فيها كل أسطر
-            # الأهداف المتراكمة) تمامًا كما يحصل عند SL/EXPIRED، بدل تركها بدون شطب نهائي
-            all_tp_text = "🏁 تحققت جميع الأهداف"
-            edit_telegram_strike(pos.get("alert_message_id"), build_progress_text(pos), all_tp_text)
-            pos["closed_reason"] = "ALL_TP"
-            pos["closed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            pos["exit_price"] = price
-            closed_now.append(pos)
+            if len(hit_set) >= len(pos["tps"]):
+                all_tp_text = "🏁 تحققت جميع الأهداف"
+                final_tp = pos["tps"][-1] if pos.get("tps") else candle_close
+                edit_telegram_strike(pos.get("alert_message_id"), build_progress_text(pos), all_tp_text)
+                pos["closed_reason"] = "ALL_TP"
+                pos["closed_at"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(candle_open_ms / 1000))
+                pos["exit_price"] = final_tp
+                pos["monitor_exit_interval"] = MONITOR_INTERVAL
+                pos["monitor_exit_candle_open_ms"] = candle_open_ms
+                closed_now.append(pos)
+                closed = True
+                break
+
+            # لا نختبر SL الجديد في نفس شمعة TP1؛ ترتيب الحركة داخل الشمعة غير معروف.
+
+        if closed:
             continue
 
-        # لم يتحقق TP ولا SL بعد -> الصفقة تبقى مفتوحة لغاية تحقق أحد الأهداف أو ضرب
-        # وقف الخسارة (لا يوجد إغلاق مبكر بسبب انعكاس الاتجاه بعد الآن)، إلا لو تجاوزت
-        # السقف الزمني الأقصى (شبكة أمان فقط).
+        # نحفظ آخر شمعة تمت معالجتها حتى لا نعيد تفسير شموع تاريخية بعد تحريك SL
+        # إلى Breakeven في تشغيل لاحق، وهو أمر مهم جدًا عند استخدام High/Low.
+        if events:
+            pos["monitor_cursor_ms"] = events[-1][0]
+        pos["monitor_last_checked_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
         hours_open = _hours_since(pos["opened_at"])
         if hours_open >= TIME_STOP_HOURS:
             pct_change = (price - pos["entry"]) / pos["entry"] * 100
             status = "بربح" if pct_change > 0 else ("بخسارة" if pct_change < 0 else "بدون تغيير")
             expired_text = (
-                f"⏱️ انتهت صلاحية المراقبة (سقف زمني) — متوقفة {status}\n{pos['symbol'].replace('USDT','/USDT')}\n"
+                f"⏱️ انتهت صلاحية المراقبة (سقف زمني) — متوقفة {status}\n{symbol.replace('USDT','/USDT')}\n"
                 f"الدخول: {pos['entry']:.6g} | الحالي: {price:.6g} | مدة المراقبة: {hours_open:.0f}س\n"
                 f"النسبة: {pct_change:+.2f}%"
             )
@@ -1899,6 +2298,7 @@ def check_open_positions(positions, price_map):
             pos["closed_reason"] = "EXPIRED"
             pos["closed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
             pos["exit_price"] = price
+            pos["monitor_exit_interval"] = MONITOR_INTERVAL
             closed_now.append(pos)
             time.sleep(1)
             continue
@@ -1907,7 +2307,6 @@ def check_open_positions(positions, price_map):
 
     if closed_now:
         print(f"صفقات أُغلقت هذا المسح: {len(closed_now)}")
-
     return still_open, closed_now
 
 
@@ -1944,7 +2343,8 @@ def main():
     # ── تشخيص: هل price_map يغطي كل الرموز المفتوحة؟ ──
     print(f"📊 price_map يحتوي على {len(price_map)} رمز")
 
-    # قبل أي مسح جديد: تفقّد الصفقات المفتوحة سابقًا مقابل السعر الحالي (TP / SL)
+    # قبل أي مسح جديد: تفقّد الصفقات المفتوحة سابقًا باستخدام شموع مراقبة 5m
+    # (High/Low) حتى لا نفقد TP/SL الذي حدث بين تشغيلتين متباعدتين.
     try:
         open_positions = load_positions(gist_files)
     except PositionsCorruptedError as e:
@@ -1961,16 +2361,21 @@ def main():
     if open_positions:
         missing = [p["symbol"] for p in open_positions if p["symbol"] not in price_map]
         if missing:
-            print(f"⚠️ رموز مفقودة من price_map (لن يُتابع TP/SL لها): {missing}")
+            print(f"⚠️ رموز مفقودة من price_map — سيُستخدم آخر إغلاق من شموع المراقبة إن توفر: {missing}")
             # نسبة كبيرة من الصفقات المفتوحة بدون سعر حالي تلمّح لعطل حقيقي بجلب الأسعار
             # (وليس مجرد رمز تم شطبه من المنصة) — تستحق تنبيهًا فوريًا بدل الاكتفاء باللوق
             if len(missing) / len(open_positions) >= 0.2:
                 send_admin_alert(
                     f"{len(missing)} من أصل {len(open_positions)} صفقة مفتوحة بدون سعر "
-                    f"حالي (price_map) — لن تُتابَع أهدافها/وقف خسارتها هذه التشغيلة.\n"
+                    f"حالي (price_map) مفقود — سيُستخدم مسار شموع المراقبة إن توفر، وإلا تتأجل المتابعة.\n"
                     f"أمثلة: {', '.join(missing[:10])}"
                 )
-    open_positions, closed_now = check_open_positions(open_positions, price_map)
+    monitor_map = {}
+    if open_positions:
+        monitor_map = _monitor_candle_map(open_positions)
+        covered = sum(1 for p in open_positions if monitor_map.get(p.get("symbol")))
+        print(f"📈 شموع المراقبة ({MONITOR_INTERVAL}) متوفرة لـ {covered}/{len(open_positions)} صفقة")
+    open_positions, closed_now = check_open_positions(open_positions, price_map, monitor_map)
     print(f"🔒 صفقات متبقية مفتوحة: {len(open_positions)} | أُغلقت الآن: {len(closed_now)}")
 
     results = run_scan(tickers)
@@ -1980,6 +2385,7 @@ def main():
         if r["score"] >= 1.5 and r["vol_confirm"] and r["atr_pct"] >= 0.08 and r["persistent"]
         and not r["ranging"] and not r["near_resistance"]
         and meets_min_profit(r["entry"], r["tps"])
+        and meets_min_rr(r["entry"], r["sl"], r["tps"])
     ]
     strong_symbols = {r["symbol"] for r in strong}
 
@@ -1993,6 +2399,7 @@ def main():
         if r["score"] < 1.5 and (r["squeeze"] or r["accumulation"])
         and r.get("early_confidence") is not None
         and meets_min_profit(r["early_entry"], r["early_tps"])
+        and meets_min_rr(r["early_entry"], r["early_sl"], r["early_tps"])
     ]
     early_keys = {f"{r['symbol']}:early" for r in early_eligible}
 
@@ -2003,6 +2410,7 @@ def main():
         if r.get("breakout_entry") is not None
         and r["symbol"] not in strong_symbols
         and meets_min_profit(r["breakout_entry"], r["breakout_tps"])
+        and meets_min_rr(r["breakout_entry"], r["breakout_sl"], r["breakout_tps"])
     ]
     breakout_keys = {f"{r['symbol']}:breakout" for r in breakout_eligible}
 
@@ -2013,6 +2421,7 @@ def main():
         if r.get("experimental_entry") is not None
         and r["symbol"] not in strong_symbols
         and meets_min_profit(r["experimental_entry"], r["experimental_tps"])
+        and meets_min_rr(r["experimental_entry"], r["experimental_sl"], r["experimental_tps"])
     ]
     experimental_keys = {f"{r['symbol']}:experimental" for r in experimental_eligible}
 
