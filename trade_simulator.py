@@ -26,23 +26,19 @@ GIST_RAW_URL = os.environ.get("GIST_RAW_URL")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# نفس نسبة الرسوم المستخدمة سابقًا بـbacktest.py (0.1% لكل جهة = دخول وخروج)
 FEE_PCT_PER_SIDE = float(os.environ.get("TRADE_FEE_PCT", "0.1"))
 MAX_CONCURRENT = int(os.environ.get("TRADE_MAX_CONCURRENT", "5"))
 
 TYPE_LABELS = {"official": "رسمية", "early": "مبكرة", "breakout": "انفجار", "experimental": "تجريبية"}
 
-# ترتيب الهدف المطلوب الخروج عنده (tp1 = index 0، tp2 = index 1، tp3 = index 2)
 TP_TARGET_INDEX = {"tp1": 0, "tp2": 1, "tp3": 2}
 
-# نفس التسمية المستخدمة بـscanner.py (archive_overflow) لملفات الأرشيف المرقّمة
 ACTIVE_FILENAME = "closed_trades.json"
 ARCHIVE_PREFIX = "closed_trades_archive_"
-MAX_ARCHIVE_LOOKUP = 500  # سقف أمان لعدد ملفات الأرشيف المفحوصة (يفوق أي حجم واقعي متوقع)
+MAX_ARCHIVE_LOOKUP = 500
 
 
 def _archive_url_for(index):
-    """يبني رابط ملف أرشيف رقم index بنفس نمط GIST_RAW_URL (استبدال اسم الملف النشط فقط)."""
     filename = f"{ARCHIVE_PREFIX}{index:04d}.json"
     if ACTIVE_FILENAME in GIST_RAW_URL:
         return GIST_RAW_URL.replace(ACTIVE_FILENAME, filename)
@@ -58,11 +54,6 @@ def _fetch_json_url(url):
 
 
 def fetch_all_trades():
-    """
-    يجمع كل الصفقات المغلقة: السجل النشط أولاً، ثم كل ملفات الأرشيف بالترتيب
-    (0001 فصاعدًا) لحد ما يوصل لأول رقم غير موجود (404) فيتوقف — بهذا الشكل
-    فترة --days الطويلة تغطي كل الصفقات المتوفرة فعليًا، مش بس السجل النشط.
-    """
     if not GIST_RAW_URL:
         raise SystemExit("❌ GIST_RAW_URL غير موجود بالأسرار (secrets).")
 
@@ -70,12 +61,8 @@ def fetch_all_trades():
     archives_found = 0
     archive_fetch_error = False
 
-    # 1) السجل النشط
     all_trades.extend(_fetch_json_url(GIST_RAW_URL))
 
-    # 2) ملفات الأرشيف بالترتيب، من الأقدم (0001) صعودًا لحد أول ملف غير موجود.
-    # أي خطأ غير 404 (تعذّر شبكة، JSON تالف، إلخ) يعني احتمال وجود أرشيف لم نتمكن من
-    # قراءته فعليًا — نوقف الجلب ونعلّم الخطأ بدل الاستمرار كأن شيئًا لم يحصل.
     idx = 1
     while idx <= MAX_ARCHIVE_LOOKUP:
         url = _archive_url_for(idx)
@@ -85,7 +72,7 @@ def fetch_all_trades():
             archives_found += 1
         except urllib.error.HTTPError as e:
             if e.code == 404:
-                break  # ما فيه أرشيف بهذا الرقم — وصلنا لنهاية الأرشيف فعليًا
+                break
             print(f"⚠️ خطأ HTTP غير متوقع عند جلب ملف الأرشيف رقم {idx:04d} ({e.code}) — التوقف هنا.")
             archive_fetch_error = True
             break
@@ -103,7 +90,6 @@ def parse_dt(s):
 
 
 def trade_return_pct(t):
-    """العائد الصافي% لصفقة واحدة (شراء فوري فقط)، بعد خصم رسوم الدخول والخروج."""
     entry, exit_price = t.get("entry"), t.get("exit_price")
     if not entry or not exit_price:
         return None
@@ -113,15 +99,6 @@ def trade_return_pct(t):
 
 
 def trade_return_pct_target(t, tp_index=0):
-    """
-    نفس trade_return_pct، لكن مع خيار الخروج عند هدف محدد (tp_index: 0=TP1, 1=TP2, 2=TP3)
-    بدل انتظار الإغلاق الفعلي النهائي المسجّل بالبوت — لأي نوع صفقة (رسمية/مبكرة/انفجار/تجريبية)
-    عنده حقلا tps/hit_tps. لو الهدف المطلوب تحقق فعلاً في أي وقت (index موجود بـhit_tps)،
-    نحتسب الخروج عند سعر ذلك الهدف مباشرة (تجاهل ما حصل بعده — رجوع لـSL أو استمرار لبقية
-    الأهداف). لو الصفقة ما وصلت أصلاً لهذا الهدف (تم إغلاقها بـSL/EXPIRED قبل الوصول له، أو
-    كانت أصلاً بعدد أهداف أقل من tp_index)، نرجع للعائد الفعلي المسجّل (trade_return_pct) —
-    بهذا الشكل لا نفترض تفاؤليًا وصول هدف لم يتحقق فعلاً.
-    """
     entry = t.get("entry")
     tps = t.get("tps") or []
     hit_tps = t.get("hit_tps") or []
@@ -131,47 +108,73 @@ def trade_return_pct_target(t, tp_index=0):
     return trade_return_pct(t)
 
 
-def simulate(trades, days, capital, max_concurrent, trade_type="all", archive_fetch_error=False, tp_target="tp1"):
+def simulate(trades, days, capital, max_concurrent, trade_type="all", archive_fetch_error=False, tp_target="tp1",
+             debug=False):
     tp_index = TP_TARGET_INDEX.get(tp_target, 0)
     cutoff = dt.datetime.now() - dt.timedelta(days=days)
     slot_amount = capital / max_concurrent
 
-    # نأخذ الصفقات اللي فُتحت خلال الفترة المطلوبة (هذا وقت "اتخاذ القرار" الفعلي)
-    # مع فلترة النوع إذا حُدد (رسمية فقط / مبكرة فقط) — الإشارات من نوع آخر تُتجاهل بالكامل
-    # وما تنافس على الشرائح أصلًا (كأنك ما شفتها من الأساس)
+    # عدادات تشخيص: كم صفقة استُبعدت بكل مرحلة، عشان نعرف بالضبط وين تضيع صفقات النوع المطلوب
+    total_seen = 0
+    excluded_no_dates = 0
+    excluded_wrong_type = 0
+    excluded_bad_date_format = 0
+    excluded_before_cutoff = 0
+    type_seen_total = 0  # صفقات من نفس trade_type بغض النظر عن أي فلتر ثاني
+
     window = []
     for t in trades:
+        total_seen += 1
+        is_target_type = (trade_type == "all" or t.get("type", "official") == trade_type)
+        if is_target_type:
+            type_seen_total += 1
+
         if not t.get("opened_at") or not t.get("closed_at"):
+            if is_target_type:
+                excluded_no_dates += 1
             continue
         if trade_type != "all" and t.get("type", "official") != trade_type:
+            excluded_wrong_type += 1
             continue
         try:
             opened_at = parse_dt(t["opened_at"])
             closed_at = parse_dt(t["closed_at"])
         except Exception:
+            if is_target_type:
+                excluded_bad_date_format += 1
             continue
         if opened_at >= cutoff:
             window.append({**t, "_opened_at": opened_at, "_closed_at": closed_at})
+        else:
+            if is_target_type:
+                excluded_before_cutoff += 1
+
+    if debug:
+        print(f"[تشخيص] إجمالي الصفقات بالسجل: {total_seen}")
+        print(f"[تشخيص] صفقات من النوع المطلوب ({trade_type}) قبل أي استبعاد: {type_seen_total}")
+        print(f"[تشخيص] من نفس النوع، استُبعدت لعدم اكتمال opened_at/closed_at: {excluded_no_dates}")
+        print(f"[تشخيص] من نفس النوع، استُبعدت بسبب صيغة تاريخ غير صالحة: {excluded_bad_date_format}")
+        print(f"[تشخيص] من نفس النوع، استُبعدت لأنها أقدم من الفترة المطلوبة (cutoff): {excluded_before_cutoff}")
+        print(f"[تشخيص] صفقات دخلت نافذة الفترة (window) قبل فلترة التزامن: {len(window)}")
 
     window.sort(key=lambda t: t["_opened_at"])
 
-    # التحذير الآن يُبنى فقط على خطأ فعلي حصل أثناء جلب الأرشيف (مش على مقارنة تاريخ
-    # أقدم صفقة بالـcutoff)، لأن بعد دمج كل الأرشيف المتوفر، وصول oldest لتاريخ أحدث
-    # من الفترة المطلوبة يعني غالبًا إن البوت ببساطة ما عنده صفقات أقدم من هيك — طبيعي،
-    # مش نقص بالبيانات.
     incomplete_warning = archive_fetch_error
 
-    open_slots = []  # قائمة أوقات إغلاق الصفقات المشغولة حاليًا
+    open_slots = []
     taken, skipped = [], 0
 
     for t in window:
-        # حرّر أي شريحة انتهت صفقتها قبل لحظة فتح هذه الصفقة
         open_slots = [c for c in open_slots if c > t["_opened_at"]]
         if len(open_slots) < max_concurrent:
             open_slots.append(t["_closed_at"])
             taken.append(t)
         else:
             skipped += 1
+
+    if debug:
+        print(f"[تشخيص] صفقات فعليًا أُخذت (بعد حدود التزامن/رأس المال): {len(taken)}")
+        print(f"[تشخيص] صفقات تُجوهلت لعدم توفر شريحة فارغة: {skipped}")
 
     by_type = {}
     total_profit = 0.0
@@ -228,6 +231,9 @@ def format_message(days, res, archives_found=0):
     if archives_found:
         lines.append(f"📦 تم دمج {archives_found} ملف أرشيف مع السجل النشط لتغطية الفترة كاملة")
 
+    if res["incomplete_warning"]:
+        lines.append("⚠️ تنبيه: صار خطأ فعلي أثناء جلب أحد ملفات الأرشيف (راجع سجل التشغيل/logs) — قد لا تكون البيانات كاملة.")
+
     if res["n"] == 0:
         lines.append("لا توجد صفقات دخلت خلال هذه الفترة (بحدود رأس المال والتزامن المحدد).")
         return "\n".join(lines)
@@ -244,9 +250,6 @@ def format_message(days, res, archives_found=0):
         for ttype, b in res["by_type"].items():
             label = TYPE_LABELS.get(ttype, ttype)
             lines.append(f"{label}: {b['count']} صفقة | {b['profit']:+.2f}$ | نجاح {round(b['wins']/(b['wins']+b['losses'])*100,1) if (b['wins']+b['losses']) else 0}%")
-
-    if res["incomplete_warning"]:
-        lines.append("⚠️ تنبيه: صار خطأ فعلي أثناء جلب أحد ملفات الأرشيف (راجع سجل التشغيل/logs) — قد لا تكون البيانات كاملة.")
 
     note = (
         "(محاكاة واقعية: رأس المال مقسوم على شرائح متزامنة، والإشارات الزائدة عند امتلاء الشرائح تُتجاهل، "
@@ -281,10 +284,12 @@ def main():
                          choices=["all", "official", "early", "breakout", "experimental"])
     parser.add_argument("--tp", type=str, default="tp1", choices=["tp1", "tp2", "tp3"],
                          help="الهدف الذي يُحتسب الخروج عنده إذا تحقق فعليًا (افتراضي: tp1)")
+    parser.add_argument("--debug", action="store_true", help="طباعة تفاصيل تشخيصية عن سبب استبعاد الصفقات")
     args = parser.parse_args()
 
     trades, archives_found, archive_fetch_error = fetch_all_trades()
-    res = simulate(trades, args.days, args.amount, MAX_CONCURRENT, args.type, archive_fetch_error, args.tp)
+    res = simulate(trades, args.days, args.amount, MAX_CONCURRENT, args.type, archive_fetch_error, args.tp,
+                   debug=args.debug)
     message = format_message(args.days, res, archives_found)
 
     print(message)
