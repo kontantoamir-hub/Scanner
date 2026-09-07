@@ -677,16 +677,20 @@ def meets_min_profit(entry, tps, min_pct=MIN_PROFIT_PCT, fee_pct=TRADING_FEE_PCT
 
 def meets_min_rr(entry, sl, tps, min_rr=MIN_RR_RATIO):
     """
-    يتحقق أن نسبة العائد إلى المخاطرة (Reward:Risk) عند أول هدف (TP1) مقارنة بمسافة
-    وقف الخسارة >= الحد الأدنى المطلوب. MIN_PROFIT_PCT وحده لا يكفي: صفقة بمخاطرة 2%
-    وهدف 1.2% تجتاز MIN_PROFIT_PCT بسهولة رغم أنها صفقة سيئة إحصائيًا (R:R < 1).
+    يتحقق أن نسبة العائد إلى المخاطرة (Reward:Risk) عند آخر هدف فعليًا مُخصَّص لهذي
+    الصفقة (وليس TP1) مقارنة بمسافة وقف الخسارة >= الحد الأدنى المطلوب.
+
+    ملاحظة مهمة: TP1 بكل أنواع الإشارات دائمًا = 1R بالضبط بالتصميم (الثقة تُترجم
+    لعدد أهداف أكبر لا لمضاعف TP1 أكبر)، فلو قِسنا R:R عند TP1 لكانت النتيجة 1.0
+    ثابتة دائمًا مهما كانت الصفقة -- وهذا يرفض كل الإشارات بلا استثناء بشكل غير مقصود.
+    لذلك نقيسه عند آخر هدف (tps[-1])، وهو أيضًا يعكس تلقائيًا أي تقليم بسبب مقاومة قريبة.
     """
     if not entry or not sl or not tps:
         return False
     risk = entry - sl
     if risk <= 0:
         return False
-    reward = tps[0] - entry
+    reward = tps[-1] - entry
     if reward <= 0:
         return False
     return (reward / risk) >= min_rr
@@ -2370,170 +2374,4 @@ def main():
                     f"حالي (price_map) مفقود — سيُستخدم مسار شموع المراقبة إن توفر، وإلا تتأجل المتابعة.\n"
                     f"أمثلة: {', '.join(missing[:10])}"
                 )
-    monitor_map = {}
-    if open_positions:
-        monitor_map = _monitor_candle_map(open_positions)
-        covered = sum(1 for p in open_positions if monitor_map.get(p.get("symbol")))
-        print(f"📈 شموع المراقبة ({MONITOR_INTERVAL}) متوفرة لـ {covered}/{len(open_positions)} صفقة")
-    open_positions, closed_now = check_open_positions(open_positions, price_map, monitor_map)
-    print(f"🔒 صفقات متبقية مفتوحة: {len(open_positions)} | أُغلقت الآن: {len(closed_now)}")
-
-    results = run_scan(tickers)
-
-    strong = [
-        r for r in results
-        if r["score"] >= 1.5 and r["vol_confirm"] and r["atr_pct"] >= 0.08 and r["persistent"]
-        and not r["ranging"] and not r["near_resistance"]
-        and meets_min_profit(r["entry"], r["tps"])
-        and meets_min_rr(r["entry"], r["sl"], r["tps"])
-    ]
-    strong_symbols = {r["symbol"] for r in strong}
-
-    # إشارات مبكرة (انضغاط تقلب / تراكم صامت) لعملات لم تصل بعد لإشارة شراء كاملة —
-    # تُميَّز بمفتاح منفصل (":early") في ذاكرة التنبيهات كي لا تتعارض مع إشارات الشراء الرسمية.
-    # تُصفّى هنا أيضًا بنفس شرط الحد الأدنى لنسبة الربح (MIN_PROFIT_PCT) قبل اعتبارها مؤهلة
-    # أصلاً — وليس فقط عند الإرسال — كي لا تُسجَّل كـ"مُنبَّه عليها" في الذاكرة وتُحرَم من
-    # الإرسال لاحقًا إن تحسّن ربحها المتوقع
-    early_eligible = [
-        r for r in results
-        if r["score"] < 1.5 and (r["squeeze"] or r["accumulation"])
-        and r.get("early_confidence") is not None
-        and meets_min_profit(r["early_entry"], r["early_tps"])
-        and meets_min_rr(r["early_entry"], r["early_sl"], r["early_tps"])
-    ]
-    early_keys = {f"{r['symbol']}:early" for r in early_eligible}
-
-    # إشارات انفجار (breakout) — اختراق قمة سابقة مع تأكيد حجم، مستقلة عن الإشارة الرسمية،
-    # تُستبعد العملات اللي أصلاً عندها إشارة رسمية جديدة تجنبًا للتكرار
-    breakout_eligible = [
-        r for r in results
-        if r.get("breakout_entry") is not None
-        and r["symbol"] not in strong_symbols
-        and meets_min_profit(r["breakout_entry"], r["breakout_tps"])
-        and meets_min_rr(r["breakout_entry"], r["breakout_sl"], r["breakout_tps"])
-    ]
-    breakout_keys = {f"{r['symbol']}:breakout" for r in breakout_eligible}
-
-    # إشارات تجريبية (Ichimoku Tenkan/Kijun + حجم/OBV + MFI) — مستقلة، تُستبعد العملات
-    # اللي أصلاً عندها إشارة رسمية جديدة تجنبًا للتكرار
-    experimental_eligible = [
-        r for r in results
-        if r.get("experimental_entry") is not None
-        and r["symbol"] not in strong_symbols
-        and meets_min_profit(r["experimental_entry"], r["experimental_tps"])
-        and meets_min_rr(r["experimental_entry"], r["experimental_sl"], r["experimental_tps"])
-    ]
-    experimental_keys = {f"{r['symbol']}:experimental" for r in experimental_eligible}
-
-    # مجموعات الرموز حسب النوع (بصرف النظر عن سبق التنبيه) — تُستخدم فقط لتوثيق أي
-    # أنواع أخرى ظهرت لنفس العملة بنفس دورة الفحص (concurrent_signals)، بلا أي استبعاد
-    # فعلي بينها؛ الأنواع الأربعة تبقى مستقلة تمامًا كما هي، هذا توثيق تشخيصي بحت
-    # لتحليل لاحق (trade_stats.py) يجاوب: "أي نوع يفوز فعليًا لما يتزامن مع غيره؟"
-    early_symbols = {r["symbol"] for r in early_eligible}
-    breakout_symbols = {r["symbol"] for r in breakout_eligible}
-    experimental_symbols = {r["symbol"] for r in experimental_eligible}
-
-    def _concurrent_signals_for(symbol, exclude_type):
-        others = []
-        if symbol in strong_symbols and exclude_type != "official":
-            others.append("official")
-        if symbol in early_symbols and exclude_type != "early":
-            others.append("early")
-        if symbol in breakout_symbols and exclude_type != "breakout":
-            others.append("breakout")
-        if symbol in experimental_symbols and exclude_type != "experimental":
-            others.append("experimental")
-        return others
-
-    for r in strong:
-        r["concurrent_signals"] = _concurrent_signals_for(r["symbol"], "official")
-    for r in early_eligible:
-        r["concurrent_signals"] = _concurrent_signals_for(r["symbol"], "early")
-    for r in breakout_eligible:
-        r["concurrent_signals"] = _concurrent_signals_for(r["symbol"], "breakout")
-    for r in experimental_eligible:
-        r["concurrent_signals"] = _concurrent_signals_for(r["symbol"], "experimental")
-
-    prev_alerted, prev_dominance = load_state(gist_files)
-    fresh = [r for r in strong if r["symbol"] not in prev_alerted]
-    fresh_early = [r for r in early_eligible if f"{r['symbol']}:early" not in prev_alerted]
-    fresh_breakout = [r for r in breakout_eligible if f"{r['symbol']}:breakout" not in prev_alerted]
-    fresh_experimental = [r for r in experimental_eligible if f"{r['symbol']}:experimental" not in prev_alerted]
-
-    # تتبّع BTC Dominance: تحذير إضافي لو تحركت بقوة منذ آخر تشغيل (إشارات العملات البديلة تصير أقل موثوقية)
-    btc_dominance = None
-    market_caution = False
-    try:
-        btc_dominance = fetch_btc_dominance()
-        if prev_dominance is not None:
-            shift = btc_dominance - prev_dominance
-            market_caution = abs(shift) >= DOM_SHIFT_THRESHOLD
-            print(f"BTC Dominance: {btc_dominance:.2f}% (تغيّر {shift:+.2f} نقطة منذ آخر تشغيل)"
-                  + (" — تحذير سوق مفعّل" if market_caution else ""))
-        else:
-            print(f"BTC Dominance: {btc_dominance:.2f}% (أول قراءة، لا مقارنة بعد)")
-    except Exception as e:
-        print("تعذّر جلب BTC Dominance:", e)
-
-    print(f"إشارات قوية حاليًا: {len(strong)} | جديدة (لم تُرسل قبل): {len(fresh)} | "
-          f"إشارات مبكرة جديدة: {len(fresh_early)} | إشارات انفجار جديدة: {len(fresh_breakout)} | "
-          f"إشارات تجريبية جديدة: {len(fresh_experimental)}")
-
-    for r in fresh:
-        caution = market_caution and not r["symbol"].startswith("BTC")
-        alert_text = format_alert(r, caution)
-        r["_msg_id"] = send_telegram(alert_text)
-        r["_alert_text"] = alert_text
-        time.sleep(1)  # تجنب تجاوز حد تيليجرام لعدد الرسائل بالثانية
-
-    for r in fresh_early:
-        alert_text = format_early_alert(r)
-        r["_alert_text"] = alert_text
-        # إشارة بشرط واحد فقط ("احتمالية") تُسجَّل وتُتابَع (TP/SL) لكن بدون إرسال
-        # إشعار تيليجرام — الإرسال محصور بالإشارات ذات شرطين فأكثر ("مؤكدة"/"مؤكدة قوية")
-        if r.get("early_confidence") == "احتمالية":
-            r["_msg_id"] = None
-        else:
-            r["_msg_id"] = send_telegram(alert_text)
-            time.sleep(1)
-
-    for r in fresh_breakout:
-        alert_text = format_breakout_alert(r)
-        r["_msg_id"] = send_telegram(alert_text)
-        r["_alert_text"] = alert_text
-        time.sleep(1)
-
-    for r in fresh_experimental:
-        alert_text = format_experimental_alert(r)
-        r["_msg_id"] = send_telegram(alert_text)
-        r["_alert_text"] = alert_text
-        time.sleep(1)
-
-    # تسجيل الإشارات الجديدة كصفقات مفتوحة قيد المتابعة لاحقًا (رسمية + مبكرة + انفجار + تجريبية)
-    open_new_positions(open_positions, fresh)
-    open_new_early_positions(open_positions, fresh_early)
-    open_new_breakout_positions(open_positions, fresh_breakout)
-    open_new_experimental_positions(open_positions, fresh_experimental)
-
-    # حفظ موحّد: ذاكرة الإشارات (رسمية + مبكرة + انفجار + تجريبية) + BTC Dominance + الصفقات المفتوحة + أرشيف الصفقات المغلقة حديثًا
-    # + إحصائيات أداء محسوبة من السجل المحدَّث (خيار 3: تتبع فقط، بدون تعديل تلقائي على منطق البوت)
-    save_all_state(
-        strong_symbols | early_keys | breakout_keys | experimental_keys,
-        btc_dominance, open_positions, closed_now, gist_files
-    )
-
-    print("انتهى المسح.")
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        tb = traceback.format_exc()
-        print(tb)
-        send_admin_alert(
-            f"توقف السكربت بخطأ غير متوقع أثناء التشغيل:\n"
-            f"{type(e).__name__}: {e}\n\n"
-            f"آخر جزء من تتبع الخطأ:\n{tb[-600:]}"
-        )
-        sys.exit(1)  # يبقي حالة GitHub Action فاشلة (❌) بدل أن تظهر ناجحة رغم العطل
+    monitor_map = {
