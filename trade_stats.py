@@ -33,6 +33,14 @@ trade_stats.py — تقرير مستقل لإحصائيات الصفقات ال�
 لا يُعدّل أي شيء في منطق البوت أو ملفاته — قراءة وعرض فقط (يمكن تشغيله يدويًا
 عبر workflow_dispatch أو محليًا بدون أي تأثير على عمل scanner.py).
 
+تحديث (أرشيف موزّع على عدة Gists): scanner.py قد ينشئ Gist أرشيف منفصل تمامًا عن الـ Gist
+الرئيسي (عبر get_active_archive_gist/_create_new_gist في scanner.py) لما تمتلئ ملفات الأرشيف
+بالـ Gist الحالي، ويسجّل معرّفات كل Gists الأرشيف عبر الوقت في ملف archive_gists_chain.json
+بالـ Gist الرئيسي (آخر عنصر بالسلسلة = الـ Gist النشط للكتابة حاليًا). load_closed_trades هنا
+تتبع هذه السلسلة وتقرأ ملفات الأرشيف من كل Gist مذكور فيها، بدل الاكتفاء بالـ Gist الرئيسي فقط
+— وإلا تبقى الصفقات المؤرشفة بـ Gist منفصل غير مرئية للتقرير للأبد (وهذا كان سبب تثبّت
+التقرير عند ACTIVE_HISTORY_SIZE صفقة رغم استمرار الصفقات).
+
 المتغيرات المطلوبة (نفس Secrets المستخدمة في scanner.py):
   GIST_TOKEN, GIST_ID
 اختياري لإرسال التقرير عبر تيليجرام بدل الطباعة فقط:
@@ -48,6 +56,7 @@ GIST_TOKEN = os.environ.get("GIST_TOKEN")
 GIST_ID = os.environ.get("GIST_ID")
 CLOSED_GIST_FILE = "closed_trades.json"     # السجل النشط: أحدث الصفقات فقط
 ARCHIVE_PREFIX = "closed_trades_archive_"   # ملفات الأرشيف المرقّمة (تحوي كل التاريخ الأقدم)
+ARCHIVE_CHAIN_FILE = "archive_gists_chain.json"   # قائمة معرّفات كل Gists الأرشيف عبر الوقت (نفس اسم الحقل في scanner.py)
 OPEN_POSITIONS_GIST_FILE = "open_positions.json"  # الصفقات المفتوحة قيد المتابعة حاليًا (نفس ملف scanner.py)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -133,6 +142,13 @@ def _gist_headers():
     return {"Authorization": f"token {GIST_TOKEN}", "Accept": "application/vnd.github+json"}
 
 
+def _fetch_gist_files(gist_id):
+    """يجلب قاموس ملفات أي Gist (الرئيسي أو أي Gist أرشيف منفصل) عبر رقم معرّفه."""
+    r = requests.get(f"https://api.github.com/gists/{gist_id}", headers=_gist_headers(), timeout=15)
+    r.raise_for_status()
+    return r.json().get("files", {})
+
+
 def _read_json_file(file_entry, filename):
     """يقرأ محتوى ملف من استجابة Gist، مع التحقق من احتمال البتر (truncated) لملف كبير جدًا
     والجلب من raw_url في هذه الحالة بدل الاعتماد على content فقط."""
@@ -154,25 +170,53 @@ def _read_json_file(file_entry, filename):
         return []
 
 
+def _archive_trades_from_files(files):
+    """يستخرج كل صفقات ملفات الأرشيف (closed_trades_archive_NNNN.json) من قاموس ملفات Gist واحد."""
+    out = []
+    archive_names = sorted(fn for fn in files if fn.startswith(ARCHIVE_PREFIX))
+    for name in archive_names:
+        out.extend(_read_json_file(files[name], name))
+    return out
+
+
 def load_closed_trades():
-    """يجمع السجل النشط (closed_trades.json) مع كل ملفات الأرشيف المرقّمة، ليعطي
-    التاريخ الكامل للصفقات المغلقة بلا أي سقف على العدد الإجمالي."""
+    """يجمع السجل النشط (closed_trades.json بالـ Gist الرئيسي) مع كل ملفات الأرشيف — سواء
+    كانت داخل نفس الـ Gist الرئيسي، أو موزّعة على Gists أرشيف منفصلة يتتبعها scanner.py عبر
+    archive_gists_chain.json — ليعطي التاريخ الكامل للصفقات المغلقة بلا أي سقف على العدد
+    الإجمالي، بصرف النظر أين خُزّن كل جزء من الأرشيف فعليًا."""
     if not GIST_TOKEN or not GIST_ID:
         raise SystemExit("❌ GIST_TOKEN أو GIST_ID غير موجودين في متغيرات البيئة.")
-    r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=_gist_headers(), timeout=15)
-    r.raise_for_status()
-    files = r.json().get("files", {})
+
+    main_files = _fetch_gist_files(GIST_ID)
 
     all_trades = []
 
-    # ملفات الأرشيف أولًا (الأقدم زمنيًا)، مرتبة حسب رقمها
-    archive_names = sorted(fn for fn in files if fn.startswith(ARCHIVE_PREFIX))
-    for name in archive_names:
-        all_trades.extend(_read_json_file(files[name], name))
+    # اقرأ سلسلة الـ Gists الأرشيفية (لو موجودة) — نفس الملف الذي يكتبه scanner.py
+    try:
+        chain_raw = main_files.get(ARCHIVE_CHAIN_FILE, {}).get("content")
+        chain = json.loads(chain_raw) if chain_raw else []
+    except Exception as e:
+        print(f"⚠️ تعذّر تحليل {ARCHIVE_CHAIN_FILE}: {e}")
+        chain = []
+
+    seen_gist_ids = set()
+
+    # اجمع أرشيف كل Gist مذكور بالسلسلة (الأقدم أولًا بترتيب السلسلة نفسه، ثم النشط أخيرًا)
+    for gist_id in chain:
+        if gist_id in seen_gist_ids:
+            continue
+        seen_gist_ids.add(gist_id)
+        files = main_files if gist_id == GIST_ID else _fetch_gist_files(gist_id)
+        all_trades.extend(_archive_trades_from_files(files))
+
+    # احتياطًا: لو فيه ملفات أرشيف بالـ Gist الرئيسي نفسه ولم يكن مذكورًا بالسلسلة (مثلاً
+    # حالة قديمة قبل إضافة السلسلة، أو سلسلة فارغة/تالفة) — لا نفقدها
+    if GIST_ID not in seen_gist_ids:
+        all_trades.extend(_archive_trades_from_files(main_files))
 
     # ثم السجل النشط (الأحدث)
-    if CLOSED_GIST_FILE in files:
-        all_trades.extend(_read_json_file(files[CLOSED_GIST_FILE], CLOSED_GIST_FILE))
+    if CLOSED_GIST_FILE in main_files:
+        all_trades.extend(_read_json_file(main_files[CLOSED_GIST_FILE], CLOSED_GIST_FILE))
 
     return all_trades
 
@@ -184,9 +228,7 @@ def load_open_positions():
     if not GIST_TOKEN or not GIST_ID:
         return []
     try:
-        r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=_gist_headers(), timeout=15)
-        r.raise_for_status()
-        files = r.json().get("files", {})
+        files = _fetch_gist_files(GIST_ID)
         if OPEN_POSITIONS_GIST_FILE not in files:
             return []
         return _read_json_file(files[OPEN_POSITIONS_GIST_FILE], OPEN_POSITIONS_GIST_FILE)
