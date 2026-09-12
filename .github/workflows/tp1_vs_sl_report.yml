@@ -1,0 +1,26 @@
+name: TP1 vs Direct SL Report
+
+# يعمل يدوياً فقط من تبويب Actions -> اختر هذا الـ workflow -> Run workflow
+on:
+  workflow_dispatch: {}
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Run TP1 vs SL report
+        env:
+          GIST_RAW_URL: ${{ secrets.GIST_RAW_URL }}
+          ARCHIVE_CHAIN_URL: ${{ secrets.ARCHIVE_CHAIN_URL }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT || github.token }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python3 tp1_vs_sl_report.py
