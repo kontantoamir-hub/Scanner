@@ -1,0 +1,35 @@
+name: تحليل الإشارات المكررة حسب العملة
+
+# يعمل يدويًا فقط (Run workflow من تبويب Actions) — لا يتداخل مع جدولة scanner.py
+# التلقائية ولا يعدّل أي شيء بمنطق البوت، قراءة وعرض فقط.
+on:
+  workflow_dispatch:
+    inputs:
+      symbol_repeat_min:
+        description: "الحد الأدنى لعدد التكرار كي تُحتسب العملة (مكررة)"
+        required: false
+        default: "2"
+
+jobs:
+  symbol-stats:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run symbol_stats.py
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SYMBOL_REPEAT_MIN: ${{ github.event.inputs.symbol_repeat_min }}
+        run: python symbol_stats.py
