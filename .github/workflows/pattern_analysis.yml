@@ -1,0 +1,42 @@
+name: Pattern Analysis Report
+
+# يعمل يدويًا فقط (workflow_dispatch) — نفس أسلوب Trade Stats Report، لا يعتمد على جدولة تلقائية
+on:
+  workflow_dispatch:
+    inputs:
+      send_telegram:
+        description: "أرسل التقرير على تيليجرام أيضًا (وليس فقط في سجل التشغيل)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run pattern analysis
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ "${{ github.event.inputs.send_telegram }}" = "true" ]; then
+            python3 pattern_analysis.py --telegram
+          else
+            python3 pattern_analysis.py
+          fi
