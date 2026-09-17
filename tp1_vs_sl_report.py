@@ -2,29 +2,54 @@
 """
 tp1_vs_sl_report.py
 --------------------
-يحسب من ملف closed_trades.json (+ أرشيفاته إن وُجدت):
+يحسب من closed_trades.json + كامل أرشيفه (عبر سلسلة archive_gists_chain.json):
 
 1) عدد الصفقات "الناجحة" التي وصلت إلى الهدف الأول (TP1) على الأقل قبل أي
    إغلاق بالستوب لوس (بغض النظر عمّا حدث بعد ذلك).
 2) عدد الصفقات "الخاسرة المباشرة" التي أُغلقت بالستوب لوس (SL) دون أن
    تصل إلى الهدف الأول إطلاقاً.
 
-يدعم أيضاً تصنيف النتائج حسب نوع الإشارة (رسمية / مبكرة / انفجار / تجريبية)
-إن كان الحقل موجوداً في بيانات الصفقة، ويرسل تقريراً على Telegram اختيارياً.
+يصنّف النتائج حسب نوع الإشارة الأربعة كلها دائمًا (حتى لو كان عددها صفراً):
+  رسمية (official) / مبكرة (early) / انفجار (breakout) / تجريبية (experimental)
+وأي نوع إضافي غير معروف يُعرض بعدها بقيمته الخام.
 
-متغيرات البيئة المستخدمة:
-  GIST_RAW_URL          رابط raw لملف closed_trades.json الرئيسي (إلزامي)
-  ARCHIVE_CHAIN_URL     رابط raw لملف archive_gists_chain.json (اختياري)
-                        هذا الملف عبارة عن قائمة Gist IDs، كل Gist منها
-                        يحتوي على عدة ملفات أرشيف (closed_trades_archive_*.json)
-                        يجلبها السكربت تلقائياً عبر GitHub API.
-  GITHUB_TOKEN          توكن GitHub (اختياري - يرفع حد الطلبات لو عندك Gists
-                        سرّية كثيرة أو أرشيف كبير؛ غير إلزامي للقراءة العامة)
-  TELEGRAM_BOT_TOKEN    توكن بوت تيليجرام (اختياري - لإرسال التقرير)
-  TELEGRAM_CHAT_ID      معرف الشات (اختياري - لإرسال التقرير)
+--------------------------------------------------------------------------
+التعديل الأهم عن النسخة السابقة: طريقة جلب البيانات
+--------------------------------------------------------------------------
+النسخة القديمة كانت تعتمد على:
+  - GIST_RAW_URL: رابط raw ثابت لـ closed_trades.json
+  - ARCHIVE_CHAIN_URL: رابط raw ثابت لـ archive_gists_chain.json
 
-الاستخدام المحلي:
-  export GIST_RAW_URL="https://gist.githubusercontent.com/.../raw/closed_trades.json"
+المشكلة: روابط raw.githubusercontent.com التي تُنسخ من عرض تعديل/نسخة معينة
+بالـ Gist (بها معرّف Revision طويل داخل الرابط) تبقى "مجمّدة" على تلك اللحظة
+ولا تتحدث تلقائياً مع كل تعديل لاحق يجريه scanner.py على الـ Gist — فيبدو
+التقرير وكأنه يفوّت صفقات جديدة أو أرشيف كامل رغم وجوده فعلياً بالـ Gist.
+بالإضافة، GitHub API نفسه قد يُرجع محتوى الملف مقصوصاً (truncated) لو تجاوز
+حجمه حداً معيناً، وكانت النسخة القديمة تتجاهل هذا الاحتمال فتقرأ جزءاً فقط
+من ملف الأرشيف.
+
+الحل هنا: نفس أسلوب scanner.py بالضبط — جلب كل الملفات دائماً عبر GitHub API
+(api.github.com/gists/{id}) باستخدام GIST_ID + GIST_TOKEN (نفس المتغيرين
+المستخدمين أصلاً في scan.yml/trade_stats.yml)، وهذا يضمن قراءة آخر نسخة من
+كل ملف دائماً + معالجة صريحة لحالة truncated بجلب raw_url الكامل عند الحاجة.
+
+رابطا GIST_RAW_URL / ARCHIVE_CHAIN_URL القديمان ما زالا مدعومين كخطة احتياطية
+فقط لو لم يُضبط GIST_ID/GIST_TOKEN، حفاظاً على التوافق مع أي إعداد سابق.
+
+متغيرات البيئة المستخدمة (بالأولوية):
+  GIST_ID               معرّف الـ Gist الرئيسي (نفس القيمة المستخدمة في scanner.py)
+  GIST_TOKEN             توكن GitHub بصلاحية gist (نفس القيمة المستخدمة في scanner.py)
+                         — يُقبل أيضاً GITHUB_TOKEN كاسم بديل لو كان هذا هو المضبوط أصلاً
+  --- احتياطي (فقط لو GIST_ID/GIST_TOKEN غير موجودين) ---
+  GIST_RAW_URL           رابط raw لملف closed_trades.json الرئيسي
+  ARCHIVE_CHAIN_URL      رابط raw لملف archive_gists_chain.json
+  --- اختياري دائماً ---
+  TELEGRAM_BOT_TOKEN     توكن بوت تيليجرام (لإرسال التقرير)
+  TELEGRAM_CHAT_ID       معرف الشات (لإرسال التقرير)
+
+الاستخدام المحلي (الطريقة الموصى بها):
+  export GIST_ID="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  export GIST_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
   python3 tp1_vs_sl_report.py
 """
 
@@ -37,13 +62,23 @@ import urllib.error
 # ---------------------------------------------------------------------------
 # إعدادات
 # ---------------------------------------------------------------------------
+GIST_ID = os.environ.get("GIST_ID", "").strip()
+GIST_TOKEN = (os.environ.get("GIST_TOKEN", "").strip()
+              or os.environ.get("GITHUB_TOKEN", "").strip())
+
+# احتياطي قديم (خطة بديلة فقط)
 GIST_RAW_URL = os.environ.get("GIST_RAW_URL", "").strip()
 ARCHIVE_CHAIN_URL = os.environ.get("ARCHIVE_CHAIN_URL", "").strip()
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 GITHUB_API_BASE = "https://api.github.com/gists"
+
+# --- نفس أسماء الملفات/الثوابت المستخدمة في scanner.py (لتفادي أي عدم توافق) ---
+CLOSED_GIST_FILE = "closed_trades.json"
+ARCHIVE_CHAIN_FILE = "archive_gists_chain.json"
+ARCHIVE_PREFIX = "closed_trades_archive_"
 
 # أسماء بديلة محتملة للحقول (لتفادي فروقات بسيطة بين نسخ scanner.py المختلفة)
 HIT_TPS_KEYS = ["hit_tps", "hit_targets", "tps_hit", "targets_hit"]
@@ -52,7 +87,21 @@ TYPE_KEYS = ["type", "signal_type", "trade_type"]
 
 SL_REASONS = {"SL", "sl", "stop_loss", "STOP_LOSS"}
 
+# ترتيب وتسمية الأنواع الأربعة المعروفة في scanner.py — تُعرض دائماً بهذا
+# الترتيب في التقرير حتى لو كان عددها صفراً، حتى يتضح أن الانفجار/التجريبية
+# مشمولان فعلاً بالحساب وليسا مهملين
+TYPE_LABELS = {
+    "official": "🟢 رسمية",
+    "early": "🔵 مبكرة",
+    "breakout": "🟠 انفجار",
+    "experimental": "🟣 تجريبية",
+}
+KNOWN_TYPE_ORDER = ["official", "early", "breakout", "experimental"]
 
+
+# ---------------------------------------------------------------------------
+# أدوات جلب البيانات
+# ---------------------------------------------------------------------------
 def fetch_json(url: str, headers: dict = None):
     """يجلب ويحلل JSON من رابط. يعيد None عند أي خطأ (مع رسالة تحذير)."""
     if not url:
@@ -70,48 +119,122 @@ def fetch_json(url: str, headers: dict = None):
         return None
 
 
+def fetch_text(url: str, headers: dict = None):
+    """مثل fetch_json لكن يرجع نصاً خاماً بدون محاولة تحليل JSON (يُستخدم لملفات raw_url)."""
+    if not url:
+        return None
+    req_headers = {"User-Agent": "tp1-vs-sl-report"}
+    if headers:
+        req_headers.update(headers)
+    try:
+        req = urllib.request.Request(url, headers=req_headers)
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.read().decode("utf-8")
+    except (urllib.error.URLError, urllib.error.HTTPError) as e:
+        print(f"⚠️ تعذر جلب: {url} -> {e}", file=sys.stderr)
+        return None
+
+
 def github_api_headers():
     headers = {"Accept": "application/vnd.github+json"}
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    if GIST_TOKEN:
+        headers["Authorization"] = f"Bearer {GIST_TOKEN}"
     return headers
 
 
-def fetch_gist_archive_trades(gist_id: str):
+def fetch_gist_files(gist_id: str):
     """
-    يجلب Gist أرشيف عبر GitHub API (api.github.com/gists/{id})، يستخرج كل
-    ملفاته (عادة closed_trades_archive_NNNN.json)، ويرجع كل الصفقات مجمّعة.
+    يجلب كل ملفات Gist معيّن دفعة واحدة عبر GitHub API (دائماً آخر نسخة، بلا
+    أي تجميد على revision قديمة كما كان يحدث مع روابط raw الثابتة).
+    يعيد dict: اسم الملف -> معلومات الملف (تتضمن content و raw_url و truncated).
     """
-    trades = []
     url = f"{GITHUB_API_BASE}/{gist_id}"
-    gist_data = fetch_json(url, headers=github_api_headers())
-    if not gist_data or "files" not in gist_data:
-        print(f"⚠️ تعذر جلب Gist الأرشيف: {gist_id}", file=sys.stderr)
-        return trades
+    data = fetch_json(url, headers=github_api_headers())
+    if not data or "files" not in data:
+        print(f"⚠️ تعذر جلب ملفات Gist: {gist_id}", file=sys.stderr)
+        return {}
+    return data["files"]
 
-    files = gist_data["files"]
-    for filename, file_info in files.items():
-        raw_url = file_info.get("raw_url")
-        if not raw_url:
+
+def get_full_file_content(file_info: dict):
+    """
+    يرجع محتوى الملف كاملاً كنص. GitHub API يقصّ (truncated=True) محتوى
+    الملفات الكبيرة نسبياً ضمن استجابة gists/{id} — في هذه الحالة يجب جلب
+    raw_url للحصول على المحتوى الكامل بدل الاكتفاء بالجزء المقصوص (كانت هذه
+    نقطة ضعف صامتة في النسخة القديمة يمكن أن تُفقد بها صفقات من الأرشيف).
+    """
+    if not file_info:
+        return None
+    if file_info.get("truncated"):
+        return fetch_text(file_info.get("raw_url"))
+    return file_info.get("content")
+
+
+def extract_trades_from_content(raw_content):
+    """يحوّل محتوى ملف (نص JSON) إلى قائمة صفقات، بصرف النظر عن الشكل
+    (قائمة مباشرة أو {"trades": [...]})."""
+    if not raw_content:
+        return []
+    try:
+        parsed = json.loads(raw_content)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict) and isinstance(parsed.get("trades"), list):
+        return parsed["trades"]
+    return []
+
+
+# ---------------------------------------------------------------------------
+# تجميع كل الصفقات المغلقة (الرئيسي + كامل سلسلة الأرشيف)
+# ---------------------------------------------------------------------------
+def load_all_closed_trades_via_api():
+    """المسار الموصى به: GIST_ID + GIST_TOKEN، بنفس أسلوب scanner.py تماماً."""
+    all_trades = []
+
+    main_files = fetch_gist_files(GIST_ID)
+    if not main_files:
+        print("❌ لم أستطع تحميل ملفات الـ Gist الرئيسي. تحقق من GIST_ID/GIST_TOKEN.")
+        sys.exit(1)
+
+    main_trades = extract_trades_from_content(
+        get_full_file_content(main_files.get(CLOSED_GIST_FILE))
+    )
+    all_trades.extend(main_trades)
+    print(f"ℹ️ صفقات السجل النشط (closed_trades.json): {len(main_trades)}")
+
+    chain_raw = get_full_file_content(main_files.get(ARCHIVE_CHAIN_FILE))
+    try:
+        chain = json.loads(chain_raw) if chain_raw else []
+    except json.JSONDecodeError:
+        chain = []
+    if not isinstance(chain, list):
+        chain = []
+
+    print(f"ℹ️ عدد Gists الأرشيف الموجودة في السلسلة: {len(chain)}")
+
+    for gist_id in chain:
+        # حالة نظرية دفاعية: لو كان الأرشيف النشط هو نفس الـ Gist الرئيسي
+        # فلا داعي لجلبه مرة ثانية عبر طلب شبكة إضافي
+        files = main_files if gist_id == GIST_ID else fetch_gist_files(gist_id)
+        if not files:
             continue
-        content = fetch_json(raw_url)
-        if isinstance(content, list):
-            trades.extend(content)
-        elif isinstance(content, dict) and "trades" in content:
-            trades.extend(content["trades"])
 
-    return trades
+        archive_trade_count = 0
+        for filename, file_info in files.items():
+            if not filename.startswith(ARCHIVE_PREFIX):
+                continue  # تجاهل README.json وأي ملف آخر غير ملفات الأرشيف الفعلية
+            trades = extract_trades_from_content(get_full_file_content(file_info))
+            all_trades.extend(trades)
+            archive_trade_count += len(trades)
+        print(f"  - Gist {gist_id}: {archive_trade_count} صفقة")
 
-
-def get_first(d: dict, keys, default=None):
-    for k in keys:
-        if k in d:
-            return d[k]
-    return default
+    return all_trades
 
 
-def load_all_closed_trades():
-    """يجمع صفقات closed_trades.json الرئيسي + كل ملفات الأرشيف المرتبطة."""
+def load_all_closed_trades_legacy():
+    """المسار الاحتياطي القديم (روابط raw ثابتة) — يُستخدم فقط لو GIST_ID/GIST_TOKEN غير مضبوطين."""
     all_trades = []
 
     main_data = fetch_json(GIST_RAW_URL)
@@ -121,39 +244,49 @@ def load_all_closed_trades():
 
     if isinstance(main_data, list):
         all_trades.extend(main_data)
-    elif isinstance(main_data, dict) and "trades" in main_data:
+    elif isinstance(main_data, dict) and isinstance(main_data.get("trades"), list):
         all_trades.extend(main_data["trades"])
-    else:
-        print("⚠️ شكل closed_trades.json غير متوقع، سأحاول استخدامه كما هو إن كان قائمة.")
 
-    # ملف سلسلة الأرشيف (اختياري): قائمة Gist IDs، كل واحد فيه عدة ملفات أرشيف
-    # مثال شكل الملف: ["1ab799eca28ba222bba65e7d749016bd", "..."]
     if ARCHIVE_CHAIN_URL:
         chain = fetch_json(ARCHIVE_CHAIN_URL)
-        gist_ids = []
-
-        if isinstance(chain, list):
-            for item in chain:
-                if isinstance(item, str):
-                    gist_ids.append(item)
-                elif isinstance(item, dict):
-                    # احتياطاً لو الشكل تغيّر يوماً إلى قائمة كائنات فيها id
-                    for key in ("id", "gist_id"):
-                        if key in item:
-                            gist_ids.append(item[key])
-                            break
-        elif isinstance(chain, dict):
-            # احتياطاً لو الشكل أصبح قاموساً (id -> معلومات) بدل قائمة
-            gist_ids.extend(chain.keys())
-
+        gist_ids = chain if isinstance(chain, list) else []
         print(f"ℹ️ عدد Gists الأرشيف الموجودة في السلسلة: {len(gist_ids)}")
 
         for gist_id in gist_ids:
-            archived_trades = fetch_gist_archive_trades(gist_id)
-            print(f"  - Gist {gist_id}: {len(archived_trades)} صفقة")
-            all_trades.extend(archived_trades)
+            files = fetch_gist_files(gist_id)
+            archive_trade_count = 0
+            for filename, file_info in files.items():
+                if not filename.startswith(ARCHIVE_PREFIX):
+                    continue
+                trades = extract_trades_from_content(get_full_file_content(file_info))
+                all_trades.extend(trades)
+                archive_trade_count += len(trades)
+            print(f"  - Gist {gist_id}: {archive_trade_count} صفقة")
 
     return all_trades
+
+
+def load_all_closed_trades():
+    if GIST_ID and GIST_TOKEN:
+        return load_all_closed_trades_via_api()
+
+    print("⚠️ GIST_ID/GIST_TOKEN غير مضبوطين، سيُستخدم المسار الاحتياطي عبر "
+          "GIST_RAW_URL/ARCHIVE_CHAIN_URL (أقل موثوقية: قد يتجمّد على نسخة قديمة "
+          "لو كان الرابط يحوي معرّف revision).")
+    if not GIST_RAW_URL:
+        print("❌ لا يوجد GIST_ID/GIST_TOKEN ولا GIST_RAW_URL. لا يمكن المتابعة.")
+        sys.exit(1)
+    return load_all_closed_trades_legacy()
+
+
+# ---------------------------------------------------------------------------
+# التصنيف والتقرير
+# ---------------------------------------------------------------------------
+def get_first(d: dict, keys, default=None):
+    for k in keys:
+        if k in d:
+            return d[k]
+    return default
 
 
 def classify_trade(trade: dict):
@@ -187,7 +320,8 @@ def build_report(trades):
     direct_sl = 0
     other = 0
 
-    by_type = {}  # نوع الإشارة -> {reached_tp1, direct_sl, other}
+    # نبدأ دائماً بالأنواع الأربعة المعروفة (حتى لو صفر) ثم أي نوع إضافي يظهر لاحقاً
+    by_type = {t: {"reached_tp1": 0, "direct_sl": 0, "other": 0} for t in KNOWN_TYPE_ORDER}
 
     for trade in trades:
         category = classify_trade(trade)
@@ -240,13 +374,23 @@ def format_report_text(stats: dict) -> str:
             f"({pct(other, total):.1f}%)"
         )
 
-    if stats["by_type"]:
+    by_type = stats["by_type"]
+    if by_type:
         lines.append("")
         lines.append("— تفصيل حسب نوع الإشارة —")
-        for ttype, counts in stats["by_type"].items():
+
+        # الأنواع الأربعة المعروفة أولاً بترتيب ثابت (رسمية/مبكرة/انفجار/تجريبية)،
+        # حتى لو عددها صفر — حتى يتضح أن الانفجار والتجريبية مُحتسبان فعلاً
+        ordered_types = list(KNOWN_TYPE_ORDER)
+        extra_types = sorted(t for t in by_type if t not in KNOWN_TYPE_ORDER)
+        ordered_types.extend(extra_types)
+
+        for ttype in ordered_types:
+            counts = by_type.get(ttype, {"reached_tp1": 0, "direct_sl": 0, "other": 0})
             sub_total = sum(counts.values())
+            label = TYPE_LABELS.get(ttype, ttype)
             lines.append(
-                f"• {ttype}: إجمالي {sub_total} | "
+                f"• {label}: إجمالي {sub_total} | "
                 f"✅ هدف أول {counts['reached_tp1']} ({pct(counts['reached_tp1'], sub_total):.1f}%) | "
                 f"❌ ستوب مباشر {counts['direct_sl']} ({pct(counts['direct_sl'], sub_total):.1f}%)"
             )
