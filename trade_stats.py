@@ -41,6 +41,19 @@ trade_stats.py — تقرير مستقل لإحصائيات الصفقات ال�
 — وإلا تبقى الصفقات المؤرشفة بـ Gist منفصل غير مرئية للتقرير للأبد (وهذا كان سبب تثبّت
 التقرير عند ACTIVE_HISTORY_SIZE صفقة رغم استمرار الصفقات).
 
+تحديث (تصنيف الفوز/الخسارة): scanner.py الحالي لا يتابع سوى TP1 وSL فقط (check_open_positions
+تغلق الصفقة نهائيًا عند أول ملامسة لأي منهما، أو EXPIRED عند انتهاء السقف الزمني) — لا يوجد
+إطلاقًا closed_reason == "ALL_TP" ولا حقل hit_tps في سجل الصفقات الفعلي؛ هذا كان منطق نسخة
+قديمة من البوت بتعدد أهداف. اعتماد classify() على هذين الحقلين غير الموجودين كان يجعل كل
+صفقة تسقط بصمت في فئة "محايدة" المستبعدة، فيظهر التقرير فارغًا أو بأرقام مغلوطة رغم استمرار
+تسجيل صفقات مغلقة فعليًا. التصنيف الآن مطابق لدالة compute_stats الرسمية داخل scanner.py نفسه
+(تحديث 2026-09-07 فيه): يُحسب الربح/الخسارة الصافي الفعلي (net_pnl_pct بعد خصم عمولة تقديرية
+TRADING_FEE_PCT)، وتُصنَّف الصفقة رابحة لو تجاوز net_pnl_pct نطاق التعادل +BREAKEVEN_BAND_PCT،
+خاسرة لو كان أقل من -BREAKEVEN_BAND_PCT، ومحايدة (مستبعدة من كل الإحصائيات كالسابق) فيما بينهما
+— وهذا يشمل تلقائيًا صفقات TP1 (رابحة بوضوح لأن هدف الربح >= MIN_PROFIT_PCT أصلاً)، صفقات SL
+(خاسرة بوضوح)، وصفقات EXPIRED التي قد تنتهي بربح أو خسارة أو قريبًا من الصفر حسب سعرها عند
+انتهاء السقف الزمني.
+
 المتغيرات المطلوبة (نفس Secrets المستخدمة في scanner.py):
   GIST_TOKEN, GIST_ID
 اختياري لإرسال التقرير عبر تيليجرام بدل الطباعة فقط:
@@ -61,6 +74,12 @@ OPEN_POSITIONS_GIST_FILE = "open_positions.json"  # الصفقات المفتو�
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+# عمولة تداول تقديرية (دخول+خروج) ونطاق تعادل حول الصفر — نفس القيم والمتغيرات البيئية
+# المستخدمة في compute_stats بداخل scanner.py، لضمان تطابق تصنيف الفوز/الخسارة/المحايدة
+# بين الملفين تمامًا
+TRADING_FEE_PCT = float(os.environ.get("TRADING_FEE_PCT", "0.2"))
+BREAKEVEN_BAND_PCT = float(os.environ.get("BREAKEVEN_BAND_PCT", "0.1"))
 
 # مؤشرات الصفقات الرسمية/المبكرة (تُحسب فقط لهذين النوعين في scanner.py)
 INDICATOR_KEYS = ["squeeze", "accumulation", "divergence", "momentum", "extended"]
@@ -237,24 +256,44 @@ def load_open_positions():
         return []
 
 
+def net_pnl_pct(trade):
+    """الربح/الخسارة الصافي الفعلي% بعد خصم عمولة تقديرية (دخول+خروج) — نفس صيغة
+    compute_stats في scanner.py بالضبط، وهي القيمة التي يُبنى عليها التصنيف win/loss/neutral."""
+    entry, exit_price = trade.get("entry"), trade.get("exit_price")
+    if entry and exit_price:
+        raw_pct = (exit_price - entry) / entry * 100
+        return raw_pct - TRADING_FEE_PCT
+    return None
+
+
 def classify(trade):
-    """يحدد نتيجة الصفقة: win / loss / neutral، بناءً على سبب الإغلاق وعدد الأهداف المتحققة.
-    ملاحظة: نتيجة "neutral" ما زالت تُحسب هنا للحفاظ على البيانات القديمة قابلة للقراءة،
-    لكن build_report يتجاهلها بالكامل في كل الإحصائيات لأن إشارة الإغلاق المحايد أُزيلت من البوت."""
-    reason = trade.get("closed_reason", "UNKNOWN")
-    hit = len(trade.get("hit_tps") or [])
-    if reason == "ALL_TP" or hit > 0:
+    """يحدد نتيجة الصفقة: win / loss / neutral، بناءً على الربح/الخسارة الصافي الفعلي
+    (net_pnl_pct) مقارنة بنطاق تعادل صغير حول الصفر (BREAKEVEN_BAND_PCT) — مطابق تمامًا
+    لمنطق compute_stats الرسمي داخل scanner.py.
+
+    ملاحظة: scanner.py الحالي لا يتابع سوى TP1 وSL فقط (تُغلق الصفقة نهائيًا عند أول
+    ملامسة لأي منهما)، أو EXPIRED عند انتهاء السقف الزمني بدون ملامسة أي منهما — لا وجود
+    إطلاقًا لـclosed_reason == "ALL_TP" ولا لحقل hit_tps في سجل الصفقات الفعلي (كانا من
+    منطق نسخة قديمة متعددة الأهداف). الاعتماد على net_pnl_pct بدل هذين الحقلين يصنّف كل
+    الحالات الثلاث تلقائيًا وبشكل صحيح: TP1 تُحسب رابحة (هدف الربح >= MIN_PROFIT_PCT
+    أصلاً فتتجاوز نطاق التعادل بوضوح)، SL تُحسب خاسرة، وEXPIRED تُصنَّف حسب سعرها الفعلي
+    عند انتهاء السقف الزمني (قد تكون رابحة أو خاسرة أو محايدة لو انتهت قريبًا من الصفر).
+    نتيجة "neutral" هنا تبقى مستبعدة بالكامل من كل إحصائيات build_report كالسابق."""
+    pnl = net_pnl_pct(trade)
+    if pnl is None:
+        return "neutral"
+    if pnl > BREAKEVEN_BAND_PCT:
         return "win"
-    if reason == "SL" and hit == 0:
+    if pnl < -BREAKEVEN_BAND_PCT:
         return "loss"
-    return "neutral"  # INVALIDATED أو EXPIRED بدون أي هدف محقق
+    return "neutral"
 
 
 def pnl_pct(trade):
-    entry, exit_price = trade.get("entry"), trade.get("exit_price")
-    if entry and exit_price:
-        return (exit_price - entry) / entry * 100
-    return None
+    """نسبة الربح/الخسارة المعروضة لكل صفقة ومُجمّعة بـwin_pnl_sum/loss_pnl_sum — نفس القيمة
+    الصافية (net_pnl_pct) المستخدمة في classify()، حتى تبقى الأرقام المعروضة متّسقة مع
+    تصنيف رابحة/خاسرة نفسه (بدل عرض نسبة خام قد تُناقض التصنيف الفعلي بالقرب من نطاق التعادل)."""
+    return net_pnl_pct(trade)
 
 
 def duration_hours(trade):
