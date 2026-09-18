@@ -7,6 +7,15 @@
 (closed_trades_archive_0001.json, 0002.json, ...) بنفس الـGist، عشان فترات (--days)
 أطول من عمر السجل النشط الحالي تُحتسب بشكل كامل وصحيح بدل ما تتوقف عند حدود السجل النشط.
 
+مهم — معيار نافذة الفترة (--days):
+الفلترة تتم على أساس تاريخ **الإغلاق** (closed_at) وليس تاريخ الدخول (opened_at).
+السبب: نافذة "آخر N يوم" المطلوبة تجاوب على سؤال "شو صار برأس مالي بآخر N يوم؟" —
+وهذا يتحدد بالصفقات التي *تحقق ربحها/خسارتها فعليًا* (أي أُغلقت) خلال هذه الفترة، بغض
+النظر عن كونها فُتحت قبلها بفترة أطول (لو مدة الاحتفاظ المتوسطة بالصفقات أطول من N يوم،
+فلترة حسب opened_at بدل closed_at تستبعد كل الصفقات القريبة وتظهر نتيجة "لا يوجد صفقات"
+بشكل خاطئ حتى لو أُغلقت عشرات الصفقات فعليًا خلال الفترة). يمكن الرجوع للسلوك القديم
+(الفلترة حسب opened_at) عبر --window-by opened لو احتجت ذلك لأي سبب.
+
 الاستخدام (نفس واجهة trade_simulator.yml — --amount هنا = رأس المال الإجمالي وليس لكل صفقة):
     python trade_simulator.py --days 10 --amount 400
 
@@ -89,6 +98,36 @@ def parse_dt(s):
     return dt.datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
 
 
+def _print_data_range_diagnostics(trades):
+    """يطبع أقدم/أحدث تاريخ دخول وإغلاق موجود بكامل السجل (بدون أي فلترة نوع/فترة)،
+    عشان تكتشف فورًا لو صار انقطاع بتحديث البيانات (السكانر توقف / تعطّل) بدل ما تفسّرها
+    غلط كمشكلة بمنطق المحاكي."""
+    opened_dates, closed_dates = [], []
+    for t in trades:
+        if t.get("opened_at"):
+            try:
+                opened_dates.append(parse_dt(t["opened_at"]))
+            except Exception:
+                pass
+        if t.get("closed_at"):
+            try:
+                closed_dates.append(parse_dt(t["closed_at"]))
+            except Exception:
+                pass
+    now = dt.datetime.now()
+    print("[تشخيص] نطاق تواريخ السجل الكامل (قبل أي فلترة):")
+    if opened_dates:
+        oldest, newest = min(opened_dates), max(opened_dates)
+        print(f"  opened_at: من {oldest} إلى {newest} (أحدث دخول قبل {(now - newest).days} يوم)")
+    else:
+        print("  opened_at: لا توجد تواريخ صالحة إطلاقًا")
+    if closed_dates:
+        oldest, newest = min(closed_dates), max(closed_dates)
+        print(f"  closed_at: من {oldest} إلى {newest} (أحدث إغلاق قبل {(now - newest).days} يوم)")
+    else:
+        print("  closed_at: لا توجد تواريخ صالحة إطلاقًا")
+
+
 def trade_return_pct(t):
     entry, exit_price = t.get("entry"), t.get("exit_price")
     if not entry or not exit_price:
@@ -109,10 +148,15 @@ def trade_return_pct_target(t, tp_index=0):
 
 
 def simulate(trades, days, capital, max_concurrent, trade_type="all", archive_fetch_error=False, tp_target="tp1",
-             debug=False):
+             debug=False, window_by="closed"):
     tp_index = TP_TARGET_INDEX.get(tp_target, 0)
     cutoff = dt.datetime.now() - dt.timedelta(days=days)
     slot_amount = capital / max_concurrent
+
+    if debug:
+        _print_data_range_diagnostics(trades)
+        print(f"[تشخيص] معيار نافذة الفترة المستخدم: {window_by} "
+              f"({'تاريخ الإغلاق' if window_by == 'closed' else 'تاريخ الدخول'})")
 
     # عدادات تشخيص: كم صفقة استُبعدت بكل مرحلة، عشان نعرف بالضبط وين تضيع صفقات النوع المطلوب
     total_seen = 0
@@ -143,7 +187,9 @@ def simulate(trades, days, capital, max_concurrent, trade_type="all", archive_fe
             if is_target_type:
                 excluded_bad_date_format += 1
             continue
-        if opened_at >= cutoff:
+
+        window_ref = closed_at if window_by == "closed" else opened_at
+        if window_ref >= cutoff:
             window.append({**t, "_opened_at": opened_at, "_closed_at": closed_at})
         else:
             if is_target_type:
@@ -154,7 +200,8 @@ def simulate(trades, days, capital, max_concurrent, trade_type="all", archive_fe
         print(f"[تشخيص] صفقات من النوع المطلوب ({trade_type}) قبل أي استبعاد: {type_seen_total}")
         print(f"[تشخيص] من نفس النوع، استُبعدت لعدم اكتمال opened_at/closed_at: {excluded_no_dates}")
         print(f"[تشخيص] من نفس النوع، استُبعدت بسبب صيغة تاريخ غير صالحة: {excluded_bad_date_format}")
-        print(f"[تشخيص] من نفس النوع، استُبعدت لأنها أقدم من الفترة المطلوبة (cutoff): {excluded_before_cutoff}")
+        print(f"[تشخيص] من نفس النوع، استُبعدت لأن {('تاريخ إغلاقها' if window_by == 'closed' else 'تاريخ دخولها')} "
+              f"أقدم من الفترة المطلوبة (cutoff): {excluded_before_cutoff}")
         print(f"[تشخيص] صفقات دخلت نافذة الفترة (window) قبل فلترة التزامن: {len(window)}")
 
     window.sort(key=lambda t: t["_opened_at"])
@@ -284,12 +331,15 @@ def main():
                          choices=["all", "official", "early", "breakout", "experimental"])
     parser.add_argument("--tp", type=str, default="tp1", choices=["tp1", "tp2", "tp3"],
                          help="الهدف الذي يُحتسب الخروج عنده إذا تحقق فعليًا (افتراضي: tp1)")
+    parser.add_argument("--window-by", type=str, default="closed", choices=["closed", "opened"],
+                         help="معيار نافذة الفترة --days: closed = حسب تاريخ الإغلاق (الافتراضي والأصحّ "
+                              "لسؤال 'شو صار بمحفظتي بآخر N يوم')، opened = حسب تاريخ الدخول (السلوك القديم)")
     parser.add_argument("--debug", action="store_true", help="طباعة تفاصيل تشخيصية عن سبب استبعاد الصفقات")
     args = parser.parse_args()
 
     trades, archives_found, archive_fetch_error = fetch_all_trades()
     res = simulate(trades, args.days, args.amount, MAX_CONCURRENT, args.type, archive_fetch_error, args.tp,
-                   debug=args.debug)
+                   debug=args.debug, window_by=args.window_by)
     message = format_message(args.days, res, archives_found)
 
     print(message)
