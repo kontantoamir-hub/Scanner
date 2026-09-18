@@ -16,8 +16,18 @@
 بشكل خاطئ حتى لو أُغلقت عشرات الصفقات فعليًا خلال الفترة). يمكن الرجوع للسلوك القديم
 (الفلترة حسب opened_at) عبر --window-by opened لو احتجت ذلك لأي سبب.
 
+نقطة بداية ثابتة (--since) بدل الرجوع N يوم للخلف من الآن:
+لو عملت Reset كامل للبوت (بدء حساب من الصفر من لحظة معينة)، الرجوع "N يوم للخلف من الآن"
+مو المنطق الصح لأنو ممكن يرجع لفترة قبل الـ Reset أصلاً. --since يحل هذا: تعطيه تاريخ/وقت
+لحظة الـ Reset، ويصير هو نقطة البداية الثابتة بدل "الآن - days". فيه وضعين عبر --since-mode:
+  - open   (افتراضي): من لحظة الـ Reset لحد الآن، بدون أي سقف زمني (--days تُتجاهل كنافذة).
+  - capped: نافذة ثابتة = [لحظة الـ Reset, لحظة الـ Reset + --days يوم]، حتى لو تجاوز
+            الوقت الحالي هذا السقف (يعني ما بتستمر بالتوسع بعد ما تخلص أيام الـ N).
+
 الاستخدام (نفس واجهة trade_simulator.yml — --amount هنا = رأس المال الإجمالي وليس لكل صفقة):
     python trade_simulator.py --days 10 --amount 400
+    python trade_simulator.py --since "2026-09-17 22:00:00" --amount 400
+    python trade_simulator.py --since "2026-09-17 22:00:00" --since-mode capped --days 10 --amount 400
 
 عدد الصفقات المتزامنة قابل للتعديل عبر متغير بيئة اختياري TRADE_MAX_CONCURRENT
 (افتراضي 5) بدون الحاجة لتعديل ملف الـworkflow.
@@ -124,6 +134,9 @@ def _print_data_range_diagnostics(trades):
     if closed_dates:
         oldest, newest = min(closed_dates), max(closed_dates)
         print(f"  closed_at: من {oldest} إلى {newest} (أحدث إغلاق قبل {(now - newest).days} يوم)")
+        if (now - newest).days >= 3:
+            print(f"  ⚠️ تنبيه: أحدث صفقة مسجّلة عمرها {(now - newest).days} يوم — يرجّح توقف السكانر عن "
+                  f"إضافة صفقات جديدة، وهذا سبب مختلف تمامًا عن أي خطأ بمنطق المحاكي نفسه.")
     else:
         print("  closed_at: لا توجد تواريخ صالحة إطلاقًا")
 
@@ -148,15 +161,29 @@ def trade_return_pct_target(t, tp_index=0):
 
 
 def simulate(trades, days, capital, max_concurrent, trade_type="all", archive_fetch_error=False, tp_target="tp1",
-             debug=False, window_by="closed"):
+             debug=False, window_by="closed", since=None, since_mode="open"):
     tp_index = TP_TARGET_INDEX.get(tp_target, 0)
-    cutoff = dt.datetime.now() - dt.timedelta(days=days)
+    now = dt.datetime.now()
+
+    end_cap = None
+    if since is not None:
+        cutoff = since
+        if since_mode == "capped":
+            end_cap = since + dt.timedelta(days=days)
+        # since_mode == "open" -> بدون سقف، لحد الآن
+    else:
+        cutoff = now - dt.timedelta(days=days)
+
     slot_amount = capital / max_concurrent
 
     if debug:
         _print_data_range_diagnostics(trades)
-        print(f"[تشخيص] معيار نافذة الفترة المستخدم: {window_by} "
-              f"({'تاريخ الإغلاق' if window_by == 'closed' else 'تاريخ الدخول'})")
+        if since is not None:
+            print(f"[تشخيص] نقطة بداية ثابتة (--since): {cutoff}  |  وضع: {since_mode}"
+                  + (f"  |  سقف النافذة: {end_cap}" if end_cap else "  |  بدون سقف (حتى الآن)"))
+        else:
+            print(f"[تشخيص] معيار نافذة الفترة المستخدم: {window_by} "
+                  f"({'تاريخ الإغلاق' if window_by == 'closed' else 'تاريخ الدخول'}) | cutoff: {cutoff}")
 
     # عدادات تشخيص: كم صفقة استُبعدت بكل مرحلة، عشان نعرف بالضبط وين تضيع صفقات النوع المطلوب
     total_seen = 0
@@ -164,6 +191,7 @@ def simulate(trades, days, capital, max_concurrent, trade_type="all", archive_fe
     excluded_wrong_type = 0
     excluded_bad_date_format = 0
     excluded_before_cutoff = 0
+    excluded_after_cap = 0
     type_seen_total = 0  # صفقات من نفس trade_type بغض النظر عن أي فلتر ثاني
 
     window = []
@@ -189,19 +217,25 @@ def simulate(trades, days, capital, max_concurrent, trade_type="all", archive_fe
             continue
 
         window_ref = closed_at if window_by == "closed" else opened_at
-        if window_ref >= cutoff:
-            window.append({**t, "_opened_at": opened_at, "_closed_at": closed_at})
-        else:
+        if window_ref < cutoff:
             if is_target_type:
                 excluded_before_cutoff += 1
+            continue
+        if end_cap is not None and window_ref > end_cap:
+            if is_target_type:
+                excluded_after_cap += 1
+            continue
+
+        window.append({**t, "_opened_at": opened_at, "_closed_at": closed_at})
 
     if debug:
         print(f"[تشخيص] إجمالي الصفقات بالسجل: {total_seen}")
         print(f"[تشخيص] صفقات من النوع المطلوب ({trade_type}) قبل أي استبعاد: {type_seen_total}")
         print(f"[تشخيص] من نفس النوع، استُبعدت لعدم اكتمال opened_at/closed_at: {excluded_no_dates}")
         print(f"[تشخيص] من نفس النوع، استُبعدت بسبب صيغة تاريخ غير صالحة: {excluded_bad_date_format}")
-        print(f"[تشخيص] من نفس النوع، استُبعدت لأن {('تاريخ إغلاقها' if window_by == 'closed' else 'تاريخ دخولها')} "
-              f"أقدم من الفترة المطلوبة (cutoff): {excluded_before_cutoff}")
+        print(f"[تشخيص] من نفس النوع، استُبعدت لأنها أقدم من نقطة البداية (cutoff): {excluded_before_cutoff}")
+        if end_cap is not None:
+            print(f"[تشخيص] من نفس النوع، استُبعدت لأنها بعد سقف النافذة (end_cap): {excluded_after_cap}")
         print(f"[تشخيص] صفقات دخلت نافذة الفترة (window) قبل فلترة التزامن: {len(window)}")
 
     window.sort(key=lambda t: t["_opened_at"])
@@ -265,14 +299,28 @@ def simulate(trades, days, capital, max_concurrent, trade_type="all", archive_fe
         "final_balance": round(capital + total_profit, 2),
         "by_type": by_type,
         "incomplete_warning": incomplete_warning,
+        "since": since,
+        "since_mode": since_mode,
+        "end_cap": end_cap,
+        "days": days,
     }
 
 
 def format_message(days, res, archives_found=0):
     type_label = "الكل" if res["trade_type"] == "all" else TYPE_LABELS.get(res["trade_type"], res["trade_type"])
     tp_label = res.get("tp_target", "tp1").upper()
+
+    if res.get("since") is not None:
+        since = res["since"]
+        if res.get("end_cap") is not None:
+            period_label = f"من {since:%Y-%m-%d %H:%M} إلى {res['end_cap']:%Y-%m-%d %H:%M} (سقف {days} يوم بعد الـ Reset)"
+        else:
+            period_label = f"منذ الـ Reset ({since:%Y-%m-%d %H:%M}) وحتى الآن"
+    else:
+        period_label = f"آخر {days} يوم"
+
     lines = [
-        f"💰 محاكاة أرباح آخر {days} يوم — نوع الصفقات: {type_label} — هدف الخروج: {tp_label} — رأس مال {res['capital']:.0f}$ "
+        f"💰 محاكاة أرباح {period_label} — نوع الصفقات: {type_label} — هدف الخروج: {tp_label} — رأس مال {res['capital']:.0f}$ "
         f"({res['max_concurrent']} صفقات متزامنة كحد أقصى، {res['slot_amount']:.0f}$ لكل شريحة)"
     ]
     if archives_found:
@@ -325,7 +373,9 @@ def send_telegram(text):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--days", type=int, default=10)
+    parser.add_argument("--days", type=int, default=10,
+                         help="بدون --since: عدد الأيام للرجوع للخلف من الآن. مع --since وWith --since-mode capped: "
+                              "طول النافذة (أيام) بعد نقطة الـ Reset.")
     parser.add_argument("--amount", type=float, default=400, help="رأس المال الإجمالي (وليس لكل صفقة)")
     parser.add_argument("--type", type=str, default="all",
                          choices=["all", "official", "early", "breakout", "experimental"])
@@ -334,12 +384,20 @@ def main():
     parser.add_argument("--window-by", type=str, default="closed", choices=["closed", "opened"],
                          help="معيار نافذة الفترة --days: closed = حسب تاريخ الإغلاق (الافتراضي والأصحّ "
                               "لسؤال 'شو صار بمحفظتي بآخر N يوم')، opened = حسب تاريخ الدخول (السلوك القديم)")
+    parser.add_argument("--since", type=str, default=None,
+                         help="نقطة بداية ثابتة بصيغة 'YYYY-MM-DD HH:MM:SS' (مثلاً لحظة عمل Reset كامل للبوت)، "
+                              "تحل محل حساب cutoff من --days. راجع --since-mode لتحديد هل فيه سقف زمني أو لا.")
+    parser.add_argument("--since-mode", type=str, default="open", choices=["open", "capped"],
+                         help="فقط مع --since. open (افتراضي) = من لحظة الـ Reset لحد الآن بدون سقف. "
+                              "capped = نافذة ثابتة أقصاها --days يوم بعد لحظة الـ Reset، حتى لو تجاوزها الوقت الحالي.")
     parser.add_argument("--debug", action="store_true", help="طباعة تفاصيل تشخيصية عن سبب استبعاد الصفقات")
     args = parser.parse_args()
 
+    since_dt = parse_dt(args.since) if args.since else None
+
     trades, archives_found, archive_fetch_error = fetch_all_trades()
     res = simulate(trades, args.days, args.amount, MAX_CONCURRENT, args.type, archive_fetch_error, args.tp,
-                   debug=args.debug, window_by=args.window_by)
+                    debug=args.debug, window_by=args.window_by, since=since_dt, since_mode=args.since_mode)
     message = format_message(args.days, res, archives_found)
 
     print(message)
