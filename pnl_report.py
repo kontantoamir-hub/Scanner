@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-pnl_report.py  (v2)
+pnl_report.py  (v3)
 ===================
 يجاوب على سؤال واحد بشكل نهائي: هل البوت رابح أم خاسر؟
 
@@ -11,6 +11,14 @@ pnl_report.py  (v2)
   - الصافي المتوقع لكل صفقة (expectancy) مع هامش ثقة تقريبي 95%
   - Profit Factor
   - حكم نهائي: إيجابي / سلبي / غير حاسم / عيّنة صغيرة
+
+ما الذي تغيّر في v3 (إصلاح التوقف عند 150 صفقة):
+  scanner.py يحتفظ في closed_trades.json بآخر 150 صفقة فقط (ACTIVE_HISTORY_SIZE)،
+  ويرحّل الأقدم إلى ملفات closed_trades_archive_NNNN.json داخل Gist أرشيف *منفصل*
+  (يُنشأ عبر _create_new_gist وليس هو GIST_ID). معرّفات هذه الـ Gists مسجّلة في
+  الملف archive_gists_chain.json داخل الـ Gist الرئيسي (وأيضًا archive_index.json).
+  النسخة السابقة كانت تقرأ الـ Gist الرئيسي فقط فتتجاهل كل الأرشيف.
+  الآن: يقرأ السلسلة، ويجلب كل Gist أرشيف، ويجمع كل الصفقات + السجل النشط.
 
 مصدر الربح والخسارة لكل صفقة (بالترتيب):
   1) أول حقل موجود من: net_pnl_pct / pnl_pct / profit_pct / ... (انظر PNL_KEYS)
@@ -22,14 +30,17 @@ pnl_report.py  (v2)
     BREAKEVEN_BAND_PCT             نطاق التعادل، افتراضي 0.1
     MIN_TRADES_FOR_VERDICT         أقل عدد صفقات لإصدار حكم، افتراضي 30
     TRADING_FEE_PCT                رسوم الدخول+الخروج للحساب البديل، افتراضي 0.2
+    ALLOW_PARTIAL                  لو 1: يكمل حتى لو فشل جلب Gist أرشيف (افتراضي 0 = يتوقف)
 
 تشغيل:
     python pnl_report.py
-(بدون GIST_TOKEN/GIST_ID يقرأ closed_trades.json المحلي بجانب السكربت)
+(بدون GIST_TOKEN/GIST_ID يقرأ closed_trades.json المحلي بجانب السكربت
+ + أي ملفات closed_trades_archive_*.json محلية بجانبه)
 """
 
 import os
 import sys
+import glob
 import json
 import math
 import statistics
@@ -38,10 +49,13 @@ import requests
 
 GIST_FILENAME = "closed_trades.json"
 ARCHIVE_PREFIX = "closed_trades_archive_"
+ARCHIVE_CHAIN_FILE = "archive_gists_chain.json"   # نفس اسم الملف في scanner.py
+ARCHIVE_INDEX_FILE = "archive_index.json"         # نفس اسم الملف في scanner.py
 
 BREAKEVEN_BAND_PCT = float(os.environ.get("BREAKEVEN_BAND_PCT", "0.1"))
 MIN_TRADES_FOR_VERDICT = int(os.environ.get("MIN_TRADES_FOR_VERDICT", "30"))
 TRADING_FEE_PCT = float(os.environ.get("TRADING_FEE_PCT", "0.2"))
+ALLOW_PARTIAL = os.environ.get("ALLOW_PARTIAL", "0") == "1"
 
 PNL_KEYS = ("net_pnl_pct", "pnl_pct", "profit_pct", "net_profit_pct",
             "realized_pnl_pct", "result_pct", "pnl_percent", "profit_percent")
@@ -57,58 +71,161 @@ TYPES = [
 
 
 # ---------------------------------------------------------------- تحميل البيانات
-def _read_json_file(file_entry, filename):
-    if file_entry.get("truncated"):
+def _headers(token):
+    return {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+
+
+def _fetch_gist_files(gist_id, token):
+    """يرجع قاموس ملفات Gist معيّن (اسم -> بيانات الملف)."""
+    r = requests.get(f"https://api.github.com/gists/{gist_id}", headers=_headers(token), timeout=30)
+    r.raise_for_status()
+    return r.json().get("files", {})
+
+
+def _read_json_file(file_entry, filename, token=None):
+    """يقرأ محتوى ملف JSON من Gist، ويجلب النسخة الكاملة من raw_url لو كان مبتورًا."""
+    content = file_entry.get("content")
+    if file_entry.get("truncated") or content is None:
         raw_url = file_entry.get("raw_url")
         try:
-            rr = requests.get(raw_url, timeout=15)
+            rr = requests.get(raw_url, headers=_headers(token) if token else None, timeout=30)
             rr.raise_for_status()
             content = rr.text
         except Exception as e:
-            print(f"⚠️ تعذّر جلب المحتوى الكامل غير المبتور لـ {filename}: {e}")
-            content = file_entry.get("content", "[]")
-    else:
-        content = file_entry.get("content", "[]")
-    return json.loads(content)
+            raise RuntimeError(f"تعذّر جلب المحتوى الكامل لـ {filename}: {e}") from e
+    return json.loads(content or "[]")
+
+
+def _archive_names(files):
+    return sorted(fn for fn in files if fn.startswith(ARCHIVE_PREFIX))
+
+
+def _find_archive_gist_ids(main_files, token, main_id):
+    """يستخرج معرّفات Gists الأرشيف بالترتيب من archive_gists_chain.json
+    (والباقي غير الموجود فيها من archive_index.json كاحتياط)."""
+    ids = []
+    if ARCHIVE_CHAIN_FILE in main_files:
+        chain = _read_json_file(main_files[ARCHIVE_CHAIN_FILE], ARCHIVE_CHAIN_FILE, token)
+        if isinstance(chain, list):
+            ids.extend(str(x) for x in chain if x)
+    if ARCHIVE_INDEX_FILE in main_files:
+        try:
+            index = _read_json_file(main_files[ARCHIVE_INDEX_FILE], ARCHIVE_INDEX_FILE, token)
+            if isinstance(index, dict):
+                ids.extend(str(k) for k in index.keys() if str(k) not in ids)
+        except Exception:
+            pass
+    seen, ordered = set(), []
+    for gid in ids:
+        if gid not in seen:
+            seen.add(gid)
+            ordered.append(gid)
+    return ordered
+
+
+def _dedupe(trades):
+    """يحذف السجلات المتطابقة تمامًا (حماية من تكرار ناتج عن ترحيل/إعادة تشغيل)."""
+    seen, out = set(), []
+    for t in trades:
+        try:
+            key = json.dumps(t, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            out.append(t)
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(t)
+    return out, len(trades) - len(out)
+
+
+def _load_from_gist(token, gist_id):
+    main_files = _fetch_gist_files(gist_id, token)
+    notes = [f"الـ Gist الرئيسي: {len(main_files)} ملف"]
+
+    if GIST_FILENAME not in main_files:
+        sys.exit(f"لم يتم العثور على '{GIST_FILENAME}' داخل الـ Gist. "
+                 f"الملفات المتوفرة: {list(main_files.keys())[:20]}")
+
+    all_trades = []
+    problems = []
+
+    # 1) ملفات الأرشيف داخل الـ Gist الرئيسي نفسه (لو وُجدت)
+    for name in _archive_names(main_files):
+        part = _read_json_file(main_files[name], name, token)
+        notes.append(f"[الرئيسي] {name}: {len(part)} صفقة")
+        all_trades.extend(part)
+
+    # 2) Gists الأرشيف المنفصلة حسب السلسلة
+    archive_ids = _find_archive_gist_ids(main_files, token, gist_id)
+    notes.append(f"عدد Gists الأرشيف في السلسلة: {len(archive_ids)}")
+    for aid in archive_ids:
+        if aid == gist_id:
+            continue  # تمت قراءته أعلاه
+        try:
+            files = _fetch_gist_files(aid, token)
+            names = _archive_names(files)
+            count = 0
+            for name in names:
+                part = _read_json_file(files[name], name, token)
+                count += len(part)
+                all_trades.extend(part)
+            notes.append(f"[أرشيف {aid[:8]}…] {len(names)} ملف، {count} صفقة")
+        except Exception as e:
+            problems.append(f"Gist أرشيف {aid}: {e}")
+
+    if problems:
+        msg = "⚠️ فشل جلب جزء من الأرشيف:\n   - " + "\n   - ".join(problems)
+        if ALLOW_PARTIAL:
+            print(msg + "\n   (ALLOW_PARTIAL=1 → سيكمل بنتائج ناقصة)")
+            notes.append("⚠️ النتائج ناقصة بسبب فشل جلب بعض الأرشيف")
+        else:
+            sys.exit(msg + "\nتوقّف لتجنّب تقرير مضلّل. أعد المحاولة أو ضع ALLOW_PARTIAL=1.")
+
+    # 3) السجل النشط (آخر 150) — في النهاية لأنه الأحدث
+    active = _read_json_file(main_files[GIST_FILENAME], GIST_FILENAME, token)
+    notes.append(f"{GIST_FILENAME} (النشط): {len(active)} صفقة")
+    all_trades.extend(active)
+
+    return all_trades, "Gist (النشط + كل الأرشيف)", notes
+
+
+def _load_local():
+    base = os.path.dirname(os.path.abspath(__file__))
+    local_path = os.path.join(base, GIST_FILENAME)
+    if not os.path.exists(local_path):
+        return None
+
+    trades, notes = [], []
+    for path in sorted(glob.glob(os.path.join(base, ARCHIVE_PREFIX + "*.json"))):
+        with open(path, "r", encoding="utf-8") as f:
+            part = json.load(f)
+        notes.append(f"{os.path.basename(path)}: {len(part)} صفقة")
+        trades.extend(part)
+    with open(local_path, "r", encoding="utf-8") as f:
+        active = json.load(f)
+    notes.append(f"{GIST_FILENAME}: {len(active)} صفقة")
+    trades.extend(active)
+    return trades, "ملفات محلية", notes
 
 
 def load_trades():
     """يرجع (الصفقات، وصف المصدر، ملاحظات). الأولوية للـ Gist لو المفاتيح موجودة."""
     token = os.environ.get("GIST_TOKEN")
     gist_id = os.environ.get("GIST_ID")
-    local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "closed_trades.json")
 
     if token and gist_id:
-        r = requests.get(
-            f"https://api.github.com/gists/{gist_id}",
-            headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
-            timeout=15,
-        )
-        r.raise_for_status()
-        files = r.json().get("files", {})
+        trades, source, notes = _load_from_gist(token, gist_id)
+    else:
+        local = _load_local()
+        if local is None:
+            sys.exit("خطأ: لم يتم ضبط GIST_TOKEN و GIST_ID، ولا يوجد closed_trades.json محليًا بجانب السكربت.")
+        trades, source, notes = local
 
-        notes = [f"عدد ملفات الـ Gist: {len(files)}"]
-        all_trades = []
-        for name in sorted(fn for fn in files if fn.startswith(ARCHIVE_PREFIX)):
-            part = _read_json_file(files[name], name)
-            notes.append(f"{name}: {len(part)} صفقة")
-            all_trades.extend(part)
-        if GIST_FILENAME in files:
-            part = _read_json_file(files[GIST_FILENAME], GIST_FILENAME)
-            notes.append(f"{GIST_FILENAME}: {len(part)} صفقة")
-            all_trades.extend(part)
-        else:
-            sys.exit(f"لم يتم العثور على '{GIST_FILENAME}' داخل الـ Gist. الملفات المتوفرة: {list(files.keys())[:20]}")
-        return all_trades, "Gist", notes
-
-    if os.path.exists(local_path):
-        with open(local_path, "r", encoding="utf-8") as f:
-            trades = json.load(f)
-        return trades, "ملف محلي closed_trades.json", [f"{len(trades)} صفقة"]
-
-    sys.exit(
-        "خطأ: لم يتم ضبط GIST_TOKEN و GIST_ID، ولا يوجد closed_trades.json محليًا بجانب السكربت."
-    )
+    trades, removed = _dedupe(trades)
+    if removed:
+        notes.append(f"تم حذف {removed} سجل مكرر تمامًا")
+    return trades, source, notes
 
 
 # ---------------------------------------------------------------- الحسابات
