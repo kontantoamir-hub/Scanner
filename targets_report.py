@@ -5,7 +5,7 @@ targets_report.py
 ==================
 سكربت تحليل يقرأ closed_trades.json من نفس الـ Gist المستخدم في scanner.py
 (نفس المفاتيح الحرفية: type / symbol / tps / hit_tps / closed_reason)
-ويعرض 3 تقارير:
+ويعرض 4 تقارير:
 
   1) نتائج الإشارات حسب النوع (رسمية / مبكرة): عدد الصفقات، نسبة لمس
      أي هدف (win)، ونسبة الوصول لكامل الأهداف الموضوعة (ALL_TP).
@@ -13,13 +13,16 @@ targets_report.py
      عند الفتح، مع نتيجة كل واحدة.
   3) نسبة نجاح كل عملة (symbol) على حدة في الوصول لكامل أهدافها، من بين
      صفقاتها التي كان لها هدفان فأكثر.
+  4) الانفجار (breakout): مجموع ربح الرابحة ومجموع خسارة الخاسرة والصافي
+     (من الحقل net_pnl_pct)، بنفس شكل تقارير الرسمية والمبكرة.
 
-صفقات breakout مستبعدة بالكامل من هذا التقرير (الطلب كان عن الرسمية والمبكرة فقط).
+الأقسام 1 إلى 3 للرسمية والمبكرة فقط؛ القسم 4 مخصص للانفجار.
 
 الإعداد
 -------
 نفس متغيرات البيئة المستخدمة في scanner.py:
     GIST_TOKEN, GIST_ID
+اختياري: BREAKEVEN_BAND_PCT (افتراضي 0.1) نطاق التعادل الذي لا يُحسب ربحًا ولا خسارة
 (أو ضع ملف closed_trades.json محليًا بجانب السكربت لتشغيله بدون شبكة)
 
 تشغيل:
@@ -35,6 +38,9 @@ import requests
 
 GIST_FILENAME = "closed_trades.json"          # السجل النشط: أحدث الصفقات فقط
 ARCHIVE_PREFIX = "closed_trades_archive_"     # ملفات الأرشيف المرقّمة (تحوي كل التاريخ الأقدم)
+
+BREAKEVEN_BAND_PCT = float(os.environ.get("BREAKEVEN_BAND_PCT", "0.1"))
+PNL_KEYS = ("net_pnl_pct", "pnl_pct", "profit_pct")   # الأساسي net_pnl_pct، والبقية احتياطية
 
 
 def _read_json_file(file_entry, filename):
@@ -112,6 +118,19 @@ def pct(part, whole):
     return (part / whole * 100) if whole else 0.0
 
 
+def get_pnl(trade):
+    """الربح/الخسارة الصافية للصفقة كنسبة مئوية، أو None لو الحقل غير موجود."""
+    for key in PNL_KEYS:
+        val = trade.get(key)
+        if val is None:
+            continue
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def print_section_by_type(trades):
     print("=" * 70)
     print("1) نتائج الإشارات حسب النوع (رسمية / مبكرة)")
@@ -187,6 +206,48 @@ def print_section_per_symbol(multi_target_trades):
         print(f"{symbol:<12}{n:<14}{full:<20}{p:.1f}%")
 
 
+def print_section_breakout_totals(trades):
+    print("\n" + "=" * 70)
+    print("4) الانفجار (breakout): مجموع الربح والخسارة")
+    print("=" * 70)
+
+    group = [t for t in trades if t.get("type") == "breakout"]
+    n_all = len(group)
+    print(f"\n🟠 انفجار — إجمالي: {n_all} صفقة")
+    if not n_all:
+        print("  لا توجد صفقات انفجار بعد.")
+        return
+
+    pnls, missing = [], 0
+    for t in group:
+        p = get_pnl(t)
+        if p is None:
+            missing += 1
+        else:
+            pnls.append(p)
+
+    if missing:
+        print(f"  ⚠️ {missing} صفقة بدون حقل ربح/خسارة (استُبعدت من المجاميع)")
+    if not pnls:
+        print("  لا توجد بيانات ربح/خسارة قابلة للحساب لهذا النوع.")
+        return
+
+    wins = [p for p in pnls if p > BREAKEVEN_BAND_PCT]
+    losses = [p for p in pnls if p < -BREAKEVEN_BAND_PCT]
+    flat = len(pnls) - len(wins) - len(losses)
+
+    n = len(pnls)
+    print(f"  نجاح {pct(len(wins), n):.0f}% (رابحة {len(wins)} / خاسرة {len(losses)})"
+          f" | مجموع ربح الرابحة: {sum(wins):+.2f}% | مجموع خسارة الخاسرة: {sum(losses):+.2f}%")
+    if wins:
+        print(f"  متوسط الربح في الصفقة الرابحة   : {sum(wins) / len(wins):+.2f}%")
+    if losses:
+        print(f"  متوسط الخسارة في الصفقة الخاسرة : {sum(losses) / len(losses):+.2f}%")
+    if flat:
+        print(f"  تعادل (±{BREAKEVEN_BAND_PCT}%) : {flat} صفقة")
+    print(f"  الصافي الإجمالي: {sum(pnls):+.2f}%  (متوسط {sum(pnls) / n:+.2f}% للصفقة)")
+
+
 def main():
     trades = load_trades()
     if not isinstance(trades, list):
@@ -195,6 +256,7 @@ def main():
     print_section_by_type(trades)
     multi = print_section_multi_target(trades)
     print_section_per_symbol(multi)
+    print_section_breakout_totals(trades)
 
 
 if __name__ == "__main__":
