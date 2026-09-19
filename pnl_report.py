@@ -1,28 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-pnl_report.py
-=============
+pnl_report.py  (v2)
+===================
 يجاوب على سؤال واحد بشكل نهائي: هل البوت رابح أم خاسر؟
 
 لكل نوع إشارة (official / early / breakout / experimental) ثم للكل معًا، يحسب:
-  - كم تربح في المتوسط بالصفقة الرابحة
-  - كم تخسر في المتوسط بالصفقة الخاسرة
+  - كم تربح في المتوسط بالصفقة الرابحة، وكم تخسر في المتوسط بالصفقة الخاسرة
   - نسبة النجاح الفعلية، ونسبة النجاح المطلوبة للتعادل
   - الصافي المتوقع لكل صفقة (expectancy) مع هامش ثقة تقريبي 95%
   - Profit Factor
   - حكم نهائي: إيجابي / سلبي / غير حاسم / عيّنة صغيرة
 
-الربح والخسارة تُقرأ من الحقل net_pnl_pct (الصافي بعد الرسوم) في closed_trades.json.
+مصدر الربح والخسارة لكل صفقة (بالترتيب):
+  1) أول حقل موجود من: net_pnl_pct / pnl_pct / profit_pct / ... (انظر PNL_KEYS)
+  2) وإلا: يُحسب من سعر الدخول وسعر الخروج ناقص الرسوم (TRADING_FEE_PCT)
+  لو لم يُعثر على أي منهما يُطبع تشخيص بأسماء حقول عيّنة من السجلات.
 
-الإعداد (متغيرات بيئة، كلها اختيارية عدا Gist لو لا يوجد ملف محلي):
-    GIST_TOKEN, GIST_ID            نفس scanner.py
-    BREAKEVEN_BAND_PCT             نطاق التعادل، افتراضي 0.1  (±0.1% لا تُحسب ربحًا ولا خسارة)
+الإعداد (متغيرات بيئة):
+    GIST_TOKEN, GIST_ID            نفس scanner.py (لو موجودان يُقرأ من الـ Gist دائمًا)
+    BREAKEVEN_BAND_PCT             نطاق التعادل، افتراضي 0.1
     MIN_TRADES_FOR_VERDICT         أقل عدد صفقات لإصدار حكم، افتراضي 30
+    TRADING_FEE_PCT                رسوم الدخول+الخروج للحساب البديل، افتراضي 0.2
 
 تشغيل:
     python pnl_report.py
-(أو ضع closed_trades.json محليًا بجانب السكربت لتشغيله بدون شبكة)
+(بدون GIST_TOKEN/GIST_ID يقرأ closed_trades.json المحلي بجانب السكربت)
 """
 
 import os
@@ -38,9 +41,12 @@ ARCHIVE_PREFIX = "closed_trades_archive_"
 
 BREAKEVEN_BAND_PCT = float(os.environ.get("BREAKEVEN_BAND_PCT", "0.1"))
 MIN_TRADES_FOR_VERDICT = int(os.environ.get("MIN_TRADES_FOR_VERDICT", "30"))
+TRADING_FEE_PCT = float(os.environ.get("TRADING_FEE_PCT", "0.2"))
 
-# الحقل الأساسي هو net_pnl_pct؛ البقية أسماء بديلة احتياطية فقط
-PNL_KEYS = ("net_pnl_pct", "pnl_pct", "profit_pct")
+PNL_KEYS = ("net_pnl_pct", "pnl_pct", "profit_pct", "net_profit_pct",
+            "realized_pnl_pct", "result_pct", "pnl_percent", "profit_percent")
+ENTRY_KEYS = ("entry", "entry_price", "open_price", "buy_price")
+EXIT_KEYS = ("exit_price", "close_price", "closed_price", "sell_price", "exit")
 
 TYPES = [
     ("official", "🔴 رسمية"),
@@ -67,64 +73,81 @@ def _read_json_file(file_entry, filename):
 
 
 def load_trades():
-    local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "closed_trades.json")
-    if os.path.exists(local_path):
-        with open(local_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-
+    """يرجع (الصفقات، وصف المصدر، ملاحظات). الأولوية للـ Gist لو المفاتيح موجودة."""
     token = os.environ.get("GIST_TOKEN")
     gist_id = os.environ.get("GIST_ID")
-    if not token or not gist_id:
-        sys.exit(
-            "خطأ: لا يوجد closed_trades.json محليًا، ولم يتم ضبط "
-            "GIST_TOKEN و GIST_ID كمتغيرات بيئة لجلبه من الـ Gist."
+    local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "closed_trades.json")
+
+    if token and gist_id:
+        r = requests.get(
+            f"https://api.github.com/gists/{gist_id}",
+            headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
+            timeout=15,
         )
+        r.raise_for_status()
+        files = r.json().get("files", {})
 
-    r = requests.get(
-        f"https://api.github.com/gists/{gist_id}",
-        headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
-        timeout=15,
+        notes = [f"عدد ملفات الـ Gist: {len(files)}"]
+        all_trades = []
+        for name in sorted(fn for fn in files if fn.startswith(ARCHIVE_PREFIX)):
+            part = _read_json_file(files[name], name)
+            notes.append(f"{name}: {len(part)} صفقة")
+            all_trades.extend(part)
+        if GIST_FILENAME in files:
+            part = _read_json_file(files[GIST_FILENAME], GIST_FILENAME)
+            notes.append(f"{GIST_FILENAME}: {len(part)} صفقة")
+            all_trades.extend(part)
+        else:
+            sys.exit(f"لم يتم العثور على '{GIST_FILENAME}' داخل الـ Gist. الملفات المتوفرة: {list(files.keys())[:20]}")
+        return all_trades, "Gist", notes
+
+    if os.path.exists(local_path):
+        with open(local_path, "r", encoding="utf-8") as f:
+            trades = json.load(f)
+        return trades, "ملف محلي closed_trades.json", [f"{len(trades)} صفقة"]
+
+    sys.exit(
+        "خطأ: لم يتم ضبط GIST_TOKEN و GIST_ID، ولا يوجد closed_trades.json محليًا بجانب السكربت."
     )
-    r.raise_for_status()
-    files = r.json().get("files", {})
-
-    all_trades = []
-    for name in sorted(fn for fn in files if fn.startswith(ARCHIVE_PREFIX)):
-        all_trades.extend(_read_json_file(files[name], name))
-    if GIST_FILENAME in files:
-        all_trades.extend(_read_json_file(files[GIST_FILENAME], GIST_FILENAME))
-
-    if not all_trades and GIST_FILENAME not in files:
-        sys.exit(f"لم يتم العثور على '{GIST_FILENAME}' داخل الـ Gist. الملفات المتوفرة: {list(files.keys())}")
-
-    return all_trades
 
 
 # ---------------------------------------------------------------- الحسابات
+def _num(v):
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def get_pnl(trade):
-    """يرجع الربح/الخسارة الصافية للصفقة كنسبة مئوية، أو None لو الحقل غير موجود."""
+    """يرجع (الربح/الخسارة الصافية بالمئة، طريقة الحساب) أو (None, None)."""
     for key in PNL_KEYS:
-        val = trade.get(key)
-        if val is None:
-            continue
-        try:
-            return float(val)
-        except (TypeError, ValueError):
-            continue
-    return None
+        val = _num(trade.get(key))
+        if val is not None:
+            return val, f"field:{key}"
+
+    entry = next((v for v in (_num(trade.get(k)) for k in ENTRY_KEYS) if v), None)
+    exit_ = next((v for v in (_num(trade.get(k)) for k in EXIT_KEYS) if v), None)
+    if entry and exit_ and entry > 0 and exit_ > 0:
+        return (exit_ / entry - 1) * 100 - TRADING_FEE_PCT, "computed"
+
+    return None, None
 
 
 def analyze(group):
-    pnls, missing = [], 0
+    pnls, missing, how = [], 0, {}
     for t in group:
-        p = get_pnl(t)
+        p, h = get_pnl(t)
         if p is None:
             missing += 1
         else:
             pnls.append(p)
+            how[h] = how.get(h, 0) + 1
 
     n = len(pnls)
-    res = {"total": len(group), "n": n, "missing": missing}
+    res = {"total": len(group), "n": n, "missing": missing, "how": how}
     if n == 0:
         return res
 
@@ -187,10 +210,13 @@ def print_block(title, group):
     print("=" * 70)
 
     if r["missing"]:
-        print(f"⚠️ {r['missing']} صفقة بدون حقل ربح/خسارة (استُبعدت من الحساب)")
+        print(f"⚠️ {r['missing']} صفقة بدون بيانات ربح/خسارة (استُبعدت من الحساب)")
     if r["n"] == 0:
         print("لا توجد بيانات ربح/خسارة قابلة للحساب.")
         return r
+
+    if r["how"].get("computed"):
+        print(f"ℹ️ {r['how']['computed']} صفقة حُسب ربحها من سعر الدخول والخروج ناقص رسوم {TRADING_FEE_PCT}%")
 
     if r["wins"]:
         print(f"  رابحة : {r['wins']} صفقة | متوسط الربح في الصفقة الرابحة   : {r['avg_win']:+.2f}%")
@@ -214,10 +240,35 @@ def print_block(title, group):
     return r
 
 
+def print_diagnostics(trades):
+    """يطبع عيّنة سجل لكل نوع فيه صفقات بلا بيانات ربح، لمعرفة أسماء الحقول الفعلية."""
+    printed_header = False
+    for ttype, label in TYPES:
+        sample = next((t for t in trades if t.get("type") == ttype and get_pnl(t)[0] is None), None)
+        if sample is None:
+            continue
+        if not printed_header:
+            print("\n" + "=" * 70)
+            print("🔧 تشخيص: صفقات بلا بيانات ربح/خسارة — عيّنة سجل لكل نوع")
+            print("(انسخ هذا الجزء وأرسله لتحديد اسم الحقل الصحيح)")
+            print("=" * 70)
+            printed_header = True
+        txt = json.dumps(sample, ensure_ascii=False)
+        if len(txt) > 900:
+            txt = txt[:900] + " …"
+        print(f"\n{label}:\n{txt}")
+
+
 def main():
-    trades = load_trades()
+    trades, source, notes = load_trades()
     if not isinstance(trades, list):
         sys.exit("خطأ: الملف لا يحتوي على قائمة صفقات كما هو متوقع.")
+
+    print(f"📥 مصدر البيانات: {source}")
+    for n in notes:
+        print(f"   - {n}")
+    counts = " | ".join(f"{lbl} {sum(1 for t in trades if t.get('type') == k)}" for k, lbl in TYPES)
+    print(f"   إجمالي المحمَّل: {len(trades)} صفقة ({counts})")
 
     results = []
     for ttype, label in TYPES:
@@ -236,7 +287,9 @@ def main():
         else:
             print(f"  {label}: {r['n']} صفقة | صافي/صفقة {r['mean']:+.2f}% | {short_verdict(r)}")
 
-    print("\nملاحظة: الأرقام مبنية على الصفقات المغلقة فقط، وعلى الحقل net_pnl_pct.")
+    print_diagnostics(trades)
+
+    print("\nملاحظة: الأرقام مبنية على الصفقات المغلقة فقط.")
     print("الهامش الإحصائي تقريبي، والأهم أن تتراكم صفقات أكثر وعلى ظروف سوق مختلفة.")
 
 
