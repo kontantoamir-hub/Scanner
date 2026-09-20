@@ -77,8 +77,8 @@ EXTENSION_ATR_THRESHOLD = float(os.environ.get("EXTENSION_ATR_THRESHOLD", "3.0")
 SQUEEZE_LOOKBACK = 20           # عدد الشموع لحساب متوسط عرض نطاق Bollinger
 SQUEEZE_RATIO_THRESHOLD = 0.6   # عرض النطاق الحالي <= هذه النسبة من المتوسط -> يُعتبر انضغاطًا
 ACCUM_WINDOW = 20               # عدد الشموع لقياس التراكم الصامت
-ACCUM_PRICE_MAX_MOVE_PCT = 2.0  # (كان 4.0) أقصى تحرك سعري% خلال النافذة كي يُعتبر السعر "شبه ثابت"
-ACCUM_FLOW_RATIO_MIN = 0.5      # (كان 0.3) أدنى نسبة صافي تدفق شراء (OBV/حجم) كي يُعتبر تراكمًا واضحًا
+ACCUM_PRICE_MAX_MOVE_PCT = 4.0  # (كان 4.0) أقصى تحرك سعري% خلال النافذة كي يُعتبر السعر "شبه ثابت"
+ACCUM_FLOW_RATIO_MIN = 0.3      # (كان 0.3) أدنى نسبة صافي تدفق شراء (OBV/حجم) كي يُعتبر تراكمًا واضحًا
 
 # ---------- إعدادات إشارة الانفجار (Breakout) ----------
 BREAKOUT_LOOKBACK = 10          # عدد الشموع للبحث فيها عن أعلى قمة سابقة قبل الاختراق
