@@ -32,8 +32,8 @@ PAPER_TIME_STOP_HOURS = float(os.environ.get("PAPER_TIME_STOP_HOURS", "96"))
 # ---------------- بوت Telegram الخاص بالمحفظة الوهمية (منفصل كليًا عن بوت السكانر) ----------------
 # يمكن تجاوزهما عبر متغيرات بيئة PAPER_TELEGRAM_TOKEN / PAPER_TELEGRAM_CHAT_ID (GitHub Secrets)،
 # والقيم هنا هي القيم التي أُنشئ بها البوت الجديد عبر BotFather.
-PAPER_TELEGRAM_TOKEN = os.environ.get("PAPER_TELEGRAM_TOKEN", "8819201723:AAHR8TXjCQf03BRt3P9lO2lAfLZhDOUJ7Jg")
-PAPER_TELEGRAM_CHAT_ID = os.environ.get("PAPER_TELEGRAM_CHAT_ID", "1721516963")
+PAPER_TELEGRAM_TOKEN = os.environ.get("PAPER_TELEGRAM_TOKEN", "")
+PAPER_TELEGRAM_CHAT_ID = os.environ.get("PAPER_TELEGRAM_CHAT_ID", "")
 
 # ---------------- Gist الخاص بالمحفظة الوهمية (منفصل كليًا عن Gist السكانر) ----------------
 # GIST_TOKEN نفسه المستخدم في السكانر (توكن GitHub الشخصي بصلاحية gist) يُعاد استخدامه هنا
