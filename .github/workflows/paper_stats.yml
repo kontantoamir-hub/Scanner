@@ -1,0 +1,35 @@
+name: Paper Trading Stats
+
+on:
+  workflow_dispatch:
+    inputs:
+      since:
+        description: "اختياري: فقط الصفقات المغلقة بعد هذا الوقت (YYYY-MM-DD HH:MM:SS) — مثلاً لحظة الـ Reset"
+        required: false
+        default: ""
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run paper stats
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          PAPER_TELEGRAM_TOKEN: ${{ secrets.PAPER_TELEGRAM_TOKEN }}
+          PAPER_TELEGRAM_CHAT_ID: ${{ secrets.PAPER_TELEGRAM_CHAT_ID }}
+          SINCE: ${{ github.event.inputs.since }}
+        run: |
+          if [ -n "$SINCE" ]; then
+            python paper_stats.py --since "$SINCE"
+          else
+            python paper_stats.py
+          fi
