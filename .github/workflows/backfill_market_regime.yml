@@ -1,0 +1,42 @@
+name: Backfill Market Regime
+
+# تشغيل يدوي فقط (زر "Run workflow" بتبويب Actions) — بدون أي جدولة تلقائية،
+# لأن هذا السكريبت "لمرة واحدة" (أو عند الحاجة لاحقًا)، وليس مهمة دورية مثل scanner.py
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "تشغيل تجريبي (dry-run) بدون حفظ أي تعديل فعلي على Gist"
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      # نفس متغيرات البيئة المستخدمة في scanner.py -- backfill_market_regime.py يستوردها
+      # كموديول (import scanner) فيحتاج نفس القيم المطابقة لضمان أنه يحسب market_regime
+      # بنفس الإطار الزمني (INTERVAL) اللي scanner.py الفعلي يستخدمه
+      - name: Run backfill
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          SCAN_INTERVAL: ${{ vars.SCAN_INTERVAL || '1h' }}
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            python3 backfill_market_regime.py --dry-run
+          else
+            python3 backfill_market_regime.py
+          fi
