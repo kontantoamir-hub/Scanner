@@ -1,0 +1,43 @@
+name: MOJA Funded Simulator
+
+on:
+  workflow_dispatch:
+    inputs:
+      account_size:
+        description: "حجم الحساب الممول ($)"
+        required: false
+        default: "5000"
+      risk_pct:
+        description: "نسبة المخاطرة لكل صفقة (%)"
+        required: false
+        default: "1.0"
+      signal_type:
+        description: "نوع الإشارة (all / رسمية / مبكرة / انفجار / تجريبية)"
+        required: false
+        default: "all"
+
+jobs:
+  simulate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run simulation
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          ARCHIVE_GIST_ID: ${{ secrets.ARCHIVE_GIST_ID }}
+        run: |
+          python3 moja_funded_simulator.py \
+            --account "${{ github.event.inputs.account_size }}" \
+            --risk "${{ github.event.inputs.risk_pct }}" \
+            --signal-type "${{ github.event.inputs.signal_type }}"
