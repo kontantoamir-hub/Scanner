@@ -33,7 +33,8 @@ pnl_report.py الحالي عندك — أبدًا الـ journal النشط ل�
     export GIST_TOKEN=xxxx
     export GIST_ID=xxxx                 # الـ Gist الرئيسي (نفس متغيرات scanner.py)
     export ARCHIVE_GIST_ID=xxxx         # (اختياري) لو الأرشيف بجست منفصل معروف
-    python3 moja_funded_simulator.py --account 5000 --risk 1.0 --signal-type all
+    python3 moja_funded_simulator.py --account 5000 --risk 1.0 --signal-type all \
+        --from-date 2026-09-17
 """
 
 import os
@@ -218,7 +219,8 @@ def get_trade_datetime(trade):
         return None
 
 
-def simulate(trades, account_size, risk_pct, signal_type_filter):
+def simulate(trades, account_size, risk_pct, signal_type_filter,
+             from_date=None, to_date=None):
     # فلترة نوع الإشارة إذا طُلب (officielle/رسمية/precoce/breakout/experimental/all)
     if signal_type_filter and signal_type_filter != "all":
         trades = [t for t in trades
@@ -229,6 +231,11 @@ def simulate(trades, account_size, risk_pct, signal_type_filter):
     dated = [(get_trade_datetime(t), t) for t in trades]
     dated = [d for d in dated if d[0] is not None]
     dated.sort(key=lambda x: x[0])
+
+    if from_date is not None:
+        dated = [d for d in dated if d[0].date() >= from_date]
+    if to_date is not None:
+        dated = [d for d in dated if d[0].date() <= to_date]
 
     if not dated:
         print("لا توجد صفقات صالحة (تحقق من أسماء الحقول entry_price/exit_price/"
@@ -245,8 +252,11 @@ def simulate(trades, account_size, risk_pct, signal_type_filter):
     peak_balance = account_size
 
     print("\n" + "=" * 70)
+    period_str = ""
+    if from_date or to_date:
+        period_str = f" | من {from_date or 'البداية'} إلى {to_date or 'اليوم'}"
     print(f"محاكاة تحدي MOJA Funded — حساب ${account_size:,.0f} | "
-          f"مخاطرة/صفقة: {risk_pct}% | نوع الإشارة: {signal_type_filter or 'all'}")
+          f"مخاطرة/صفقة: {risk_pct}% | نوع الإشارة: {signal_type_filter or 'all'}{period_str}")
     print("=" * 70)
 
     for dt, trade in dated:
@@ -320,10 +330,32 @@ def main():
     parser.add_argument("--signal-type", type=str, default="all",
                          help="فلترة حسب نوع الإشارة: all / رسمية / مبكرة / انفجار / تجريبية "
                               "(استخدم القيمة كما هي مخزّنة في حقل signal_type عندك)")
+    parser.add_argument("--from-date", type=str, default=None,
+                         help="بداية المحاكاة بصيغة YYYY-MM-DD (مثال: 2026-09-17)")
+    parser.add_argument("--to-date", type=str, default=None,
+                         help="نهاية المحاكاة بصيغة YYYY-MM-DD (اختياري)")
     args = parser.parse_args()
 
+    from_date = None
+    to_date = None
+    if args.from_date:
+        try:
+            from_date = datetime.strptime(args.from_date, "%Y-%m-%d").date()
+        except ValueError:
+            print(f"خطأ: --from-date يجب أن يكون بصيغة YYYY-MM-DD (استلمت: {args.from_date})",
+                  file=sys.stderr)
+            sys.exit(1)
+    if args.to_date:
+        try:
+            to_date = datetime.strptime(args.to_date, "%Y-%m-%d").date()
+        except ValueError:
+            print(f"خطأ: --to-date يجب أن يكون بصيغة YYYY-MM-DD (استلمت: {args.to_date})",
+                  file=sys.stderr)
+            sys.exit(1)
+
     trades = load_full_trade_archive()
-    simulate(trades, args.account, args.risk, args.signal_type)
+    simulate(trades, args.account, args.risk, args.signal_type,
+              from_date=from_date, to_date=to_date)
 
 
 if __name__ == "__main__":
