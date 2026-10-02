@@ -557,6 +557,9 @@ def per_trade_line(t):
 def build_messages(trades, open_count=None):
     """يرجع قائمة رسائل (كل قسم رسالة مستقلة) لتُطبع وتُرسل بالترتيب."""
     valid = [t for t in trades if t.get("type") in TYPE_KEYS]
+    skipped = [t for t in trades if t.get("type") not in TYPE_KEYS]
+    print(f"🔎 loaded={len(trades)} | valid={len(valid)} | skipped(type)={len(skipped)}")
+    print("   أنواع مستبعدة:", {str(t.get('type')) for t in skipped})
     if not valid:
         msg = "لا توجد صفقات مغلقة بعد في السجل."
         if open_count is not None:
