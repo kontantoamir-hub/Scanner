@@ -22,4 +22,4 @@ jobs:
           GIST_ID: ${{ secrets.GIST_ID }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python trade_stats.py
+        run: run: python trade_stats.py --history
