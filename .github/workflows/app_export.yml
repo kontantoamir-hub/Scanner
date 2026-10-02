@@ -1,0 +1,37 @@
+name: Export App Data
+
+on:
+  schedule:
+    # 8 مرات في الساعة، بعد كل scan (GitHub في 4/19/34/49 و cron-job.org في 11/26/41/56)
+    - cron: '0,8,15,23,30,38,45,53 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: app-export
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install requests
+      - name: Export app data
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          PAPER_GIST_ID: ${{ secrets.PAPER_GIST_ID }}
+          PAPER_GIST_TOKEN: ${{ secrets.PAPER_GIST_TOKEN }}
+          APP_SIM_SINCE: ${{ vars.APP_SIM_SINCE }}
+        run: python export_app_data.py
