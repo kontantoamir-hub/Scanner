@@ -21,6 +21,9 @@ trade_stats.py  (نسخة موحّدة)
     BREAKEVEN_BAND_PCT                 نطاق التعادل حول الصفر، افتراضي 0.1
     MIN_TRADES_FOR_VERDICT             أقل عدد صفقات لإصدار حكم، افتراضي 30
     ALLOW_PARTIAL                      لو 1: يكمل حتى لو فشل جلب Gist أرشيف (افتراضي 0 = يتوقف)
+    HISTORY_MAX                        عدد التعديلات المفحوصة في وضع --history (افتراضي 60)
+
+وضع فحص التاريخ:  python trade_stats.py --history  (يطبع عدد الصفقات في كل تعديل للـ Gist)
 """
 
 import os
@@ -646,7 +649,83 @@ def send_telegram(messages):
                 print("تعذّر إرسال التقرير عبر تيليجرام:", e)
 
 
+# ---------------------------------------------------------------- فحص تاريخ التعديلات (--history)
+HISTORY_MAX = int(os.environ.get("HISTORY_MAX", "60"))
+
+
+def _list_commits(gist_id):
+    """آخر HISTORY_MAX تعديل للـ Gist (الأحدث أولًا)."""
+    out, page = [], 1
+    while len(out) < HISTORY_MAX:
+        r = requests.get(f"https://api.github.com/gists/{gist_id}/commits",
+                         headers=_headers(), params={"per_page": 100, "page": page}, timeout=30)
+        r.raise_for_status()
+        chunk = r.json()
+        if not chunk:
+            break
+        out.extend(chunk)
+        if len(chunk) < 100:
+            break
+        page += 1
+    return out[:HISTORY_MAX]
+
+
+def _count_trades_in(files):
+    counts = {}
+    for name, entry in files.items():
+        if name == CLOSED_GIST_FILE or name.startswith(ARCHIVE_PREFIX):
+            try:
+                counts[name] = len(_read_json_file(entry, name))
+            except Exception:
+                counts[name] = None
+    return counts
+
+
+def history_report():
+    """يمرّ على تعديلات الـ Gist الرئيسي وGists الأرشيف، ويطبع عدد الصفقات في كل تعديل،
+    ويعلّم ⚠️ أي تعديل نقص فيه العدد عن التعديل الذي قبله."""
+    if not GIST_TOKEN or not GIST_ID:
+        sys.exit("❌ GIST_TOKEN أو GIST_ID غير موجودين في متغيرات البيئة.")
+
+    main_files = _fetch_gist_files(GIST_ID)
+    ids = [GIST_ID] + [g for g in _find_archive_gist_ids(main_files) if g != GIST_ID]
+    print(f"🕓 فحص تاريخ التعديلات (آخر {HISTORY_MAX} تعديل لكل Gist)\n")
+
+    for gid in ids:
+        label = "الرئيسي" if gid == GIST_ID else f"أرشيف {gid[:8]}…"
+        try:
+            commits = _list_commits(gid)
+        except Exception as e:
+            print(f"[{label}] تعذّر جلب التعديلات: {e}\n")
+            continue
+        commits.reverse()  # الأقدم أولًا
+        print(f"═══ [{label}] — {len(commits)} تعديل ═══")
+        prev_total = None
+        for c in commits:
+            ver = c.get("version", "")
+            when = (c.get("committed_at") or "")[:19].replace("T", " ")
+            try:
+                r = requests.get(f"https://api.github.com/gists/{gid}/{ver}",
+                                 headers=_headers(), timeout=30)
+                r.raise_for_status()
+                counts = _count_trades_in(r.json().get("files", {}))
+            except Exception as e:
+                print(f"{when} | {ver[:7]} | تعذّر القراءة: {e}")
+                continue
+            total = sum(v for v in counts.values() if v is not None)
+            delta = "" if prev_total is None else f"{total - prev_total:+d}"
+            flag = " ⚠️ نقص" if prev_total is not None and total < prev_total else ""
+            detail = ", ".join(f"{k.replace(ARCHIVE_PREFIX, 'archive_')}={v}" for k, v in counts.items())
+            print(f"{when} | {ver[:7]} | الإجمالي {total} {delta}{flag} | {detail}")
+            prev_total = total
+        print()
+
+
 def main():
+    if "--history" in sys.argv:
+        history_report()
+        return
+
     trades, notes = load_closed_trades()
     open_positions = load_open_positions()
 
