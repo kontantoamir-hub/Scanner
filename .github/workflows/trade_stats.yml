@@ -1,7 +1,12 @@
 name: Trade Stats Report
 
 on:
-  workflow_dispatch: {}   # تشغيل يدوي فقط: من تبويب Actions -> Trade Stats Report -> Run workflow
+  workflow_dispatch:   # تشغيل يدوي فقط: من تبويب Actions -> Trade Stats Report -> Run workflow
+    inputs:
+      history:
+        description: "فحص تاريخ تعديلات الـ Gist (عدد الصفقات في كل تعديل) بدل التقرير العادي"
+        type: boolean
+        default: false
 
 jobs:
   report:
@@ -22,4 +27,9 @@ jobs:
           GIST_ID: ${{ secrets.GIST_ID }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: run: python trade_stats.py
+        run: |
+          if [ "${{ github.event.inputs.history }}" = "true" ]; then
+            python trade_stats.py --history
+          else
+            python trade_stats.py
+          fi
