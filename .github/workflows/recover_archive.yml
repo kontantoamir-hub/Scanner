@@ -1,0 +1,33 @@
+name: Recover Archive Trades
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "فعّلها لكتابة الصفقات المسترجعة في الأرشيف (بدونها: تجربة فقط)"
+        type: boolean
+        default: false
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: تثبيت المتطلبات
+        run: pip install requests
+
+      - name: استرجاع الصفقات الضائعة
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+        run: |
+          if [ "${{ github.event.inputs.apply }}" = "true" ]; then
+            python recover_archive.py --apply
+          else
+            python recover_archive.py
+          fi
