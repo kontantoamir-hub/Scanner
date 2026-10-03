@@ -1,0 +1,878 @@
+"""
+paper_trading.py — محفظة وهمية حقيقية (Paper Trading)
+========================================================
+منفصل بالكامل عن scanner.py: Gist خاص به + بوت Telegram خاص به، ولا يخزّن أي
+شيء في Gist السكانر الأصلي. الملف الوحيد الذي يربطه بالسكانر هو استدعاء
+الدالة run_cycle() من داخل scanner.py عند كل دورة فحص (لأن الإشارات الأربعة
+—رسمية/مبكرة/انفجار/تجريبية— تُولَّد هناك فقط ولا يوجد مكان آخر يلتقطها).
+
+المنطق:
+- رأس مال وهمي ثابت = PAPER_CAPITAL (افتراضيًا 400$)
+- حجم كل صفقة ثابت = PAPER_CAPITAL / PAPER_MAX_POSITIONS (افتراضيًا 400/8 = 50$)
+- حد أقصى PAPER_MAX_POSITIONS صفقة مفتوحة في نفس الوقت (افتراضيًا 8)
+- لو الرصيد المتاح < حجم الصفقة، أو عدد الصفقات المفتوحة وصل الحد الأقصى
+  → الإشارة تُتفوّت بدون تنفيذ وهمي (نفس منطق التداول الحقيقي تمامًا)
+- يدخل في كل الأنواع الأربعة (رسمية/مبكرة/انفجار/تجريبية) بدون استثناء
+- الرصيد يتحرك فعليًا: يُخصم عند الفتح ويُعاد (+ الربح/الخسارة الصافية بعد
+  عمولة التداول) عند الإغلاق — وليس مجرد تقرير نهائي
+
+المحافظ الفرعية (Sub-portfolios) — تحديث:
+- بجانب المحفظة الرئيسية أعلاه (تبقى كما هي بالضبط: تتداول كل الإشارات وترسل تيليجرام)،
+  توجد 4 محافظ وهمية مستقلة، واحدة لكل نوع إشارة (official/early/breakout/experimental)،
+  رأس مال كل واحدة SUB_CAPITAL (افتراضيًا 400$).
+- كل إشارة من نوع معيّن تُحسب كصفقة داخل محفظة نوعها فقط، وعند إغلاقها يُحسب الربح/الخسارة
+  من رصيد تلك المحفظة. المحافظ الفرعية لا ترسل أي شيء لتيليجرام (حساب داخلي فقط).
+- كل محفظة فرعية مستقلة تمامًا عن الرئيسية وعن بعضها: امتلاء الرئيسية أو محفظة نوع آخر
+  لا يمنع فتح صفقة في محفظة النوع (لذلك مقارنتها أنظف لجودة كل نوع).
+- الحالة تُحفظ في ملف جديد واحد (paper_sub_portfolios.json) داخل نفس Gist المحفظة،
+  والصفقات المغلقة تدخل نفس السجل النشط/الأرشيف مع الحقل "portfolio" (مثل "sub_early")؛
+  الصفقات بدون هذا الحقل = المحفظة الرئيسية (توافق كامل مع الأرشيف القديم).
+- لا حاجة لأي تعديل في scanner.py: توقيعات load_context / get_open_symbols / run_cycle كما هي.
+"""
+
+import os
+import time
+import json
+import requests
+
+# ---------------- إعدادات عامة ----------------
+PAPER_CAPITAL = float(os.environ.get("PAPER_CAPITAL", "400"))
+PAPER_MAX_POSITIONS = int(os.environ.get("PAPER_MAX_POSITIONS", "8"))
+PAPER_POSITION_SIZE = round(PAPER_CAPITAL / PAPER_MAX_POSITIONS, 8)
+PAPER_TRADING_FEE_PCT = float(os.environ.get("PAPER_TRADING_FEE_PCT", "0.2"))  # عمولة الدخول+الخروج مجتمعة
+PAPER_TIME_STOP_HOURS = float(os.environ.get("PAPER_TIME_STOP_HOURS", "96"))
+
+# ---------------- المحافظ الفرعية (واحدة لكل نوع إشارة) ----------------
+SIGNAL_TYPES = ("official", "early", "breakout", "experimental")
+SUB_ENABLED = os.environ.get("PAPER_SUB_ENABLED", "1") == "1"
+SUB_CAPITAL = float(os.environ.get("PAPER_SUB_CAPITAL", "400"))
+# نفس منطق المحفظة الرئيسية افتراضيًا: 8 شرائح × 50$. يمكن تغييره بمتغيرات البيئة.
+SUB_MAX_POSITIONS = int(os.environ.get("PAPER_SUB_MAX_POSITIONS", str(PAPER_MAX_POSITIONS)))
+SUB_POSITION_SIZE = round(SUB_CAPITAL / SUB_MAX_POSITIONS, 8)
+SUB_STATE_FILE = "paper_sub_portfolios.json"   # {type: {"balance": {...}, "positions": [...]}}
+
+# ---------------- بوت Telegram الخاص بالمحفظة الوهمية (منفصل كليًا عن بوت السكانر) ----------------
+# يمكن تجاوزهما عبر متغيرات بيئة PAPER_TELEGRAM_TOKEN / PAPER_TELEGRAM_CHAT_ID (GitHub Secrets)،
+# والقيم هنا هي القيم التي أُنشئ بها البوت الجديد عبر BotFather.
+PAPER_TELEGRAM_TOKEN = os.environ.get("PAPER_TELEGRAM_TOKEN", "")
+PAPER_TELEGRAM_CHAT_ID = os.environ.get("PAPER_TELEGRAM_CHAT_ID", "")
+
+# ---------------- Gist الخاص بالمحفظة الوهمية (منفصل كليًا عن Gist السكانر) ----------------
+# GIST_TOKEN نفسه المستخدم في السكانر (توكن GitHub الشخصي بصلاحية gist) يُعاد استخدامه هنا
+# تلقائيًا لأنه ينتمي لنفس الحساب ويملك صلاحية الكتابة على أي Gist خاص به — لا داعي لتوكن جديد،
+# فقط PAPER_GIST_ID مختلف. يمكن التجاوز عبر PAPER_GIST_TOKEN لو احتجت توكن مختلف لاحقًا.
+PAPER_GIST_TOKEN = os.environ.get("PAPER_GIST_TOKEN") or os.environ.get("GIST_TOKEN")
+PAPER_GIST_ID = os.environ.get("PAPER_GIST_ID", "af82b35a4fde92f671d596bc6c18f4f2")
+
+BALANCE_FILE = "paper_balance.json"
+POSITIONS_FILE = "paper_positions.json"
+CLOSED_FILE = "paper_closed_trades.json"          # السجل النشط: أحدث الصفقات فقط (قراءة سريعة)
+ACTIVE_HISTORY_SIZE = 150  # عدد الصفقات المغلقة بالسجل النشط قبل ترحيل الأقدم للأرشيف (مثل السكانر الأصلي)
+
+# ---------------- أرشيف الصفقات المغلقة (نفس منطق scanner.py بالضبط) ----------------
+# بدل حذف الصفقات الأقدم من ACTIVE_HISTORY_SIZE نهائيًا، تُرحَّل لملفات أرشيف مرقّمة
+# داخل Gist أرشيف مخصص (يبدأ بنفس الـGist الرئيسي، وينتقل تلقائيًا لـGist أرشيف جديد
+# عند الاقتراب من حد GitHub الفعلي 300 ملف/Gist) — لا يُفقد أي شيء أبدًا.
+ARCHIVE_PREFIX = "paper_closed_trades_archive_"    # بادئة ملفات الأرشيف المرقّمة
+ARCHIVE_CHUNK_SIZE = 150                           # حد أقصى للصفقات بكل ملف أرشيف
+ARCHIVE_CHAIN_FILE = "paper_archive_gists_chain.json"  # بالـGist الرئيسي: سلسلة معرّفات Gists الأرشيف (الأخير = النشط للكتابة)
+ARCHIVE_INDEX_FILE = "paper_archive_index.json"    # فهرس صغير: أي Gist أرشيف آخر تحديث له
+MAX_ARCHIVE_FILES_BEFORE_ROTATE = 280              # هامش أمان قبل حد GitHub (300 ملف/Gist)
+
+
+class GistFetchError(Exception):
+    pass
+
+
+class GistContentError(Exception):
+    """يُرفع عند تعذّر قراءة ملف JSON من Gist قراءة كاملة وسليمة — بدل اعتباره فارغًا
+    (وكتابة فوقه = فقدان صفقات)."""
+    pass
+
+
+# ---------------- Gist helpers (نسخة مستقلة، تستهدف PAPER_GIST_ID فقط) ----------------
+
+def _gist_headers():
+    return {"Authorization": f"token {PAPER_GIST_TOKEN}", "Accept": "application/vnd.github+json"}
+
+
+def _gist_get_all_files():
+    if not PAPER_GIST_TOKEN or not PAPER_GIST_ID:
+        print("⚠️ [محفظة وهمية] PAPER_GIST_TOKEN أو PAPER_GIST_ID غير موجودين — تخطي هذه الدورة.")
+        return {}
+    try:
+        r = requests.get(f"https://api.github.com/gists/{PAPER_GIST_ID}", headers=_gist_headers(), timeout=15)
+        r.raise_for_status()
+        return r.json().get("files", {})
+    except Exception as e:
+        raise GistFetchError(f"تعذّر قراءة ملفات Gist المحفظة الوهمية: {e}") from e
+
+
+def _gist_get_file(filename, gist_files):
+    f = gist_files.get(filename)
+    return f["content"] if f else None
+
+
+def _read_json_list(entry, name=""):
+    """يقرأ ملف JSON (قائمة) من بيانات ملف Gist بأمان: لو المحتوى مقتطع أو تالف يعيد
+    القراءة من raw_url، ولو فشل يرفع GistContentError ولا يرجع [] أبدًا."""
+    def _parse(text):
+        data = json.loads(text or "[]")
+        if not isinstance(data, list):
+            raise ValueError("المحتوى ليس قائمة")
+        return data
+
+    content = entry.get("content")
+    size = entry.get("size") or 0
+    if not entry.get("truncated") and (content or size <= 2):
+        try:
+            return _parse(content)
+        except Exception:
+            pass
+    raw_url = entry.get("raw_url")
+    if not raw_url:
+        raise GistContentError(f"{name}: المحتوى مقتطع/غير صالح ولا يوجد raw_url")
+    try:
+        r = requests.get(raw_url, headers=_gist_headers(), timeout=30)
+        r.raise_for_status()
+        r.encoding = "utf-8"
+        return _parse(r.text)
+    except Exception as e:
+        raise GistContentError(f"{name}: فشلت القراءة الكاملة من raw_url: {e}") from e
+
+
+def _gist_get_all_files_for(gist_id):
+    """مثل _gist_get_all_files لكن لأي معرف Gist — يُستخدم لقراءة ملفات Gist أرشيف
+    منفصل لو كان مختلفًا عن الـGist الرئيسي (PAPER_GIST_ID)."""
+    if not PAPER_GIST_TOKEN or not gist_id:
+        return {}
+    try:
+        r = requests.get(f"https://api.github.com/gists/{gist_id}", headers=_gist_headers(), timeout=15)
+        r.raise_for_status()
+        return r.json().get("files", {})
+    except Exception as e:
+        raise GistFetchError(f"تعذّر قراءة ملفات Gist أرشيف المحفظة الوهمية {gist_id}: {e}") from e
+
+
+def _create_new_gist(description="Paper Trading - أرشيف صفقات وهمية إضافي"):
+    """ينشئ Gist خاص جديد (يبدأ بملف README بسيط) ويرجع معرفه — يُستخدم عند تدوير الأرشيف."""
+    payload = {
+        "description": description,
+        "public": False,
+        "files": {"README.md": {"content": "أرشيف صفقات مغلقة للمحفظة الوهمية — يُدار تلقائيًا، لا تعدّل يدويًا."}},
+    }
+    r = requests.post("https://api.github.com/gists", headers=_gist_headers(), json=payload, timeout=20)
+    r.raise_for_status()
+    return r.json()["id"]
+
+
+def get_active_archive_gist(main_gist_files):
+    """يرجع (معرف Gist الأرشيف النشط حاليًا للكتابة، سلسلة الـGists، ملفاته الحالية).
+    ينشئ Gist أرشيف جديد تلقائيًا لو عدد ملفات الأرشيف بالنشط الحالي يقارب حد GitHub
+    الفعلي (300 ملف/Gist) — بنفس منطق get_active_archive_gist في scanner.py."""
+    try:
+        chain_raw = _gist_get_file(ARCHIVE_CHAIN_FILE, main_gist_files)
+        chain = json.loads(chain_raw) if chain_raw else []
+    except Exception:
+        chain = []
+
+    if not chain:
+        new_id = _create_new_gist()
+        return new_id, [new_id], {}
+
+    active_id = chain[-1]
+    active_files = main_gist_files if active_id == PAPER_GIST_ID else _gist_get_all_files_for(active_id)
+
+    archive_count = sum(1 for fn in active_files if fn.startswith(ARCHIVE_PREFIX))
+    if archive_count >= MAX_ARCHIVE_FILES_BEFORE_ROTATE:
+        new_id = _create_new_gist()
+        chain.append(new_id)
+        return new_id, chain, {}
+
+    return active_id, chain, active_files
+
+
+def archive_overflow(overflow_trades, main_gist_files):
+    """يوزّع الصفقات القديمة الفائضة على ملفات أرشيف مرقّمة داخل Gist أرشيف نشط —
+    نفس منطق archive_overflow في scanner.py بالضبط. يرجع: (معرف Gist الأرشيف
+    المستهدف, ملفات الأرشيف المطلوب كتابتها, ملفات إضافية للـGist الرئيسي
+    [سلسلة الـGists + الفهرس] إن تغيّرت)."""
+    main_updates = {}
+    if not overflow_trades:
+        return None, {}, main_updates
+
+    target_gist_id, chain, archive_files = get_active_archive_gist(main_gist_files)
+
+    try:
+        old_chain_raw = _gist_get_file(ARCHIVE_CHAIN_FILE, main_gist_files)
+        old_chain = json.loads(old_chain_raw) if old_chain_raw else []
+    except Exception:
+        old_chain = []
+    if chain != old_chain:
+        main_updates[ARCHIVE_CHAIN_FILE] = json.dumps(chain, ensure_ascii=False)
+
+    archive_names = sorted(fn for fn in archive_files if fn.startswith(ARCHIVE_PREFIX))
+    if archive_names:
+        last_name = archive_names[-1]
+        idx = int(last_name[len(ARCHIVE_PREFIX):].replace(".json", ""))
+        # لو فشلت القراءة السليمة يُرفع GistContentError (لا نعتبر الملف فارغًا ولا نكتب فوقه)
+        last_content = _read_json_list(archive_files[last_name], last_name)
+    else:
+        idx = 1
+        last_content = []
+
+    files_to_write = {}
+    remaining = list(overflow_trades)
+
+    space = ARCHIVE_CHUNK_SIZE - len(last_content)
+    if space > 0 and remaining:
+        last_content.extend(remaining[:space])
+        remaining = remaining[space:]
+        files_to_write[f"{ARCHIVE_PREFIX}{idx:04d}.json"] = json.dumps(
+            last_content, ensure_ascii=False, separators=(",", ":")
+        )
+
+    while remaining:
+        idx += 1
+        chunk = remaining[:ARCHIVE_CHUNK_SIZE]
+        remaining = remaining[ARCHIVE_CHUNK_SIZE:]
+        files_to_write[f"{ARCHIVE_PREFIX}{idx:04d}.json"] = json.dumps(
+            chunk, ensure_ascii=False, separators=(",", ":")
+        )
+
+    try:
+        index_raw = _gist_get_file(ARCHIVE_INDEX_FILE, main_gist_files)
+        index = json.loads(index_raw) if index_raw else {}
+    except Exception:
+        index = {}
+    index[target_gist_id] = {
+        "last_updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "archive_files_count": len(archive_names) + len(files_to_write)
+        - (1 if space > 0 and overflow_trades else 0),
+    }
+    main_updates[ARCHIVE_INDEX_FILE] = json.dumps(index, ensure_ascii=False)
+
+    return target_gist_id, files_to_write, main_updates
+
+
+def _gist_patch_files(files_dict, gist_id=None):
+    """يحفظ عدة ملفات دفعة واحدة داخل Gist معيّن (افتراضيًا PAPER_GIST_ID، أو أي
+    Gist أرشيف آخر لو مُرِّر gist_id صراحة — يُستخدم عند تدوير الأرشيف)."""
+    target_id = gist_id or PAPER_GIST_ID
+    if not PAPER_GIST_TOKEN or not target_id:
+        print("⚠️ [محفظة وهمية] لا يمكن الحفظ — التوكن أو معرف الـGist غير موجودين.")
+        return False
+    payload = {"files": {fn: {"content": content} for fn, content in files_dict.items()}}
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            r = requests.patch(
+                f"https://api.github.com/gists/{target_id}",
+                headers=_gist_headers(), json=payload, timeout=20,
+            )
+            if r.ok:
+                return True
+            if r.status_code == 429:
+                time.sleep(5 * attempt)
+                continue
+            last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+        except Exception as e:
+            last_err = str(e)
+        if attempt < 3:
+            time.sleep(2 * attempt)
+    print(f"❌ [محفظة وهمية] فشل الحفظ في Gist ({target_id}) نهائيًا: {last_err}")
+    return False
+
+
+# ---------------- تحميل/حفظ الحالة ----------------
+
+def load_balance(gist_files):
+    content = _gist_get_file(BALANCE_FILE, gist_files)
+    if content:
+        try:
+            data = json.loads(content)
+        except Exception as e:
+            # لا نعيد التهيئة برأس المال الكامل بصمت (يمسح الرصيد الحقيقي): نوقف الدورة.
+            raise GistContentError(f"{BALANCE_FILE} تالف: {e}") from e
+        if data:
+            return data
+    # أول تشغيل (أو ملف فارغ {}) → تهيئة برأس المال الكامل
+    return {
+        "initial_capital": PAPER_CAPITAL,
+        "available": PAPER_CAPITAL,
+        "realized_pnl_usd": 0.0,
+        "wins": 0,
+        "losses": 0,
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def load_positions(gist_files):
+    content = _gist_get_file(POSITIONS_FILE, gist_files)
+    if not content:
+        return []
+    try:
+        return json.loads(content) or []
+    except Exception as e:
+        # لا نعتبره فارغًا (سيُكتب فوقه لاحقًا فنفقد الصفقات المفتوحة): نوقف الدورة.
+        raise GistContentError(f"{POSITIONS_FILE} تالف: {e}") from e
+
+
+def _new_balance(capital):
+    return {
+        "initial_capital": capital,
+        "available": capital,
+        "realized_pnl_usd": 0.0,
+        "wins": 0,
+        "losses": 0,
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def load_sub_state(gist_files):
+    """يحمّل حالة المحافظ الفرعية الأربع. أي نوع ناقص/تالف يُهيّأ برأس ماله الكامل
+    (SUB_CAPITAL) — أول تشغيل بعد هذا التحديث يبدأ كل محفظة من 400$ نظيفة."""
+    raw = {}
+    content = _gist_get_file(SUB_STATE_FILE, gist_files)
+    if content:
+        try:
+            raw = json.loads(content) or {}
+        except Exception as e:
+            # لا نعيد تهيئة المحافظ الفرعية بصمت (يمسح أرصدتها): تُترك حالتها السابقة.
+            raise GistContentError(f"{SUB_STATE_FILE} تالف: {e}") from e
+    state = {}
+    for t in SIGNAL_TYPES:
+        entry = raw.get(t) or {}
+        balance = entry.get("balance") or _new_balance(SUB_CAPITAL)
+        positions = entry.get("positions") or []
+        state[t] = {"balance": balance, "positions": positions}
+    return state
+
+
+def _save_state(balance, positions, closed_now, gist_files, sub_state=None, sub_closed=None):
+    files = {
+        BALANCE_FILE: json.dumps(balance, ensure_ascii=False, separators=(",", ":")),
+        POSITIONS_FILE: json.dumps(positions, ensure_ascii=False, separators=(",", ":")),
+    }
+    if sub_state is not None:
+        files[SUB_STATE_FILE] = json.dumps(sub_state, ensure_ascii=False, separators=(",", ":"))
+    closed_all = list(closed_now) + list(sub_closed or [])
+    if closed_all:
+        entry = gist_files.get(CLOSED_FILE)
+        try:
+            history = _read_json_list(entry, CLOSED_FILE) if entry else []
+        except GistContentError as e:
+            # لا نكتب فوق السجل النشط ولا نحفظ شيئًا من هذه الدورة: الصفقات تبقى مفتوحة
+            # بالحالة المحفوظة وتُغلق حتميًا من نفس الشموع بالدورة القادمة (لا يضيع شيء).
+            print(f"❌ [محفظة وهمية] تعذّرت قراءة السجل النشط — أُلغي حفظ هذه الدورة كاملة: {e}")
+            return False
+        history.extend(closed_all)
+        full_history = history
+
+        # لو تجاوز السجل النشط الحد، تُرحَّل أقدم الصفقات لملفات الأرشيف بدل حذفها
+        # نهائيًا — بنفس منطق save_all_state في scanner.py بالضبط. لا يُفقد أي شيء،
+        # والسجل النشط (CLOSED_FILE) يبقى دائمًا صغيرًا وسريع القراءة.
+        if len(history) > ACTIVE_HISTORY_SIZE:
+            overflow = history[:-ACTIVE_HISTORY_SIZE]
+            history = history[-ACTIVE_HISTORY_SIZE:]
+            try:
+                archive_gist_id, archive_files, main_updates = archive_overflow(overflow, gist_files)
+            except Exception as e:
+                # فشل قراءة/إنشاء الأرشيف: لا نقتطع السجل النشط فلا تضيع صفقة، وتُعاد المحاولة لاحقًا
+                print(f"❌ [محفظة وهمية] تعذّر ترحيل الأرشيف هذه الدورة (لم يُفقد شيء): {e}")
+                history = full_history
+                archive_gist_id, archive_files, main_updates = None, {}, {}
+            files.update(main_updates)  # سلسلة الـGists + الفهرس، تُحفظ بالـGist الرئيسي
+            if archive_gist_id and archive_files:
+                if archive_gist_id == PAPER_GIST_ID:
+                    files.update(archive_files)  # نفس الـGist الرئيسي، تُدمج بحفظة واحدة
+                else:
+                    archived_ok = _gist_patch_files(archive_files, gist_id=archive_gist_id)
+                    if not archived_ok:
+                        # لو لم يُحفظ الأرشيف لا نقتطع السجل النشط (وإلا تضيع الصفقات الفائضة)
+                        print(f"❌ [محفظة وهمية] فشل حفظ ملفات الأرشيف بـGist منفصل ({archive_gist_id}) — "
+                              f"أُبقي الفائض بالسجل النشط")
+                        history = full_history
+
+        files[CLOSED_FILE] = json.dumps(history, ensure_ascii=False, separators=(",", ":"))
+    return _gist_patch_files(files)
+
+
+def load_full_closed_history():
+    """يجمع السجل النشط (paper_closed_trades.json) + كل ملفات الأرشيف (سواء داخل
+    نفس الـGist الرئيسي أو موزّعة على Gists أرشيف منفصلة عبر paper_archive_gists_chain.json)
+    في لقطة واحدة كاملة — لأي تقرير/سكربت مستقبلي على صفقات المحفظة الوهمية، حتى
+    لا يكتفي بالسجل النشط الأخير فقط (نفس القاعدة المتبعة مع صفقات البوت الحقيقي)."""
+    try:
+        main_files = _gist_get_all_files()
+    except GistFetchError as e:
+        raise SystemExit(f"❌ [محفظة وهمية] تعذّر جلب الـGist الرئيسي: {e}")
+
+    all_trades = []
+    try:
+        chain_raw = _gist_get_file(ARCHIVE_CHAIN_FILE, main_files)
+        chain = json.loads(chain_raw) if chain_raw else []
+    except Exception:
+        chain = []
+
+    seen_gist_ids = set()
+    for gist_id in chain:
+        if gist_id in seen_gist_ids:
+            continue
+        seen_gist_ids.add(gist_id)
+        try:
+            files = main_files if gist_id == PAPER_GIST_ID else _gist_get_all_files_for(gist_id)
+        except Exception as e:
+            print(f"⚠️ [محفظة وهمية] تعذّر جلب Gist الأرشيف {gist_id} ضمن السلسلة: {e} — قد تكون البيانات ناقصة.")
+            continue
+        for name in sorted(fn for fn in files if fn.startswith(ARCHIVE_PREFIX)):
+            try:
+                all_trades.extend(_read_json_list(files[name], name))
+            except Exception as e:
+                print(f"⚠️ [محفظة وهمية] تعذّرت قراءة ملف الأرشيف {name}: {e} — قد تكون البيانات ناقصة.")
+
+    if PAPER_GIST_ID not in seen_gist_ids:
+        for name in sorted(fn for fn in main_files if fn.startswith(ARCHIVE_PREFIX)):
+            try:
+                all_trades.extend(_read_json_list(main_files[name], name))
+            except Exception as e:
+                print(f"⚠️ [محفظة وهمية] تعذّرت قراءة ملف الأرشيف {name}: {e} — قد تكون البيانات ناقصة.")
+
+    try:
+        active_entry = main_files.get(CLOSED_FILE)
+        active = _read_json_list(active_entry, CLOSED_FILE) if active_entry else []
+    except Exception as e:
+        print(f"⚠️ [محفظة وهمية] تعذّرت قراءة السجل النشط: {e} — قد تكون البيانات ناقصة.")
+        active = []
+    all_trades.extend(active)
+    return all_trades
+
+
+# ---------------- Telegram (بوت منفصل خاص بالمحفظة الوهمية) ----------------
+
+def send_telegram(text, retries=2):
+    if not PAPER_TELEGRAM_TOKEN or not PAPER_TELEGRAM_CHAT_ID:
+        print("⚠️ [محفظة وهمية] PAPER_TELEGRAM_TOKEN/CHAT_ID غير موجودين — تخطي الإرسال.")
+        return None
+    url = f"https://api.telegram.org/bot{PAPER_TELEGRAM_TOKEN}/sendMessage"
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.post(url, data={"chat_id": PAPER_TELEGRAM_CHAT_ID, "text": text}, timeout=15)
+            if resp.ok:
+                return resp.json().get("result", {}).get("message_id")
+        except Exception as e:
+            print(f"[محفظة وهمية] خطأ إرسال تيليجرام (محاولة {attempt}): {e}")
+        if attempt < retries:
+            time.sleep(2)
+    return None
+
+
+def _escape_html(text):
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _edit_telegram_strike(message_id, original_text, result_text):
+    if not PAPER_TELEGRAM_TOKEN or not PAPER_TELEGRAM_CHAT_ID or not message_id:
+        return
+    new_text = f"<s>{_escape_html(original_text)}</s>\n\n{_escape_html(result_text)}"
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{PAPER_TELEGRAM_TOKEN}/editMessageText",
+            data={"chat_id": PAPER_TELEGRAM_CHAT_ID, "message_id": message_id,
+                  "text": new_text, "parse_mode": "HTML"},
+            timeout=15,
+        )
+    except Exception as e:
+        print(f"[محفظة وهمية] خطأ تعديل رسالة تيليجرام: {e}")
+
+
+# ---------------- أدوات مساعدة ----------------
+
+def _hours_since(opened_at_str):
+    try:
+        t = time.strptime(opened_at_str, "%Y-%m-%d %H:%M:%S")
+        return (time.time() - time.mktime(t)) / 3600
+    except Exception:
+        return 0
+
+
+def _parse_opened_epoch_ms(opened_at_str):
+    try:
+        t = time.strptime(opened_at_str, "%Y-%m-%d %H:%M:%S")
+        return int(time.mktime(t) * 1000)
+    except Exception:
+        return None
+
+
+def _format_duration(hours):
+    total_minutes = round(hours * 60)
+    days, rem = divmod(total_minutes, 24 * 60)
+    hrs, minutes = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days} يوم" if days > 1 else "يوم")
+    if hrs:
+        parts.append(f"{hrs} ساعة")
+    if not parts:
+        parts.append(f"{minutes} دقيقة")
+    return " و".join(parts)
+
+
+TYPE_LABELS = {
+    "official": "🟢 رسمية",
+    "early": "🟡 مبكرة",
+    "breakout": "🚀 انفجار",
+    "experimental": "🧪 تجريبية",
+}
+
+
+def _normalize_signal(r, sig_type):
+    """يستخرج entry/sl/tps/score من قاموس الإشارة r حسب نوعها — نفس الحقول التي
+    يستخدمها scanner.py في open_new_*_positions."""
+    if sig_type == "official":
+        entry, sl, tps, score = r.get("entry"), r.get("sl"), r.get("tps"), r.get("score")
+    elif sig_type == "early":
+        entry, sl, tps, score = r.get("early_entry"), r.get("early_sl"), r.get("early_tps"), r.get("score")
+    elif sig_type == "breakout":
+        entry, sl, tps, score = r.get("breakout_entry"), r.get("breakout_sl"), r.get("breakout_tps"), r.get("breakout_score")
+    elif sig_type == "experimental":
+        entry, sl, tps, score = r.get("experimental_entry"), r.get("experimental_sl"), r.get("experimental_tps"), r.get("experimental_score")
+    else:
+        return None
+    if entry is None or sl is None or not tps:
+        return None
+    return {"symbol": r["symbol"], "entry": entry, "sl": sl, "tps": tps, "score": score, "type": sig_type}
+
+
+# حقول تشخيصية تُحفظ مع كل صفقة وهمية وقت الدخول (لتحليلها لاحقًا في paper_stats.py).
+# القيم تأتي من نتيجة analyze_symbol في scanner.py، وتُحفظ لكل الأنواع الأربعة (وليس فقط الرسمية/المبكرة)
+DIAG_FIELDS = (
+    "squeeze", "accumulation", "divergence", "momentum", "extended",
+    "rsi_state", "macd_bull", "bb_state", "vol_confirm", "ranging",
+    "near_resistance", "obv_confirm", "htf_aligned", "di_confirm",
+    "momentum_agree", "trend_up", "atr_pct", "interval",
+)
+
+
+# عوامل breakout/experimental تأتي داخل details (الغياب = False) — تُسطَّح لحقول bool صريحة
+# (نفس تعريف scanner.py: ADAPTIVE_DETAIL_FACTORS) لتحليلها في paper_stats/trade_stats.
+DETAIL_FACTORS = {
+    "breakout": ("trend_support", "macd_bull", "rsi_ok"),
+    "experimental": ("trend_support", "volume_confirm", "mfi_bullish"),
+}
+
+
+def _diagnostics(r, sig, sig_type):
+    """يبني الحقول التشخيصية الإضافية للصفقة (تُضاف فوق الحقول الأساسية)."""
+    d = {k: r.get(k) for k in DIAG_FIELDS if k in r}
+    d["initial_risk"] = sig["entry"] - sig["sl"]
+    d["concurrent_signals"] = r.get("concurrent_signals", [])
+    if sig_type == "early":
+        d["confidence"] = r.get("early_confidence")
+    elif sig_type == "breakout":
+        d["breakout_details"] = r.get("breakout_details")
+    elif sig_type == "experimental":
+        d["experimental_details"] = r.get("experimental_details")
+    keys = DETAIL_FACTORS.get(sig_type)
+    if keys:
+        det = r.get(f"{sig_type}_details") or {}
+        for k in keys:
+            d[k] = bool(det.get(k))
+    # درجة المحرك التكيفي وقت الدخول -> لاحقًا نقيس هل الترتيب يتنبأ فعلًا بالنتيجة
+    d["adaptive_score"] = ((r.get("adaptive") or {}).get(sig_type) or {}).get("score")
+    return d
+
+
+def _bump_signal_counter(balance, sig_type, key):
+    """عدّاد لكل نوع: seen (كل إشارة صالحة وصلت) / taken (فُتحت) / missed_max_positions / missed_balance.
+    يُحفظ داخل paper_balance.json (ملف موجود أصلًا، لا ملفات جديدة بالـGist)."""
+    counters = balance.setdefault("signal_counters", {})
+    per_type = counters.setdefault(sig_type, {})
+    per_type[key] = per_type.get(key, 0) + 1
+
+
+# ---------------- رسائل Telegram ----------------
+
+def _format_open(pos):
+    label = TYPE_LABELS.get(pos["type"], pos["type"])
+    tp1 = pos["tps"][0]
+    pct_target = (tp1 - pos["entry"]) / pos["entry"] * 100
+    return (
+        f"💼 دخول وهمي — {label}\n"
+        f"{pos['symbol'].replace('USDT', '/USDT')}\n"
+        f"الدخول: {pos['entry']:.6g}\n"
+        f"SL: {pos['sl']:.6g}\n"
+        f"TP1: {tp1:.6g} (+{pct_target:.2f}%)\n"
+        f"حجم الصفقة: ${pos['size_usd']:.2f}"
+    )
+
+
+def _format_close(pos, exit_price, reason, pnl_usd, net_pct, balance, open_count):
+    label = TYPE_LABELS.get(pos["type"], pos["type"])
+    icon = "✅" if pnl_usd >= 0 else "❌"
+    reason_ar = {"TP1": "تحقق الهدف TP1", "SL": "ضرب وقف الخسارة", "EXPIRED": "انتهت صلاحية المراقبة (سقف زمني)"}[reason]
+    duration = _format_duration(_hours_since(pos["opened_at"]))
+    return (
+        f"{icon} إغلاق وهمي — {label} — {reason_ar}\n"
+        f"{pos['symbol'].replace('USDT', '/USDT')}\n"
+        f"الدخول: {pos['entry']:.6g} | الخروج: {exit_price:.6g}\n"
+        f"النتيجة الصافية: {net_pct:+.2f}% → {pnl_usd:+.2f}$\n"
+        f"المدة: {duration}\n"
+        f"الرصيد المتاح الآن: ${balance['available']:.2f} | صفقات مفتوحة: {open_count}"
+    )
+
+
+# ---------------- إغلاق الصفقات (TP1 / SL / سقف زمني) ----------------
+
+def _check_positions(positions, balance, price_map, monitor_map, notify=True):
+    still_open, closed_now = [], []
+    monitor_map = monitor_map or {}
+
+    for pos in positions:
+        symbol = pos["symbol"]
+        price = price_map.get(symbol)
+        candles = monitor_map.get(symbol) or []
+        if price is None and candles:
+            try:
+                price = float(candles[-1][4])
+            except Exception:
+                price = None
+        if price is None:
+            still_open.append(pos)
+            continue
+
+        opened_ms = _parse_opened_epoch_ms(pos.get("opened_at")) or 0
+        try:
+            cursor_ms = int(pos.get("monitor_cursor_ms", opened_ms))
+        except (TypeError, ValueError):
+            cursor_ms = opened_ms
+
+        events = []
+        for k in candles:
+            try:
+                candle_open_ms = int(k[0])
+                if candle_open_ms <= cursor_ms:
+                    continue
+                events.append((candle_open_ms, float(k[2]), float(k[3])))  # open_ms, high, low
+            except Exception:
+                continue
+
+        tp = pos["tps"][0] if pos.get("tps") else None
+        closed, exit_price, reason, close_ms = False, None, None, None
+
+        for candle_open_ms, high, low in events:
+            # أعلى/أدنى سعر وصلته الصفقة (يُستخدم لقياس كم اقتربت من TP1 قبل ضرب SL)
+            pos["max_high"] = max(pos.get("max_high", pos["entry"]), high)
+            pos["min_low"] = min(pos.get("min_low", pos["entry"]), low)
+            if low <= pos["sl"]:
+                exit_price, reason, close_ms, closed = pos["sl"], "SL", candle_open_ms, True
+                break
+            if tp is not None and high >= tp:
+                exit_price, reason, close_ms, closed = tp, "TP1", candle_open_ms, True
+                break
+
+        if not closed and events:
+            pos["monitor_cursor_ms"] = events[-1][0]
+
+        if not closed:
+            hours_open = _hours_since(pos["opened_at"])
+            if hours_open >= PAPER_TIME_STOP_HOURS:
+                exit_price, reason, closed = price, "EXPIRED", True
+                close_ms = None
+
+        if not closed:
+            still_open.append(pos)
+            continue
+
+        pct_change = (exit_price - pos["entry"]) / pos["entry"] * 100
+        net_pct = pct_change - PAPER_TRADING_FEE_PCT
+        pnl_usd = round(pos["size_usd"] * net_pct / 100, 8)
+
+        balance["available"] = round(balance["available"] + pos["size_usd"] + pnl_usd, 8)
+        balance["realized_pnl_usd"] = round(balance.get("realized_pnl_usd", 0.0) + pnl_usd, 8)
+        if pnl_usd >= 0:
+            balance["wins"] = balance.get("wins", 0) + 1
+        else:
+            balance["losses"] = balance.get("losses", 0) + 1
+        balance["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        pos["closed_reason"] = reason
+        pos["closed_at"] = (
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(close_ms / 1000))
+            if close_ms else time.strftime("%Y-%m-%d %H:%M:%S")
+        )
+        pos["exit_price"] = exit_price
+        pos["pnl_pct"] = round(net_pct, 4)
+        pos["pnl_usd"] = pnl_usd
+
+        if notify:  # المحافظ الفرعية لا ترسل تيليجرام
+            result_text = _format_close(pos, exit_price, reason, pnl_usd, net_pct, balance,
+                                         open_count=max(0, sum(1 for p in positions if p not in closed_now) - 1))
+            send_telegram(result_text)
+            _edit_telegram_strike(pos.get("alert_message_id"), pos.get("alert_text", ""), result_text)
+
+        closed_now.append(pos)
+
+    return still_open, closed_now
+
+
+# ---------------- فتح صفقات جديدة ----------------
+
+def _open_new(positions, balance, fresh, fresh_early, fresh_breakout, fresh_experimental,
+              only_type=None, max_positions=None, position_size=None, notify=True, portfolio=None):
+    """يفتح صفقات وهمية للإشارات الجديدة.
+    الافتراضي = المحفظة الرئيسية (كل الأنواع + تيليجرام). للمحافظ الفرعية:
+    only_type=النوع، notify=False، portfolio="sub_<type>"، مع حدّها وحجم شريحتها."""
+    max_positions = PAPER_MAX_POSITIONS if max_positions is None else max_positions
+    position_size = PAPER_POSITION_SIZE if position_size is None else position_size
+    tag = f"[محفظة وهمية — {portfolio}]" if portfolio else "[محفظة وهمية]"
+
+    candidates = []
+    for r in fresh:
+        candidates.append((r, "official"))
+    for r in fresh_early:
+        candidates.append((r, "early"))
+    for r in fresh_breakout:
+        candidates.append((r, "breakout"))
+    for r in fresh_experimental:
+        candidates.append((r, "experimental"))
+    if only_type:
+        candidates = [(r, t) for r, t in candidates if t == only_type]
+
+    for r, sig_type in candidates:
+        sig = _normalize_signal(r, sig_type)
+        if sig is None:
+            continue
+        if any(p.get("symbol") == sig["symbol"] and p.get("type") == sig_type for p in positions):
+            print(f"{tag} {sig['symbol']} ({sig_type}) مفتوحة أصلًا — تخطي المكرر")
+            continue
+        _bump_signal_counter(balance, sig_type, "seen")
+
+        if len(positions) >= max_positions:
+            _bump_signal_counter(balance, sig_type, "missed_max_positions")
+            print(f"{tag} الحد الأقصى للصفقات المفتوحة ({max_positions}) — "
+                  f"تفويت {sig['symbol']} ({sig_type})")
+            continue
+        if balance["available"] < position_size - 1e-9:
+            _bump_signal_counter(balance, sig_type, "missed_balance")
+            print(f"{tag} رصيد غير كافٍ (${balance['available']:.2f}) — "
+                  f"تفويت {sig['symbol']} ({sig_type})")
+            continue
+
+        balance["available"] = round(balance["available"] - position_size, 8)
+        pos = {
+            "symbol": sig["symbol"],
+            "entry": sig["entry"],
+            "sl": sig["sl"],
+            "tps": sig["tps"],
+            "score": sig["score"],
+            "type": sig_type,
+            "size_usd": position_size,
+            "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        if portfolio:
+            pos["portfolio"] = portfolio   # الصفقات بدون هذا الحقل = المحفظة الرئيسية
+        pos.update(_diagnostics(r, sig, sig_type))
+        _bump_signal_counter(balance, sig_type, "taken")
+        if notify:
+            alert_text = _format_open(pos)
+            pos["alert_message_id"] = send_telegram(alert_text)
+            pos["alert_text"] = alert_text
+        positions.append(pos)
+        if notify:
+            time.sleep(1)  # نفس احتياط حد تيليجرام المستخدم في السكانر الأصلي
+
+
+def _run_sub_portfolios(gist_files, price_map, monitor_map, fresh, fresh_early, fresh_breakout, fresh_experimental):
+    """يشغّل دورة كاملة (إغلاق ثم فتح) لكل محفظة فرعية. يرجع (state, closed_all).
+    أي خطأ هنا لا يجوز أن يعطّل المحفظة الرئيسية → يُلتقط في run_cycle."""
+    state = load_sub_state(gist_files)
+    closed_all = []
+    for t in SIGNAL_TYPES:
+        sub = state[t]
+        sub["positions"], closed = _check_positions(
+            sub["positions"], sub["balance"], price_map, monitor_map, notify=False)
+        _open_new(sub["positions"], sub["balance"], fresh, fresh_early, fresh_breakout, fresh_experimental,
+                  only_type=t, max_positions=SUB_MAX_POSITIONS, position_size=SUB_POSITION_SIZE,
+                  notify=False, portfolio=f"sub_{t}")
+        closed_all.extend(closed)
+        b = sub["balance"]
+        print(f"💼 [محفظة فرعية {t}] متاح: ${b['available']:.2f} | مفتوحة: {len(sub['positions'])} "
+              f"| أُغلقت الآن: {len(closed)} | ربح/خسارة متراكم: {b.get('realized_pnl_usd', 0):+.2f}$")
+    return state, closed_all
+
+
+# ---------------- نقطة الدخول: تُستدعى مرتين من scanner.py لكل دورة ----------------
+# (1) load_context() + get_open_symbols() مبكرًا، قبل بناء خريطة شموع المراقبة في
+#     scanner.py، عشان رموز صفقات المحفظة الوهمية المفتوحة تنضم لنفس الخريطة
+#     المستخدمة للصفقات الحقيقية — بدل ما تعتمد لاحقًا على آخر سعر ticker فقط
+#     وتفوّت TP/SL حصل وارتد بين تشغيلتين متباعدتين (نفس المشكلة التي صُممت
+#     خريطة المراقبة أصلاً لتفاديها للصفقات الحقيقية).
+# (2) run_cycle(gist_files, ...) لاحقًا، بنفس gist_files المُجلب في load_context()
+#     — بدون إعادة جلب نفس الـGist مرة ثانية.
+
+def load_context():
+    """يجلب ملفات Gist المحفظة الوهمية مرة واحدة فقط لكل دورة. الناتج يُعاد
+    استخدامه في run_cycle لاحقًا. يرجع None بهدوء عند أي فشل جلب — لا يوقف
+    تشغيل السكانر الحقيقي أبدًا."""
+    try:
+        return _gist_get_all_files()
+    except GistFetchError as e:
+        print(f"❌ [محفظة وهمية] فشل جلب Gist ({e}) — تخطي دورة المحفظة الوهمية هذه المرة.")
+        return None
+
+
+def get_open_symbols(gist_files):
+    """يرجع الصفقات المفتوحة حاليًا بالمحفظة الوهمية (لضمها لخريطة شموع المراقبة
+    قبل بنائها في scanner.py). قائمة فارغة بهدوء لو gist_files غير متاح."""
+    if gist_files is None:
+        return []
+    try:
+        combined = list(load_positions(gist_files))
+        if SUB_ENABLED:
+            try:
+                sub_state = load_sub_state(gist_files)
+                for t in SIGNAL_TYPES:
+                    combined.extend(sub_state[t]["positions"])
+            except Exception as e:
+                print(f"⚠️ [محفظة وهمية] تعذّر قراءة صفقات المحافظ الفرعية المفتوحة: {e}")
+        # لا إزالة لتكرار الرموز هنا: _monitor_candle_map في scanner.py يجمّع حسب الرمز ويستخدم
+        # أقدم نقطة بداية، بينما حذف التكرار كان قد يُسقط الصفقة الأقدم فتفوت شموعها (TP/SL).
+        unique = combined
+        return unique
+    except Exception as e:
+        print(f"⚠️ [محفظة وهمية] تعذّر قراءة صفقاتها المفتوحة لضمها لخريطة المراقبة: {e}")
+        return []
+
+
+def run_cycle(gist_files, price_map, monitor_map, fresh, fresh_early, fresh_breakout, fresh_experimental):
+    """
+    يُستدعى مرة واحدة من داخل scanner.py في main()، بعد حساب fresh/fresh_early/
+    fresh_breakout/fresh_experimental وبعد أن يصبح price_map وmonitor_map جاهزين.
+    مستقل بالكامل عن حالة السكانر الحقيقي (Gist وبوت تيليجرام مختلفان تمامًا).
+    gist_files: نفس القاموس المُجلب مسبقًا عبر load_context() في بداية main() —
+    وليس جلبًا جديدًا، لتوفير طلب API مكرر على نفس الـGist كل دورة.
+    """
+    if gist_files is None:
+        return
+
+    balance = load_balance(gist_files)
+    positions = load_positions(gist_files)
+
+    positions, closed_now = _check_positions(positions, balance, price_map, monitor_map)
+    _open_new(positions, balance, fresh, fresh_early, fresh_breakout, fresh_experimental)
+
+    # المحافظ الفرعية (حساب داخلي فقط، بدون تيليجرام). معزولة: فشلها لا يمس الرئيسية.
+    sub_state, sub_closed = None, []
+    if SUB_ENABLED:
+        try:
+            sub_state, sub_closed = _run_sub_portfolios(
+                gist_files, price_map, monitor_map, fresh, fresh_early, fresh_breakout, fresh_experimental)
+        except Exception as e:
+            print(f"❌ [محفظة وهمية] فشلت دورة المحافظ الفرعية ({e}) — تُترك حالتها السابقة دون تغيير.")
+            sub_state, sub_closed = None, []
+
+    print(f"💼 [محفظة وهمية] رصيد متاح: ${balance['available']:.2f} | صفقات مفتوحة: {len(positions)} "
+          f"| أُغلقت الآن: {len(closed_now)} | ربح/خسارة متراكم: {balance.get('realized_pnl_usd', 0):+.2f}$")
+
+    _save_state(balance, positions, closed_now, gist_files, sub_state=sub_state, sub_closed=sub_closed)
