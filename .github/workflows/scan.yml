@@ -33,6 +33,7 @@ jobs:
           PAPER_TELEGRAM_TOKEN: ${{ secrets.PAPER_TELEGRAM_TOKEN }}
           PAPER_TELEGRAM_CHAT_ID: ${{ secrets.PAPER_TELEGRAM_CHAT_ID }}
           SCAN_INTERVAL: '1h'
-          SCAN_DEPTH: '60'
+          SCAN_DEPTH: '120'
           MARKET_REGIME_ADX_THRESHOLD: '25'
         run: python scanner.py
+        
