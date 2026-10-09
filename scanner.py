@@ -3068,12 +3068,13 @@ def fetch_market_regime(tickers=None, results=None):
         "vol": vol, "vol_state": vol_state, "risk_mult": risk_mult,
     }
     fmt = lambda v: "n/a" if v is None else f"{v:+.1f}"
+    vol_txt = f" (p{vol['pct']:.0f}, ATR% {vol['atr_pct']})" if vol else ""
     print(
         f"🧭 Regime(pro)={label} [{phase}] score={score:+.2f}"
         f"{f' ({note})' if note else ''} | primary={fmt(votes.get('primary'))} "
         f"htf={fmt(votes.get('htf'))} htf2={fmt(votes.get('htf2'))} "
         f"structure={fmt(votes.get('structure'))} breadth={fmt(votes.get('breadth'))} {b_info} | "
-        f"vol={vol_state}{'' if not vol else f' (p{vol['pct']:.0f}, ATR% {vol['atr_pct']})'} risk×{risk_mult}"
+        f"vol={vol_state}{vol_txt} risk×{risk_mult}"
     )
     if info:
         print("Regime details (primary):", info)
