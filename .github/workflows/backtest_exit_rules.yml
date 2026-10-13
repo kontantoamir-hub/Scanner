@@ -1,0 +1,43 @@
+name: Backtest Exit Rules
+
+# تشغيل يدوي فقط — للقراءة فقط، لا يكتب شيئًا في الـ Gist
+on:
+  workflow_dispatch:
+    inputs:
+      since:
+        description: "اختياري: فقط الصفقات المفتوحة بعد هذا الوقت (YYYY-MM-DD HH:MM:SS) — مثلاً لحظة آخر Reset"
+        required: false
+        default: ""
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      # تخزين الشموع بين التشغيلات كي لا تُجلب من Binance كل مرة
+      - uses: actions/cache@v4
+        with:
+          path: .candle_cache
+          key: candles-${{ github.run_id }}
+          restore-keys: candles-
+
+      - name: Run backtest
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          SINCE: ${{ github.event.inputs.since }}
+        run: |
+          if [ -n "$SINCE" ]; then
+            python backtest_exit_rules.py --since "$SINCE"
+          else
+            python backtest_exit_rules.py
+          fi
