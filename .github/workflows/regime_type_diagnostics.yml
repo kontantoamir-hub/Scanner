@@ -1,0 +1,57 @@
+name: Regime Type Diagnostics
+
+# تشغيل يدوي فقط — للقراءة فقط، لا يكتب شيئًا في الـ Gist
+on:
+  workflow_dispatch:
+    inputs:
+      signal_type:
+        description: "نوع الإشارة"
+        required: true
+        type: choice
+        options:
+          - early
+          - breakout
+          - official
+          - experimental
+        default: early
+      regime:
+        description: "نظام السوق"
+        required: true
+        type: choice
+        options:
+          - trending_up
+          - ranging
+          - trending_down
+        default: trending_up
+      since:
+        description: "اختياري: فقط الصفقات المفتوحة بعد هذا الوقت (YYYY-MM-DD HH:MM:SS)"
+        required: false
+        default: ""
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run diagnostics
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          SIGNAL_TYPE: ${{ github.event.inputs.signal_type }}
+          REGIME: ${{ github.event.inputs.regime }}
+          SINCE: ${{ github.event.inputs.since }}
+        run: |
+          if [ -n "$SINCE" ]; then
+            python regime_type_diagnostics.py --type "$SIGNAL_TYPE" --regime "$REGIME" --since "$SINCE"
+          else
+            python regime_type_diagnostics.py --type "$SIGNAL_TYPE" --regime "$REGIME"
+          fi
