@@ -1,0 +1,46 @@
+name: Strict Policy Backtest
+
+# تشغيل يدوي فقط — للقراءة فقط، لا يكتب شيئًا في الـ Gist
+on:
+  workflow_dispatch:
+    inputs:
+      regime:
+        description: "نظام السوق المراد اختبار strict عليه"
+        required: true
+        type: choice
+        options:
+          - trending_up
+          - ranging
+          - trending_down
+        default: trending_up
+      since:
+        description: "اختياري: فقط الصفقات المفتوحة بعد هذا الوقت (YYYY-MM-DD HH:MM:SS)"
+        required: false
+        default: ""
+
+jobs:
+  strict-backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run strict policy backtest
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          REGIME: ${{ github.event.inputs.regime }}
+          SINCE: ${{ github.event.inputs.since }}
+        run: |
+          if [ -n "$SINCE" ]; then
+            python strict_policy_backtest.py --regime "$REGIME" --since "$SINCE"
+          else
+            python strict_policy_backtest.py --regime "$REGIME"
+          fi
